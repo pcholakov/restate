@@ -233,6 +233,11 @@ pub struct CommonOptions {
     #[serde(with = "serde_with::As::<serde_with::DisplayFromStr>")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub metadata_update_interval: humantime::Duration,
+
+    /// # Network error retry policy
+    ///
+    /// The retry policy for node network error
+    pub network_error_retry_policy: RetryPolicy,
 }
 
 static HOSTNAME: Lazy<String> = Lazy::new(|| {
@@ -357,6 +362,12 @@ impl Default for CommonOptions {
             rocksdb_perf_level: PerfStatsLevel::EnableCount,
             rocksdb: Default::default(),
             metadata_update_interval: std::time::Duration::from_secs(3).into(),
+            network_error_retry_policy: RetryPolicy::exponential(
+                Duration::from_millis(10),
+                2.0,
+                Some(15),
+                Some(Duration::from_secs(5)),
+            ),
         }
     }
 }

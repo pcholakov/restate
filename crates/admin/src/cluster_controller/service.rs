@@ -25,7 +25,7 @@ use restate_types::config::{AdminOptions, Configuration};
 use restate_types::live::Live;
 use restate_types::net::cluster_controller::{Action, AttachRequest, AttachResponse, RunPartition};
 use restate_types::net::RequestId;
-use restate_types::partition_table::{FixedPartitionTable, KeyRange};
+use restate_types::partition_table::{KeyRange, PartitionTable};
 
 use super::cluster_state::{ClusterStateRefresher, ClusterStateWatcher};
 use restate_bifrost::{Bifrost, BifrostAdmin};
@@ -213,7 +213,10 @@ where
         all_partitions_started_tx: Option<oneshot::Sender<()>>,
     ) -> anyhow::Result<()> {
         // Make sure we have partition table before starting
-        let _ = self.metadata.wait_for_partition_table(Version::MIN).await?;
+        let _ = self
+            .metadata
+            .wait_for_version(MetadataKind::PartitionTable, Version::MIN)
+            .await?;
         let bifrost_admin =
             BifrostAdmin::new(&bifrost, &self.metadata_writer, &self.metadata_store_client);
 
@@ -371,19 +374,19 @@ where
 
     fn create_attachment_response(
         &self,
-        partition_table: &FixedPartitionTable,
+        partition_table: &PartitionTable,
         _node: GenerationalNodeId,
         request_id: RequestId,
     ) -> AttachResponse {
-        // simulating a plan after initial attachement
+        // simulating a plan after initial attachment
         let actions = partition_table
-            .partitioner()
-            .map(|(partition_id, key_range)| {
+            .partitions()
+            .map(|(partition_id, partition)| {
                 Action::RunPartition(RunPartition {
-                    partition_id,
+                    partition_id: *partition_id,
                     key_range_inclusive: KeyRange {
-                        from: *key_range.start(),
-                        to: *key_range.end(),
+                        from: *partition.key_range.start(),
+                        to: *partition.key_range.end(),
                     },
                     mode: RunMode::Leader,
                 })

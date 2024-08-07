@@ -55,7 +55,7 @@ use restate_types::net::partition_processor_manager::{
 };
 use restate_types::net::MessageEnvelope;
 use restate_types::net::RpcMessage;
-use restate_types::partition_table::FixedPartitionTable;
+use restate_types::partition_table::PartitionTable;
 use restate_types::time::MillisSinceEpoch;
 use restate_types::GenerationalNodeId;
 
@@ -464,7 +464,8 @@ impl PartitionProcessorManager {
         let partition_table = self
             .metadata
             .wait_for_partition_table(control_processors.min_partition_table_version)
-            .await?;
+            .await?
+            .into_arc();
 
         for control_processor in control_processors.commands {
             self.on_control_processor(control_processor, &partition_table)
@@ -478,7 +479,7 @@ impl PartitionProcessorManager {
     async fn on_control_processor(
         &mut self,
         control_processor: ControlProcessor,
-        partition_table: &FixedPartitionTable,
+        partition_table: &PartitionTable,
     ) -> Result<(), Error> {
         let partition_id = control_processor.partition_id;
 
@@ -498,8 +499,9 @@ impl PartitionProcessorManager {
                 if let Some(state) = self.running_partition_processors.get_mut(&partition_id) {
                     // if we error here, then the system is shutting down
                     state.step_down()?;
-                } else if let Some(partition_key_range) =
-                    partition_table.partition_range(partition_id)
+                } else if let Some(partition_key_range) = partition_table
+                    .get_partition(&partition_id)
+                    .map(|partition| &partition.key_range)
                 {
                     self.start_partition_processor(
                         partition_id,
@@ -519,8 +521,9 @@ impl PartitionProcessorManager {
                             self.metadata.my_node_id(),
                         )
                         .await?;
-                } else if let Some(partition_key_range) =
-                    partition_table.partition_range(partition_id)
+                } else if let Some(partition_key_range) = partition_table
+                    .get_partition(&partition_id)
+                    .map(|partition| &partition.key_range)
                 {
                     self.start_partition_processor(
                         partition_id,
@@ -548,7 +551,7 @@ impl PartitionProcessorManager {
                     {
                         self.start_partition_processor(
                             action.partition_id,
-                            action.key_range_inclusive.clone().into(),
+                            &action.key_range_inclusive.clone().into(),
                             action.mode,
                         )
                         .await?;
@@ -569,7 +572,7 @@ impl PartitionProcessorManager {
     async fn start_partition_processor(
         &mut self,
         partition_id: PartitionId,
-        key_range: RangeInclusive<PartitionKey>,
+        key_range: &RangeInclusive<PartitionKey>,
         mode: RunMode,
     ) -> Result<(), Error> {
         let mut state = self.spawn_partition_processor(partition_id, key_range.clone())?;

@@ -688,6 +688,7 @@ impl<T: TransportConnect> PartitionProcessorManager<T> {
 
         let invoker_name = Box::leak(Box::new(format!("invoker-{}", partition_id)));
         let invoker_config = self.updateable_config.clone().map(|c| &c.worker.invoker);
+        let configuration = self.updateable_config.clone();
 
         let maybe_task_id: Result<TaskId, RuntimeError> = self.task_center.start_runtime(
             TaskKind::PartitionProcessor,
@@ -715,7 +716,12 @@ impl<T: TransportConnect> PartitionProcessorManager<T> {
                     )?;
 
                     pp_builder
-                        .build::<ProtobufRawEntryCodec, T>(networking, bifrost, partition_store)
+                        .build::<ProtobufRawEntryCodec, T>(
+                            networking,
+                            bifrost,
+                            partition_store,
+                            configuration,
+                        )
                         .await?
                         .run()
                         .await

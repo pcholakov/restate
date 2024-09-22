@@ -17,7 +17,7 @@ use anyhow::Context;
 use assert2::let_assert;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt as _};
 use metrics::{counter, histogram};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, instrument, trace, warn, Span};
 
@@ -34,9 +34,10 @@ use restate_storage_api::fsm_table::{FsmTable, ReadOnlyFsmTable};
 use restate_storage_api::outbox_table::ReadOnlyOutboxTable;
 use restate_storage_api::{invocation_status_table, StorageError, Transaction};
 use restate_types::cluster::cluster_state::{PartitionProcessorStatus, ReplayStatus, RunMode};
-use restate_types::config::WorkerOptions;
-use restate_types::identifiers::{LeaderEpoch, PartitionId, PartitionKey};
+use restate_types::config::{Configuration, WorkerOptions};
+use restate_types::identifiers::{LeaderEpoch, PartitionId, PartitionKey, SnapshotId};
 use restate_types::journal::raw::RawEntryCodec;
+use restate_types::live::Live;
 use restate_types::logs::MatchKeyQuery;
 use restate_types::logs::{KeyFilter, LogId, Lsn, SequenceNumber};
 use restate_types::time::MillisSinceEpoch;
@@ -50,6 +51,7 @@ use crate::metric_definitions::{
 };
 use crate::partition::invoker_storage_reader::InvokerStorageReader;
 use crate::partition::leadership::{LeadershipState, PartitionProcessorMetadata};
+use crate::partition::snapshot_producer::SnapshotProducer;
 use crate::partition::state_machine::{ActionCollector, StateMachine};
 
 mod action_effect_handler;
@@ -57,6 +59,7 @@ mod cleaner;
 pub mod invoker_storage_reader;
 mod leadership;
 pub mod shuffle;
+mod snapshot_producer;
 mod state_machine;
 pub mod types;
 
@@ -65,6 +68,7 @@ pub mod types;
 pub enum PartitionProcessorControlCommand {
     RunForLeader(LeaderEpoch),
     StepDown,
+    CreateSnapshot(Option<oneshot::Sender<anyhow::Result<SnapshotId>>>),
 }
 
 #[derive(Debug)]
@@ -123,6 +127,7 @@ where
         networking: Networking<T>,
         bifrost: Bifrost,
         mut partition_store: PartitionStore,
+        configuration: Live<Configuration>,
     ) -> Result<PartitionProcessor<Codec, InvokerInputSender, T>, StorageError> {
         let PartitionProcessorBuilder {
             partition_id,
@@ -172,6 +177,8 @@ where
             last_seen_leader_epoch,
         );
 
+        let snapshot_producer = SnapshotProducer::new(partition_id, configuration);
+
         Ok(PartitionProcessor {
             partition_id,
             partition_key_range,
@@ -180,6 +187,7 @@ where
             max_command_batch_size,
             partition_store: Some(partition_store),
             bifrost,
+            snapshot_producer,
             control_rx,
             status_watch_tx,
             status,
@@ -220,6 +228,7 @@ pub struct PartitionProcessor<Codec, InvokerSender, T> {
     leadership_state: LeadershipState<InvokerSender, T>,
     state_machine: StateMachine<Codec>,
     bifrost: Bifrost,
+    snapshot_producer: SnapshotProducer,
     control_rx: mpsc::Receiver<PartitionProcessorControlCommand>,
     status_watch_tx: watch::Sender<PartitionProcessorStatus>,
     status: PartitionProcessorStatus,
@@ -253,13 +262,21 @@ where
                 FindTailAttributes::default(),
             )
             .await?;
-        info!(
+        debug!(
+           partition_id = %self.partition_id,
             last_applied_lsn = %last_applied_lsn,
             current_log_tail = ?current_tail,
-            "PartitionProcessor creating log reader",
+            "Processor creating log reader",
         );
         if current_tail.offset() == last_applied_lsn.next() {
-            self.status.replay_status = ReplayStatus::Active;
+            if self.status.replay_status != ReplayStatus::Active {
+                debug!(
+                    partition_id = %self.partition_id,
+                    ?last_applied_lsn,
+                    "Processor has caught up with the log tail."
+                );
+                self.status.replay_status = ReplayStatus::Active;
+            }
         } else {
             // catching up.
             self.status.target_tail_lsn = Some(current_tail.offset());
@@ -277,6 +294,7 @@ where
             // todo: declare unhealthy state to cluster controller, or raise a flare.
         } else if last_applied_lsn.next() != current_tail.offset() {
             debug!(
+                partition_id = %self.partition_id,
                 "Replaying the log from lsn={}, log tail lsn={}",
                 last_applied_lsn.next(),
                 current_tail.offset()
@@ -337,7 +355,7 @@ where
             tokio::select! {
                 _ = &mut cancellation => break,
                 Some(command) = self.control_rx.recv() => {
-                    if let Err(err) = self.on_command(command).await {
+                    if let Err(err) = self.on_command(command, &mut partition_store).await {
                         warn!("Failed executing command: {err}");
                     }
                 }
@@ -432,6 +450,7 @@ where
     async fn on_command(
         &mut self,
         command: PartitionProcessorControlCommand,
+        partition_store: &mut PartitionStore,
     ) -> anyhow::Result<()> {
         match command {
             PartitionProcessorControlCommand::RunForLeader(leader_epoch) => {
@@ -447,6 +466,11 @@ where
                     .step_down()
                     .await
                     .context("failed handling StepDown command")?;
+            }
+            PartitionProcessorControlCommand::CreateSnapshot(maybe_sender) => {
+                self.snapshot_producer
+                    .create_snapshot(partition_store, maybe_sender)
+                    .ok();
             }
         }
 

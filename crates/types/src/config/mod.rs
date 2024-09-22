@@ -158,6 +158,7 @@ pub struct Configuration {
     pub metadata_store: MetadataStoreOptions,
     pub networking: NetworkingOptions,
     pub log_server: LogServerOptions,
+    pub partition_store: SnapshotsOptions,
 }
 
 impl Configuration {

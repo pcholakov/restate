@@ -15,10 +15,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tracing::warn;
 
-use restate_serde_util::NonZeroByteCount;
-
 use super::{CommonOptions, RocksDbOptions, RocksDbOptionsBuilder};
+use crate::identifiers::PartitionId;
 use crate::retries::RetryPolicy;
+use restate_serde_util::NonZeroByteCount;
 
 /// # Worker options
 #[serde_as]
@@ -339,5 +339,23 @@ impl Default for StorageOptions {
             persist_lsn_threshold: 1000,
             always_commit_in_background: false,
         }
+    }
+}
+
+#[serde_as]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, derive_builder::Builder)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schemars", schemars(rename = "SnapshotsOptions", default))]
+#[serde(rename_all = "kebab-case")]
+#[builder(default)]
+pub struct SnapshotsOptions {}
+
+impl SnapshotsOptions {
+    pub fn snapshots_base_dir(&self) -> PathBuf {
+        super::data_dir("db-snapshots")
+    }
+
+    pub fn snapshots_dir(&self, partition_id: PartitionId) -> PathBuf {
+        super::data_dir("db-snapshots").join(partition_id.to_string())
     }
 }

@@ -81,6 +81,9 @@ pub enum TaskKind {
     #[strum(props(OnCancel = "abort", runtime = "ingress"))]
     Ingress,
     PartitionProcessor,
+    /// upload to remote storage, of partition store snapshots.
+    #[strum(props(OnCancel = "abort", OnError = "log"))]
+    PartitionSnapshotProducer,
     #[strum(props(OnError = "log"))]
     ConnectionReactor,
     Shuffle,

@@ -19,8 +19,9 @@ use futures::future::OptionFuture;
 use futures::stream::StreamExt;
 use futures::Stream;
 use metrics::gauge;
+use rand::Rng;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, instrument, trace, warn};
@@ -28,9 +29,9 @@ use tracing::{debug, info, instrument, trace, warn};
 use restate_bifrost::Bifrost;
 use restate_core::network::rpc_router::{RpcError, RpcRouter};
 use restate_core::network::{Incoming, MessageRouterBuilder};
-use restate_core::network::{Networking, TransportConnect};
+use restate_core::network::{MessageHandler, Networking, TransportConnect};
 use restate_core::worker_api::{ProcessorsManagerCommand, ProcessorsManagerHandle};
-use restate_core::{cancellation_watcher, Metadata, ShutdownError, TaskId, TaskKind};
+use restate_core::{cancellation_watcher, task_center, Metadata, ShutdownError, TaskId, TaskKind};
 use restate_core::{RuntimeError, TaskCenter};
 use restate_invoker_api::StatusHandle;
 use restate_invoker_impl::Service as InvokerService;
@@ -44,7 +45,7 @@ use restate_types::cluster::cluster_state::ReplayStatus;
 use restate_types::cluster::cluster_state::{PartitionProcessorStatus, RunMode};
 use restate_types::config::{Configuration, StorageOptions};
 use restate_types::epoch::EpochMetadata;
-use restate_types::identifiers::{LeaderEpoch, PartitionId, PartitionKey};
+use restate_types::identifiers::{LeaderEpoch, PartitionId, PartitionKey, SnapshotId};
 use restate_types::live::Live;
 use restate_types::live::LiveLoad;
 use restate_types::logs::Lsn;
@@ -52,9 +53,12 @@ use restate_types::logs::SequenceNumber;
 use restate_types::metadata_store::keys::partition_processor_epoch_key;
 use restate_types::net::cluster_controller::AttachRequest;
 use restate_types::net::cluster_controller::{Action, AttachResponse};
-use restate_types::net::partition_processor_manager::ProcessorsStateResponse;
 use restate_types::net::partition_processor_manager::{
-    ControlProcessor, ControlProcessors, GetProcessorsState, ProcessorCommand,
+    ControlProcessor, ControlProcessors, CreateSnapshotResponse, GetProcessorsState,
+    ProcessorCommand,
+};
+use restate_types::net::partition_processor_manager::{
+    CreateSnapshotRequest, ProcessorsStateResponse,
 };
 use restate_types::partition_table::PartitionTable;
 use restate_types::schema::Schema;
@@ -240,6 +244,60 @@ impl PartitionProcessorHandle {
             .try_send(PartitionProcessorControlCommand::RunForLeader(leader_epoch))?;
         Ok(())
     }
+
+    fn create_snapshot(
+        &self,
+        sender: Option<oneshot::Sender<anyhow::Result<SnapshotId>>>,
+    ) -> Result<(), PartitionProcessorHandleError> {
+        self.control_tx
+            .try_send(PartitionProcessorControlCommand::CreateSnapshot(sender))?;
+        Ok(())
+    }
+}
+
+pub struct PartitionProcessorManagerMessageHandler {
+    processors_manager_handle: ProcessorsManagerHandle,
+}
+
+impl PartitionProcessorManagerMessageHandler {
+    fn new(
+        processors_manager_handle: ProcessorsManagerHandle,
+    ) -> PartitionProcessorManagerMessageHandler {
+        Self {
+            processors_manager_handle,
+        }
+    }
+}
+
+impl MessageHandler for PartitionProcessorManagerMessageHandler {
+    type MessageType = CreateSnapshotRequest;
+
+    async fn on_message(&self, msg: Incoming<Self::MessageType>) {
+        info!("Received '{:?}' from {}", msg.body(), msg.peer());
+
+        let processors_manager_handle = self.processors_manager_handle.clone();
+        let _ = task_center().spawn_child(
+            TaskKind::Disposable,
+            "create-snapshot-request-rpc",
+            None,
+            async move {
+                let snapshot_id = processors_manager_handle
+                    .create_snapshot(msg.body().partition_id)
+                    .await;
+
+                if let Ok(snapshot_id) = snapshot_id {
+                    msg.to_rpc_response(CreateSnapshotResponse {
+                        snapshot_id: snapshot_id.to_string(),
+                    })
+                    .send()
+                    .await
+                    .ok();
+                };
+
+                Ok(())
+            },
+        );
+    }
 }
 
 type ChannelStatusReaderList = Vec<(RangeInclusive<PartitionKey>, ChannelStatusReader)>;
@@ -325,6 +383,10 @@ impl<T: TransportConnect> PartitionProcessorManager<T> {
 
     pub fn handle(&self) -> ProcessorsManagerHandle {
         ProcessorsManagerHandle::new(self.tx.clone())
+    }
+
+    pub(crate) fn message_handler(&self) -> PartitionProcessorManagerMessageHandler {
+        PartitionProcessorManagerMessageHandler::new(self.handle())
     }
 
     async fn attach(&mut self) -> Result<Incoming<AttachResponse>, AttachError> {
@@ -496,6 +558,11 @@ impl<T: TransportConnect> PartitionProcessorManager<T> {
             GetLivePartitions(sender) => {
                 let live_partitions = self.running_partition_processors.keys().cloned().collect();
                 let _ = sender.send(live_partitions);
+            }
+            CreateSnapshot(partition_id, sender) => {
+                self.running_partition_processors
+                    .get(&partition_id)
+                    .map(|store| store.handle.create_snapshot(Some(sender)));
             }
         }
     }
@@ -689,6 +756,7 @@ impl<T: TransportConnect> PartitionProcessorManager<T> {
         let invoker_name = Box::leak(Box::new(format!("invoker-{}", partition_id)));
         let invoker_config = self.updateable_config.clone().map(|c| &c.worker.invoker);
         let configuration = self.updateable_config.clone();
+        let partition_processor_handle = PartitionProcessorHandle::new(control_tx.clone());
 
         let maybe_task_id: Result<TaskId, RuntimeError> = self.task_center.start_runtime(
             TaskKind::PartitionProcessor,
@@ -700,11 +768,12 @@ impl<T: TransportConnect> PartitionProcessorManager<T> {
                 let key_range = key_range.clone();
                 move || async move {
                     let partition_store = storage_manager
-                        .open_partition_store(
+                        .open_or_restore_partition_store(
                             partition_id,
                             key_range,
                             OpenMode::CreateIfMissing,
                             &options.storage.rocksdb,
+                            &options.snapshots,
                         )
                         .await?;
 
@@ -714,6 +783,35 @@ impl<T: TransportConnect> PartitionProcessorManager<T> {
                         Some(pp_builder.partition_id),
                         invoker.run(invoker_config),
                     )?;
+
+                    if let Some(snapshot_interval) = options.snapshots.export_interval {
+                        restate_core::task_center().spawn_child(
+                            TaskKind::PartitionProcessorBackground,
+                            "snapshot-producer",
+                            Some(pp_builder.partition_id),
+                            async move {
+                                let shutdown = cancellation_watcher();
+                                tokio::pin!(shutdown);
+
+                                loop {
+                                    tokio::select! {
+                                        _ = &mut shutdown => {
+                                            break;
+                                        }
+                                        _ = time::sleep(*snapshot_interval.as_ref()
+                                            + options.snapshots.export_interval_jitter.as_ref()
+                                                .mul_f32(rand::thread_rng().gen_range(0.0f32..1.0))) => {
+                                            if partition_processor_handle.create_snapshot(None).is_err() {
+                                                warn!(?partition_id, "Failed to send snapshot trigger for partition");
+                                            };
+                                        }
+                                    }
+                                }
+
+                                Ok(())
+                            },
+                        )?;
+                    }
 
                     pp_builder
                         .build::<ProtobufRawEntryCodec, T>(

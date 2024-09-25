@@ -69,3 +69,20 @@ impl From<RunMode> for ProcessorCommand {
         }
     }
 }
+
+define_rpc! {
+    @request = CreateSnapshotRequest,
+    @response = CreateSnapshotResponse,
+    @request_target = TargetName::PartitionCreateSnapshotRequest,
+    @response_target = TargetName::PartitionCreateSnapshotResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSnapshotRequest {
+    pub partition_id: PartitionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSnapshotResponse {
+    pub snapshot_id: String,
+}

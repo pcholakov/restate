@@ -8,11 +8,12 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 use tracing::warn;
 
 use super::{CommonOptions, RocksDbOptions, RocksDbOptionsBuilder};
@@ -59,6 +60,8 @@ pub struct WorkerOptions {
     /// The maximum number of commands a partition processor will apply in a batch. The larger this
     /// value is, the higher the throughput and latency are.
     max_command_batch_size: NonZeroUsize,
+
+    pub snapshots: SnapshotsOptions,
 }
 
 impl WorkerOptions {
@@ -93,6 +96,7 @@ impl Default for WorkerOptions {
             storage: StorageOptions::default(),
             invoker: Default::default(),
             max_command_batch_size: NonZeroUsize::new(4).expect("Non zero number"),
+            snapshots: Default::default(),
         }
     }
 }
@@ -342,13 +346,43 @@ impl Default for StorageOptions {
     }
 }
 
+/// # Snapshot options.
+/// Configures the partitioned worker store periodic snapshot mechanism.
 #[serde_as]
-#[derive(Default, Debug, Clone, Serialize, Deserialize, derive_builder::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, derive_builder::Builder)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schemars", schemars(rename = "SnapshotsOptions", default))]
+#[cfg_attr(
+    feature = "schemars",
+    schemars(rename = "PartitionStoreOptions", default)
+)]
 #[serde(rename_all = "kebab-case")]
 #[builder(default)]
-pub struct SnapshotsOptions {}
+pub struct SnapshotsOptions {
+    /// ## Snapshot interval
+    /// How frequently to export snapshots. Disabled by default.
+    #[serde(with = "serde_with::As::<Option<serde_with::DisplayFromStr>>")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub export_interval: Option<humantime::Duration>,
+
+    /// ## Snapshot interval jitter
+    /// Randomness added to the snapshot intervals to stagger snapshot writes.
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub export_interval_jitter: humantime::Duration,
+
+    /// ## Snapshot restore policy
+    pub restore_policy: SnapshotRestorePolicy,
+}
+
+impl Default for SnapshotsOptions {
+    fn default() -> Self {
+        Self {
+            export_interval: None,
+            export_interval_jitter: humantime::Duration::from(Duration::from_secs(60)),
+            restore_policy: SnapshotRestorePolicy::default(),
+        }
+    }
+}
 
 impl SnapshotsOptions {
     pub fn snapshots_base_dir(&self) -> PathBuf {
@@ -357,5 +391,25 @@ impl SnapshotsOptions {
 
     pub fn snapshots_dir(&self, partition_id: PartitionId) -> PathBuf {
         super::data_dir("db-snapshots").join(partition_id.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum SnapshotRestorePolicy {
+    /// ## Never
+    /// Do not attempt to restore from a snapshot, always preferring to rebuild worker state from the log.
+    #[default]
+    Never,
+
+    /// ## Initialize from snapshot if available.
+    /// Attempt to restore the most recent available snapshot only when the store is first created.
+    InitializeFromSnapshot,
+}
+
+impl SnapshotRestorePolicy {
+    pub fn allows_restore_on_init(&self) -> bool {
+        matches!(self, SnapshotRestorePolicy::InitializeFromSnapshot)
     }
 }

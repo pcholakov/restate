@@ -24,6 +24,8 @@ use restate_types::config::Configuration;
 use restate_types::identifiers::{PartitionId, SnapshotId};
 use restate_types::live::Live;
 
+/// Exports asynchronous snapshots of partition store state. Runs as a background task and takes overall responsibility
+/// for enacting the configured snapshot policy, including remote uploads, metadata updates, and cleanup.
 pub struct SnapshotProducer {
     pub partition_id: PartitionId,
     pub config: Live<Configuration>,
@@ -57,7 +59,8 @@ impl SnapshotProducer {
         let base_dir = self
             .config
             .live_load()
-            .partition_store
+            .worker
+            .snapshots
             .snapshots_base_dir()
             .to_path_buf();
         let config = self.config.live_load();

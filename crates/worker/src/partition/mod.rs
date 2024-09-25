@@ -64,7 +64,6 @@ mod state_machine;
 pub mod types;
 
 /// Control messages from Manager to individual partition processor instances.
-#[allow(dead_code)]
 pub enum PartitionProcessorControlCommand {
     RunForLeader(LeaderEpoch),
     StepDown,

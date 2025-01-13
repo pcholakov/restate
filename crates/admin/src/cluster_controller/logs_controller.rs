@@ -466,7 +466,8 @@ impl LogletConfiguration {
                 sequencer_change_required || nodeset_improvement_possible
             }
             (x, y) => {
-                debug!(
+                // todo(pavel): do not commit
+                trace!(
                     "Changing provider type from {} to {} is not supporter at the moment. Ignoring reconfigure",
                     x.as_provider(), y.kind(),
                 );

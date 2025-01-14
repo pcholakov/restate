@@ -743,13 +743,17 @@ impl SealAndExtendTask {
 mod tests {
     use super::Service;
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     use googletest::assert_that;
     use googletest::matchers::eq;
+    use test_log::test;
+    use tracing::{info, warn};
+
+    use crate::cluster_controller::cluster_state_refresher::ClusterStateWatcher;
     use restate_bifrost::providers::memory_loglet;
     use restate_bifrost::{Bifrost, BifrostService, ErrorRecoveryStrategy};
     use restate_core::network::{
@@ -757,7 +761,7 @@ mod tests {
     };
     use restate_core::test_env::NoOpMessageHandler;
     use restate_core::{TaskCenter, TaskKind, TestCoreEnv, TestCoreEnvBuilder};
-    use restate_types::cluster::cluster_state::PartitionProcessorStatus;
+    use restate_types::cluster::cluster_state::{NodeState, PartitionProcessorStatus};
     use restate_types::config::{AdminOptions, BifrostOptions, Configuration};
     use restate_types::health::HealthStatus;
     use restate_types::identifiers::PartitionId;
@@ -768,9 +772,7 @@ mod tests {
     use restate_types::net::partition_processor_manager::ControlProcessors;
     use restate_types::net::AdvertisedAddress;
     use restate_types::nodes_config::{LogServerConfig, NodeConfig, NodesConfiguration, Role};
-    use restate_types::{GenerationalNodeId, Version};
-    use test_log::test;
-    use tracing::{info, warn};
+    use restate_types::{GenerationalNodeId, PlainNodeId, Version};
 
     #[test(restate_core::test)]
     async fn manual_log_trim() -> anyhow::Result<()> {
@@ -856,6 +858,57 @@ mod tests {
         }
     }
 
+    struct MockNodeStateHandler2 {
+        node_state_generators:
+            HashMap<GenerationalNodeId, Box<dyn Fn() -> Arc<MockNodeState> + Send + Sync>>,
+    }
+
+    struct MockNodeState {
+        applied_lsn: AtomicU64,
+        persisted_lsn: AtomicU64,
+        archived_lsn: AtomicU64,
+    }
+
+    impl MessageHandler for MockNodeStateHandler2 {
+        type MessageType = GetNodeState;
+
+        async fn on_message(&self, msg: Incoming<Self::MessageType>) {
+            info!("Got message {:?}", msg);
+
+            let dest_node_id = msg.peer();
+            let Some(generator) = self.node_state_generators.get(&dest_node_id) else {
+                warn!("No state generator for node id: {}", dest_node_id);
+                return;
+            };
+
+            let state = generator();
+            let archived_lsn = state.archived_lsn.load(Ordering::Relaxed);
+            let partition_processor_status = PartitionProcessorStatus {
+                last_applied_log_lsn: Some(Lsn::from(state.applied_lsn.load(Ordering::Relaxed))),
+                last_persisted_log_lsn: Some(Lsn::from(
+                    state.persisted_lsn.load(Ordering::Relaxed),
+                )),
+                last_archived_log_lsn: if archived_lsn == Lsn::INVALID.as_u64() {
+                    None
+                } else {
+                    Some(Lsn::from(archived_lsn))
+                },
+                ..PartitionProcessorStatus::new()
+            };
+
+            let state = [(PartitionId::MIN, partition_processor_status)].into();
+            let response = msg.to_rpc_response(NodeStateResponse {
+                partition_processor_state: Some(state),
+            });
+
+            info!("Responding to {} with: {:?}", dest_node_id, &response);
+
+            // We are not really sending something back to target, we just need to provide a known
+            // node_id. The response will be sent to a handler running on the very same node.
+            response.send().await.expect("send should succeed");
+        }
+    }
+
     #[test(restate_core::test(start_paused = true))]
     async fn auto_log_trim() -> anyhow::Result<()> {
         const LOG_ID: LogId = LogId::new(0);
@@ -880,7 +933,7 @@ mod tests {
             block_list: BTreeSet::new(),
         });
 
-        let (node_env, bifrost) = create_test_env(config, |builder| {
+        let (node_env, bifrost, _) = create_test_env(config, |builder| {
             builder
                 .add_message_handler(get_node_state_handler.clone())
                 .add_message_handler(NoOpMessageHandler::<ControlProcessors>::default())
@@ -949,7 +1002,7 @@ mod tests {
             archived_lsn: Arc::new(AtomicU64::new(0)), // not used in this test
             block_list: BTreeSet::new(),
         });
-        let (node_env, bifrost) = create_test_env(config, |builder| {
+        let (node_env, bifrost, _) = create_test_env(config, |builder| {
             builder
                 .add_message_handler(get_node_state_handler.clone())
                 .add_message_handler(NoOpMessageHandler::<ControlProcessors>::default())
@@ -1021,7 +1074,7 @@ mod tests {
         let applied_lsn = Arc::new(AtomicU64::new(0));
         let persisted_lsn = Arc::new(AtomicU64::new(0));
 
-        let (_node_env, bifrost) = create_test_env(config, |builder| {
+        let (_node_env, bifrost, _) = create_test_env(config, |builder| {
             let block_list = builder
                 .nodes_config
                 .iter()
@@ -1078,17 +1131,21 @@ mod tests {
         let persisted_lsn = Arc::new(AtomicU64::new(0));
         let archived_lsn = Arc::new(AtomicU64::new(0));
 
-        let (_node_env, bifrost) = create_test_env(config, |builder| {
-            // assert_eq!(builder.nodes_config.iter().count(), 2, "expect two nodes in config");
-            //
-            // let blocked_node = builder
-            //     .nodes_config
-            //     .iter()
-            //     .nth(1)
-            //     .map(|(_, node_config)| node_config.current_generation)
-            //     .expect("there must be a node to block");
-            //
-            // info!("Block list: {:?}", blocked_node);
+        let (_node_env, bifrost, cluster_state) = create_test_env(config, |builder| {
+            assert_eq!(
+                builder.nodes_config.iter().count(),
+                2,
+                "expect two nodes in config"
+            );
+
+            let blocked_node = builder
+                .nodes_config
+                .iter()
+                .nth(1)
+                .map(|(_, node_config)| node_config.current_generation)
+                .expect("a second node in cluster");
+
+            info!("Block list: {:?}", blocked_node);
 
             let get_node_state_handler = MockNodeStateHandler {
                 applied_lsn: applied_lsn.clone(),
@@ -1111,6 +1168,16 @@ mod tests {
             Ordering::Relaxed,
         );
         tokio::time::sleep(interval_duration * 10).await;
+        assert!(cluster_state
+            .current()
+            .nodes
+            .get(&PlainNodeId::new(1))
+            .is_some_and(|n| matches!(n, NodeState::Alive(_))));
+        assert!(cluster_state
+            .current()
+            .nodes
+            .get(&PlainNodeId::new(2))
+            .is_some_and(|n| matches!(n, NodeState::Dead(_))));
         assert_eq!(Lsn::INVALID, bifrost.get_trim_point(LOG_ID).await?);
 
         archived_lsn.store(10, Ordering::Relaxed);
@@ -1121,14 +1188,114 @@ mod tests {
     }
 
     #[test(restate_core::test(start_paused = true))]
-    async fn do_not_trim_if_slow_nodes_present() -> anyhow::Result<()> {
-        todo!()
+    async fn do_not_trim_by_archived_lsn_if_slow_nodes_present() -> anyhow::Result<()> {
+        const LOG_ID: LogId = LogId::new(0);
+
+        let mut admin_options = AdminOptions::default();
+        admin_options.log_trim_threshold = 0;
+        let interval_duration = Duration::from_secs(10);
+        admin_options.log_trim_interval = Some(interval_duration.into());
+        let mut bifrost_options = BifrostOptions::default();
+        bifrost_options.default_provider = ProviderKind::InMemory;
+        let config = Configuration {
+            admin: admin_options,
+            bifrost: bifrost_options,
+            ..Default::default()
+        };
+
+        let n1 = Arc::new(MockNodeState {
+            applied_lsn: AtomicU64::new(20),
+            persisted_lsn: AtomicU64::new(0),
+            archived_lsn: AtomicU64::new(15),
+        });
+        let n2 = Arc::new(MockNodeState {
+            applied_lsn: AtomicU64::new(10),
+            persisted_lsn: AtomicU64::new(0),
+            archived_lsn: AtomicU64::new(0),
+        });
+
+        let (node_env, bifrost, cluster_state) = create_test_env(config, |builder| {
+            assert_eq!(
+                builder.nodes_config.iter().count(),
+                2,
+                "expect two nodes in config"
+            );
+            let n1 = n1.clone();
+            // let n2 = n2.clone();
+            builder
+                .add_message_handler(MockNodeStateHandler2 {
+                    node_state_generators: [
+                        (
+                            GenerationalNodeId::new(1, 1), // sender id
+                            Box::new(move || n1.clone())
+                                as Box<dyn Fn() -> Arc<MockNodeState> + Send + Sync>,
+                        ),
+                        // (
+                        //     GenerationalNodeId::new(2, 2),
+                        //     Box::new(move || n2.clone())
+                        //         as Box<dyn Fn() -> Arc<MockNodeState> + Send + Sync>,
+                        // ),
+                    ]
+                    .into(),
+                })
+                .add_message_handler(NoOpMessageHandler::<ControlProcessors>::default())
+        })
+        .await?;
+
+        // simulate a connection from node 2 so we can have a connection between the two
+        // nodes
+        let node_2_conn = MockPeerConnection::connect(
+            GenerationalNodeId::new(2, 2),
+            node_env.metadata.nodes_config_version(),
+            node_env
+                .metadata
+                .nodes_config_ref()
+                .cluster_name()
+                .to_owned(),
+            node_env.networking.connection_manager(),
+            10,
+        )
+        .await?;
+
+        let n2_2 = n2.clone();
+        let (_node_2, _node2_reactor) =
+            node_2_conn.process_with_message_handler(MockNodeStateHandler2 {
+                node_state_generators: [(
+                    GenerationalNodeId::new(1, 1), // sender id
+                    Box::new(move || n2_2.clone())
+                        as Box<dyn Fn() -> Arc<MockNodeState> + Send + Sync>,
+                )]
+                .into(),
+            })?;
+
+        let mut appender = bifrost.create_appender(LOG_ID, ErrorRecoveryStrategy::default())?;
+        for i in 1..=20 {
+            let lsn = appender.append(format!("record{i}")).await?;
+            assert_eq!(Lsn::from(i), lsn);
+        }
+
+        tokio::time::sleep(interval_duration * 2).await;
+        assert!(matches!(
+            cluster_state.current().nodes.get(&PlainNodeId::new(1)),
+            Some(NodeState::Alive(_))
+        ));
+        assert!(matches!(
+            cluster_state.current().nodes.get(&PlainNodeId::new(2)),
+            Some(NodeState::Alive(_))
+        ));
+        assert_eq!(Lsn::INVALID, bifrost.get_trim_point(LOG_ID).await?);
+
+        n2.applied_lsn.store(20, Ordering::Relaxed);
+        tokio::time::sleep(interval_duration * 2).await;
+        assert_eq!(Lsn::from(15), bifrost.get_trim_point(LOG_ID).await?);
+
+        Ok(())
     }
 
     async fn create_test_env<F>(
         config: Configuration,
         mut modify_builder: F,
-    ) -> anyhow::Result<(TestCoreEnv<FailingConnector>, Bifrost)>
+    ) -> anyhow::Result<(TestCoreEnv<FailingConnector>, Bifrost, ClusterStateWatcher)>
     where
         F: FnMut(TestCoreEnvBuilder<FailingConnector>) -> TestCoreEnvBuilder<FailingConnector>,
     {
@@ -1149,13 +1316,14 @@ mod tests {
             &mut server_builder,
             builder.metadata_writer.clone(),
         );
+        let cluster_state_watcher = svc.cluster_state_refresher.cluster_state_watcher();
 
         let mut nodes_config = NodesConfiguration::new(Version::MIN, "test-cluster".to_owned());
         nodes_config.upsert_node(NodeConfig::new(
             "node-1".to_owned(),
             GenerationalNodeId::new(1, 1),
             AdvertisedAddress::Uds("foobar".into()),
-            Role::Worker.into(),
+            Role::Admin | Role::Worker,
             LogServerConfig::default(),
         ));
         nodes_config.upsert_node(NodeConfig::new(
@@ -1171,6 +1339,6 @@ mod tests {
         bifrost_svc.start().await?;
 
         TaskCenter::spawn(TaskKind::SystemService, "cluster-controller", svc.run())?;
-        Ok((node_env, bifrost))
+        Ok((node_env, bifrost, cluster_state_watcher))
     }
 }

@@ -15,7 +15,14 @@ use crate::state::AdminServiceState;
 pub async fn render_service_metrics<V>(State(state): State<AdminServiceState<V>>) -> String {
     if let Some(prometheus) = state.prometheus_handle.as_ref() {
         let metrics_unfiltered = prometheus.render();
-        filter_metrics(metrics_unfiltered, &["restate_services_"])
+        filter_metrics(
+            metrics_unfiltered,
+            &[
+                "restate_ingress_requests_total",
+                "restate_ingress_request_duration_seconds",
+                "restate_invoker_invocation_task_total",
+            ],
+        )
     } else {
         "".to_owned()
     }

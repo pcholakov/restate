@@ -281,6 +281,7 @@ impl Node {
         };
 
         let admin_role = if config.has_role(Role::Admin) {
+            let prometheus_handle = prometheus.handle().cloned();
             Some(
                 AdminRole::create(
                     TaskCenter::with_current(|tc| tc.health().admin_status()),
@@ -295,6 +296,7 @@ impl Node {
                     worker_role
                         .as_ref()
                         .map(|worker_role| worker_role.storage_query_context().clone()),
+                    prometheus_handle,
                 )
                 .await?,
             )

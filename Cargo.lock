@@ -6309,6 +6309,8 @@ dependencies = [
  "hyper-util",
  "itertools 0.14.0",
  "jsonschema",
+ "metrics",
+ "metrics-exporter-prometheus",
  "mime_guess",
  "okapi-operation",
  "parking_lot",

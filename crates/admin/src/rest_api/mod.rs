@@ -16,6 +16,7 @@ mod error;
 mod handlers;
 mod health;
 mod invocations;
+mod service_metrics;
 mod services;
 mod subscriptions;
 mod version;
@@ -23,11 +24,13 @@ mod version;
 use axum_integration::put;
 use okapi_operation::axum_integration::{delete, get, patch, post};
 use okapi_operation::*;
+
 use restate_types::identifiers::PartitionKey;
 use restate_types::schema::subscriptions::SubscriptionValidator;
 use restate_wal_protocol::{Destination, Header, Source};
 
 use crate::state::AdminServiceState;
+use service_metrics::render_service_metrics;
 
 pub fn create_router<V>(state: AdminServiceState<V>) -> axum::Router<()>
 where
@@ -106,6 +109,7 @@ where
             "/cluster-health",
             get(openapi_handler!(cluster_health::cluster_health)),
         )
+        .route("/metrics", get(render_service_metrics))
         .finish_openapi("/openapi", "Admin API", env!("CARGO_PKG_VERSION"))
         .expect("Error when building the OpenAPI specification")
         .with_state(state)

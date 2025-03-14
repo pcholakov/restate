@@ -10,18 +10,19 @@
 
 use axum::error_handling::HandleErrorLayer;
 use http::StatusCode;
+use metrics_exporter_prometheus::PrometheusHandle;
+use tower::ServiceBuilder;
+use tracing::info;
+
 use restate_admin_rest_model::version::AdminApiVersion;
 use restate_bifrost::Bifrost;
-use restate_types::config::AdminOptions;
-use restate_types::live::LiveLoad;
-use tower::ServiceBuilder;
-
 use restate_core::MetadataWriter;
 use restate_core::network::net_util;
 use restate_service_protocol::discovery::ServiceDiscovery;
+use restate_types::config::AdminOptions;
+use restate_types::live::LiveLoad;
 use restate_types::net::BindAddress;
 use restate_types::schema::subscriptions::SubscriptionValidator;
-use tracing::info;
 
 use crate::schema_registry::SchemaRegistry;
 use crate::{rest_api, state};
@@ -37,6 +38,7 @@ pub struct AdminService<V> {
     query_context: Option<restate_storage_query_datafusion::context::QueryContext>,
     #[cfg(feature = "metadata-api")]
     metadata_writer: MetadataWriter,
+    prometheus_handle: Option<PrometheusHandle>,
 }
 
 impl<V> AdminService<V>
@@ -48,6 +50,7 @@ where
         bifrost: Bifrost,
         subscription_validator: V,
         service_discovery: ServiceDiscovery,
+        prometheus_handle: Option<PrometheusHandle>,
         experimental_feature_kafka_ingress_next: bool,
     ) -> Self {
         Self {
@@ -62,6 +65,7 @@ where
             ),
             #[cfg(feature = "storage-query")]
             query_context: None,
+            prometheus_handle,
         }
     }
 
@@ -82,7 +86,11 @@ where
     ) -> anyhow::Result<()> {
         let opts = updateable_config.live_load();
 
-        let rest_state = state::AdminServiceState::new(self.schema_registry, self.bifrost);
+        let rest_state = state::AdminServiceState::new(
+            self.schema_registry,
+            self.bifrost,
+            self.prometheus_handle,
+        );
 
         let router = axum::Router::new();
 

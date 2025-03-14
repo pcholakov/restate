@@ -10,6 +10,8 @@
 
 use std::time::Duration;
 
+use metrics_exporter_prometheus::PrometheusHandle;
+
 use codederror::CodedError;
 use restate_admin::cluster_controller;
 use restate_admin::service::AdminService;
@@ -70,6 +72,7 @@ impl<T: TransportConnect> AdminRole<T> {
         server_builder: &mut NetworkServerBuilder,
         router_builder: &mut MessageRouterBuilder,
         local_query_context: Option<QueryContext>,
+        prometheus_handle: Option<PrometheusHandle>,
     ) -> Result<Self, AdminRoleBuildError> {
         health_status.update(AdminStatus::StartingUp);
         let config = updateable_config.pinned();
@@ -105,6 +108,7 @@ impl<T: TransportConnect> AdminRole<T> {
             bifrost.clone(),
             config.ingress.clone(),
             service_discovery,
+            prometheus_handle,
             config.ingress.experimental_feature_kafka_ingress_next(),
         )
         .with_query_context(query_context);

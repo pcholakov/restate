@@ -8,6 +8,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use metrics_exporter_prometheus::PrometheusHandle;
+
 use crate::schema_registry::SchemaRegistry;
 use restate_bifrost::Bifrost;
 
@@ -15,13 +17,19 @@ use restate_bifrost::Bifrost;
 pub struct AdminServiceState<V> {
     pub schema_registry: SchemaRegistry<V>,
     pub bifrost: Bifrost,
+    pub prometheus_handle: Option<PrometheusHandle>,
 }
 
 impl<V> AdminServiceState<V> {
-    pub fn new(schema_registry: SchemaRegistry<V>, bifrost: Bifrost) -> Self {
+    pub fn new(
+        schema_registry: SchemaRegistry<V>,
+        bifrost: Bifrost,
+        prometheus_handle: Option<PrometheusHandle>,
+    ) -> Self {
         Self {
             schema_registry,
             bifrost,
+            prometheus_handle,
         }
     }
 }

@@ -52,6 +52,9 @@ impl MetricGroup {
     fn on_group_end(self, buffer: &mut String) -> Self {
         match self {
             Self::Matching(items) => {
+                if !buffer.is_empty() {
+                    buffer.push('\n');
+                }
                 for line in items {
                     buffer.push_str(&line);
                     buffer.push('\n');

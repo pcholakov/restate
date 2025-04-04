@@ -6613,6 +6613,7 @@ dependencies = [
  "http-body-util",
  "hyper-util",
  "itertools 0.14.0",
+ "jiff",
  "jsonschema",
  "mime_guess",
  "okapi-operation",
@@ -6663,6 +6664,7 @@ dependencies = [
  "http 1.2.0",
  "http-serde",
  "humantime",
+ "jiff",
  "restate-serde-util",
  "restate-types",
  "schemars",
@@ -6792,7 +6794,6 @@ dependencies = [
  "futures",
  "http 1.2.0",
  "http-body-util",
- "humantime",
  "hyper",
  "hyper-rustls",
  "hyper-util",
@@ -7400,6 +7401,7 @@ dependencies = [
 name = "restate-serde-util"
 version = "1.3.0-rc.1"
 dependencies = [
+ "anyhow",
  "bytes",
  "bytesize",
  "http 1.2.0",

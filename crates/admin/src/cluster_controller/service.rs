@@ -81,6 +81,7 @@ pub struct Service<T> {
     command_rx: mpsc::Receiver<ClusterControllerCommand>,
     health_status: HealthStatus<AdminStatus>,
     heartbeat_interval: Interval,
+    metadata_staleness_limit: Duration,
     observed_cluster_state: ObservedClusterState,
 }
 
@@ -108,6 +109,7 @@ where
 
         let options = configuration.live_load();
         let heartbeat_interval = Self::create_heartbeat_interval(&options.admin);
+        let metadata_staleness_limit = 2 * *options.admin.heartbeat_interval;
 
         let cluster_query_context = QueryContext::create(
             &options.admin.query_engine,
@@ -143,6 +145,7 @@ where
             command_tx,
             command_rx,
             heartbeat_interval,
+            metadata_staleness_limit,
             observed_cluster_state: ObservedClusterState::default(),
         })
     }
@@ -353,7 +356,7 @@ impl<T: TransportConnect> Service<T> {
                     trace!(observed_cluster_state = ?self.observed_cluster_state, "Observed cluster state updated");
                     // todo quarantine this cluster controller if errors re-occur too often so that
                     //  another cluster controller can take over
-                    if let Err(err) = state.update(&self) {
+                    if let Err(err) = state.update(&self, self.metadata_staleness_limit) {
                         warn!(%err, "Failed to update cluster state. This can impair the overall cluster operations");
                         continue;
                     }

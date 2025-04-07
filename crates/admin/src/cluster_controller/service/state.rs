@@ -48,7 +48,11 @@ impl<T> ClusterControllerState<T>
 where
     T: TransportConnect,
 {
-    pub fn update(&mut self, service: &Service<T>) -> anyhow::Result<()> {
+    pub fn update(
+        &mut self,
+        service: &Service<T>,
+        metadata_staleness_limit: Duration,
+    ) -> anyhow::Result<()> {
         let maybe_leader = {
             let nodes_config = Metadata::with_current(|m| m.nodes_config_ref());
             nodes_config
@@ -74,7 +78,9 @@ where
         // that we are isolated from the cluster majority, which would cause us to assume leadership
         // and potentially take disruptive actions when the cluster becomes reachable again.
         let fresh_metadata = Metadata::with_current(|m| m.last_update())
-            .map(|last_update| Instant::now().duration_since(last_update) < Duration::from_secs(3))
+            .map(|last_update| {
+                Instant::now().duration_since(last_update) < metadata_staleness_limit
+            })
             .unwrap_or_default();
 
         match (is_leader, &self, fresh_metadata) {

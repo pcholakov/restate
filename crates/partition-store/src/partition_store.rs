@@ -238,7 +238,7 @@ pub(crate) fn cf_options() -> impl Fn(rocksdb::Options) -> rocksdb::Options + Se
     // much as we can to increase the chances to observe a deletion.
 
     // TODO(pavel): we should also update these at runtime if partition config changes
-    let write_buffer_size = 640 << 20;
+    let write_buffer_size = 1 << 30;
     let bloom_filter_size = 8 << 20; // we typically flush somewhere ~32-48MB, which gives us 20~25% effective ratio at the time of flush
 
     move |mut cf_options| {
@@ -275,22 +275,21 @@ fn set_memory_related_opts(opts: &mut rocksdb::Options, write_buffer_size: usize
 
     opts.set_write_buffer_size(write_buffer_size);
 
-    // opts.set_arena_block_size(1 << 20);
-    // opts.set_memtable_prefix_bloom_ratio(0.1);
+    // opts.set_memtable_prefix_bloom_ratio(0.2);
 
     // Keep just one immutable buffer while we flush to L0
     opts.set_min_write_buffer_number_to_merge(1); // don't wait to merge 2+ memtables to L0?
-    opts.set_max_write_buffer_number(2);
+    opts.set_max_write_buffer_number(100);
 
     // Start flushing L0->L1 as soon as possible. Each file in L0 should be
     // ~target_memtable_flush_size so this will compact L0 when it's ~2x that.
     opts.set_level_zero_file_num_compaction_trigger(2);
 
     // doesn't really matter much, but we don't want to create too many files
-    opts.set_target_file_size_base(write_buffer_size as u64);
+    opts.set_target_file_size_base(64 << 20);
 
     // make Level1 size equal to Level0 size, so that L0->L1 compactions are fast
-    opts.set_max_bytes_for_level_base(2 * write_buffer_size as u64);
+    opts.set_max_bytes_for_level_base(64 << 20);
 }
 
 impl PartitionStore {

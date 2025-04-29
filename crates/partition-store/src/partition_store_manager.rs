@@ -14,11 +14,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rocksdb::ExportImportFilesMetaData;
+use rocksdb::event_listener::EventListenerExt;
+use rocksdb::table_properties::TablePropertiesExt;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::PartitionStore;
 use crate::cf_options;
+use crate::persisted_lsn_tracking::LatestAppliedLsnCollectorFactory;
+use crate::persisted_lsn_tracking::PersistedLsnEventListener;
 use crate::snapshots::LocalPartitionSnapshot;
 use restate_core::worker_api::SnapshotError;
 use restate_rocksdb::{
@@ -66,6 +71,45 @@ impl PartitionStoreManager {
                 CfPrefixPattern::new(PARTITION_CF_PREFIX),
                 cf_options(per_partition_memory_budget),
             )
+            .ensure_column_families(partition_ids_to_cfs(initial_partition_set))
+            // This is added as an experiment. We might make this configurable to let users decide
+            // on the trade-off between shutdown time and startup catchup time.
+            .add_to_flush_on_shutdown(CfPrefixPattern::ANY)
+            .build()
+            .expect("valid spec");
+
+        let manager = RocksDbManager::get();
+        let rocksdb = manager
+            .open_db(storage_opts.map(|opts| &opts.rocksdb), db_spec)
+            .await?;
+
+        Ok(Self {
+            rocksdb,
+            lookup: Arc::default(),
+        })
+    }
+
+    // TODO(pavel): make this elegant; load the initial applied LSN on open
+    pub async fn create_with_persisted_lsn_listener(
+        mut storage_opts: impl LiveLoad<Live = StorageOptions> + 'static,
+        initial_partition_set: &[(PartitionId, RangeInclusive<PartitionKey>)],
+        persisted_lsn_tx: mpsc::Sender<(PartitionId, Lsn)>,
+    ) -> Result<Self, RocksError> {
+        let options = storage_opts.live_load();
+
+        let per_partition_memory_budget = options.rocksdb_memory_budget()
+            / options.num_partitions_to_share_memory_budget() as usize;
+
+        let mut db_opts = db_options();
+        let listener = PersistedLsnEventListener { persisted_lsn_tx };
+        db_opts.add_event_listener(Arc::new(listener));
+
+        let db_spec = DbSpecBuilder::new(DbName::new(DB_NAME), options.data_dir(), db_opts)
+            .add_cf_pattern(CfPrefixPattern::new(PARTITION_CF_PREFIX), move |opts| {
+                let mut opts = cf_options(per_partition_memory_budget.clone())(opts);
+                opts.add_table_properties_collector_factory(LatestAppliedLsnCollectorFactory {});
+                opts
+            })
             .ensure_column_families(partition_ids_to_cfs(initial_partition_set))
             // This is added as an experiment. We might make this configurable to let users decide
             // on the trade-off between shutdown time and startup catchup time.

@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use futures::future::OptionFuture;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
@@ -30,6 +31,8 @@ use restate_types::logs::{Lsn, SequenceNumber};
 /// An alternative approach could be to register an event listener on flush events and using
 /// table properties to retrieve the flushed log lsn. However, this requires that we update our
 /// RocksDB binding to expose event listeners and table properties :-(
+
+// TODO(pavel): Next step - merge this with the PersistedLsnEventListener
 pub struct PersistedLogLsnWatchdog {
     configuration: BoxLiveLoad<StorageOptions>,
     partition_store_manager: PartitionStoreManager,
@@ -37,6 +40,9 @@ pub struct PersistedLogLsnWatchdog {
     persisted_lsns: BTreeMap<PartitionId, Lsn>,
     persist_lsn_interval: Option<time::Interval>,
     persist_lsn_threshold: Lsn,
+
+    // channel for updates from RocksDB events
+    applied_lsns_rx: mpsc::Receiver<(PartitionId, Lsn)>,
 }
 
 impl PersistedLogLsnWatchdog {
@@ -44,6 +50,7 @@ impl PersistedLogLsnWatchdog {
         mut configuration: impl LiveLoad<Live = StorageOptions> + 'static,
         partition_store_manager: PartitionStoreManager,
         watch_tx: watch::Sender<BTreeMap<PartitionId, Lsn>>,
+        applied_lsns_rx: mpsc::Receiver<(PartitionId, Lsn)>,
     ) -> Self {
         let options = configuration.live_load();
 
@@ -56,6 +63,7 @@ impl PersistedLogLsnWatchdog {
             persisted_lsns: BTreeMap::default(),
             persist_lsn_interval,
             persist_lsn_threshold,
+            applied_lsns_rx,
         }
     }
 
@@ -90,6 +98,10 @@ impl PersistedLogLsnWatchdog {
                 }
                 _ = config_watcher.changed() => {
                     self.on_config_update();
+                }
+                Some((partition_id, lsn)) = self.applied_lsns_rx.recv() => {
+                    self.persisted_lsns.insert(partition_id, lsn);
+                    let _ = self.watch_tx.send(self.persisted_lsns.clone());
                 }
             }
         }
@@ -170,7 +182,7 @@ mod tests {
     use std::ops::RangeInclusive;
     use std::time::Duration;
     use test_log::test;
-    use tokio::sync::watch;
+    use tokio::sync::{mpsc, watch};
     use tokio::time::Instant;
 
     #[test(restate_core::test(start_paused = true))]
@@ -198,11 +210,13 @@ mod tests {
             .expect("partition store present");
 
         let (watch_tx, mut watch_rx) = watch::channel(BTreeMap::default());
+        let (_, persisted_lsn_rx) = mpsc::channel(1);
 
         let watchdog = PersistedLogLsnWatchdog::new(
             Constant::new(storage_options.clone()),
             partition_store_manager.clone(),
             watch_tx,
+            persisted_lsn_rx,
         );
 
         let now = Instant::now();

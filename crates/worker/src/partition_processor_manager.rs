@@ -114,6 +114,8 @@ pub struct PartitionProcessorManager {
     snapshot_export_tasks: FuturesUnordered<TaskHandle<SnapshotResultInternal>>,
     snapshot_repository: Option<SnapshotRepository>,
     fast_forward_on_startup: HashMap<PartitionId, Lsn>,
+
+    persisted_lsn_rx: Option<mpsc::Receiver<(PartitionId, Lsn)>>,
 }
 
 struct PendingSnapshotTask {
@@ -186,6 +188,7 @@ impl PartitionProcessorManager {
         router_builder: &mut MessageRouterBuilder,
         bifrost: Bifrost,
         snapshot_repository: Option<SnapshotRepository>,
+        persisted_lsn_rx: mpsc::Receiver<(PartitionId, Lsn)>,
     ) -> Self {
         let ppm_svc_rx = router_builder.register_service(24, BackPressureMode::PushBack);
         let pp_rpc_rx = router_builder.register_service(24, BackPressureMode::PushBack);
@@ -214,6 +217,7 @@ impl PartitionProcessorManager {
             latest_snapshots: HashMap::default(),
             snapshot_repository,
             fast_forward_on_startup: HashMap::default(),
+            persisted_lsn_rx: Some(persisted_lsn_rx),
         }
     }
 
@@ -238,6 +242,7 @@ impl PartitionProcessorManager {
                 .boxed(),
             self.partition_store_manager.clone(),
             persisted_lsns_tx,
+            self.persisted_lsn_rx.take().unwrap(),
         );
         TaskCenter::spawn_child(TaskKind::Watchdog, "persisted-lsn-watchdog", watchdog.run())?;
         let metadata = Metadata::current();
@@ -1272,6 +1277,7 @@ mod tests {
         LogServerConfig, MetadataServerConfig, NodeConfig, NodesConfiguration, Role,
     };
     use restate_types::{GenerationalNodeId, Version};
+    use tokio::sync::mpsc;
     use std::time::Duration;
     use test_log::test;
 
@@ -1309,6 +1315,8 @@ mod tests {
         )
         .await?;
 
+        let (_, persisted_lsn_rx) = mpsc::channel(1);
+
         let partition_processor_manager = PartitionProcessorManager::new(
             health_status,
             Live::from_value(Configuration::default()),
@@ -1317,6 +1325,7 @@ mod tests {
             &mut env_builder.router_builder,
             bifrost,
             None,
+            persisted_lsn_rx,
         );
 
         let env = env_builder.build().await;

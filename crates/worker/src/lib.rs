@@ -21,6 +21,7 @@ mod subscription_integration;
 
 use codederror::CodedError;
 use restate_core::TaskCenter;
+use tokio::sync::mpsc;
 use std::time::Duration;
 
 use restate_bifrost::Bifrost;
@@ -122,9 +123,14 @@ impl Worker {
         metric_definitions::describe_metrics();
         health_status.update(WorkerStatus::StartingUp);
 
-        let partition_store_manager =
-            PartitionStoreManager::create(live_config.clone().map(|c| &c.worker.storage), &[])
-                .await?;
+        let (persisted_lsn_tx, persisted_lsn_rx) = mpsc::channel(100);
+
+        let partition_store_manager = PartitionStoreManager::create_with_persisted_lsn_listener(
+            live_config.clone().map(|c| &c.worker.storage),
+            &[],
+            persisted_lsn_tx,
+        )
+        .await?;
 
         let live_config_clone = live_config.clone();
         let config = live_config.live_load();
@@ -161,6 +167,7 @@ impl Worker {
             )
             .await
             .map_err(BuildError::SnapshotRepository)?,
+            persisted_lsn_rx,
         );
 
         let remote_scanner_manager = RemoteScannerManager::new(

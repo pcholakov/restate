@@ -14,6 +14,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use parking_lot::RwLock;
+use rocksdb::event_listener::{EventListener, EventListenerExt};
 use rocksdb::{BlockBasedOptions, Cache, LogLevel, WriteBufferManager};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -137,9 +138,26 @@ impl RocksDbManager {
 
     pub async fn open_db(
         &'static self,
+        updateable_opts: impl LiveLoad<Live = RocksDbOptions> + 'static,
+        db_spec: DbSpec,
+    ) -> Result<Arc<RocksDb>, RocksError> {
+        struct NoopListener;
+
+        impl EventListener for NoopListener {}
+
+        self.open_db_with_listener::<NoopListener>(updateable_opts, db_spec, None)
+            .await
+    }
+
+    pub async fn open_db_with_listener<T>(
+        &'static self,
         mut updateable_opts: impl LiveLoad<Live = RocksDbOptions> + 'static,
         mut db_spec: DbSpec,
-    ) -> Result<Arc<RocksDb>, RocksError> {
+        event_listener: Option<Arc<T>>,
+    ) -> Result<Arc<RocksDb>, RocksError>
+    where
+        T: EventListener + Send + Sync + Sized + 'static,
+    {
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
@@ -154,10 +172,11 @@ impl RocksDbManager {
         self.amend_db_options(&mut db_spec.db_options, &options);
 
         // todo: move to bg thread pool
-        let db = Arc::new(rocksdb::DB::open_db(
-            &db_spec,
-            self.default_cf_options(&options),
-        )?);
+        let mut db_opts = self.default_cf_options(&options);
+        if let Some(event_listener) = event_listener {
+            db_opts.add_event_listener(event_listener);
+        }
+        let db = Arc::new(rocksdb::DB::open_db(&db_spec, db_opts)?);
 
         let path = db_spec.path.clone();
         let wrapper = Arc::new(RocksDb::new(self, db_spec, db));

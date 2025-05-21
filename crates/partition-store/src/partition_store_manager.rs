@@ -79,6 +79,10 @@ impl PartitionStoreManager {
                 CfPrefixPattern::new(PARTITION_CF_PREFIX),
                 cf_options(per_partition_memory_budget),
             )
+            .add_cf_pattern(
+                CfPrefixPattern::new("snap_"),
+                cf_options(per_partition_memory_budget),
+            )
             .ensure_column_families(partition_ids_to_cfs(initial_partition_set))
             // This is added as an experiment. We might make this configurable to let users decide
             // on the trade-off between shutdown time and startup catchup time.
@@ -289,6 +293,11 @@ impl PartitionStoreManager {
 
         guard.remove(&partition_id);
         self.persisted_lsns.remove(&partition_id);
+    }
+
+    #[cfg(test)]
+    pub fn rocksdb(&self) -> Arc<RocksDb> {
+        self.rocksdb.clone()
     }
 
     #[cfg(test)]

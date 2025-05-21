@@ -68,7 +68,7 @@ async fn storage_test_environment_with_manager() -> (PartitionStoreManager, Part
     (manager, store)
 }
 
-#[restate_core::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_log::test(restate_core::test(flavor = "multi_thread", worker_threads = 2))]
 async fn test_read_write() {
     let (manager, store) = storage_test_environment_with_manager().await;
 

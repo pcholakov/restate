@@ -8,90 +8,73 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::ops::RangeInclusive;
-use std::time::SystemTime;
-
+use rocksdb::ExportImportFilesMetaData;
 use tempfile::tempdir;
 
 use restate_storage_api::Transaction;
-use restate_storage_api::fsm_table::{FsmTable, ReadOnlyFsmTable};
-use restate_types::config::WorkerOptions;
-use restate_types::identifiers::{PartitionKey, SnapshotId};
-use restate_types::live::Live;
-use restate_types::logs::{LogId, Lsn};
-use restate_types::time::MillisSinceEpoch;
+use restate_storage_api::fsm_table::FsmTable;
+use restate_types::identifiers::SnapshotId;
+use restate_types::logs::Lsn;
 
-use crate::snapshots::{LocalPartitionSnapshot, PartitionSnapshotMetadata, SnapshotFormatVersion};
 use crate::{PartitionStore, PartitionStoreManager};
 
 pub(crate) async fn run_tests(manager: PartitionStoreManager, mut partition_store: PartitionStore) {
-    insert_test_data(&mut partition_store).await;
+    for i in 1..100_000u64 {
+        eprintln!("LSN {}", i);
+        create_snapshot(&manager, &mut partition_store, Lsn::new(i)).await;
+    }
+}
+
+async fn create_snapshot(
+    _manager: &PartitionStoreManager,
+    mut partition_store: &mut PartitionStore,
+    lsn: Lsn,
+) {
+    insert_test_data(&mut partition_store, lsn).await;
 
     let snapshots_dir = tempdir().unwrap();
 
-    let partition_id = partition_store.partition_id();
+    // let partition_id = partition_store.partition_id();
 
     let snapshot = partition_store
         .create_snapshot(snapshots_dir.path(), None, SnapshotId::new())
         .await
         .unwrap();
 
-    let key_range = partition_store.partition_key_range().clone();
-    let snapshot_meta = PartitionSnapshotMetadata {
-        version: SnapshotFormatVersion::V1,
-        cluster_name: "cluster_name".to_string(),
-        partition_id,
-        node_name: "node".to_string(),
-        created_at: humantime::Timestamp::from(SystemTime::from(MillisSinceEpoch::new(0))),
-        snapshot_id: SnapshotId::from_parts(0, 0),
-        key_range: key_range.clone(),
-        log_id: Some(LogId::from(partition_id)),
-        min_applied_lsn: snapshot.min_applied_lsn,
-        db_comparator_name: snapshot.db_comparator_name.clone(),
-        files: snapshot.files.clone(),
-    };
-    let metadata_json = serde_json::to_string_pretty(&snapshot_meta).unwrap();
+    // let key_range = partition_store.partition_key_range().clone();
+    // let snapshot_meta = PartitionSnapshotMetadata {
+    //     version: SnapshotFormatVersion::V1,
+    //     cluster_name: "cluster_name".to_string(),
+    //     partition_id,
+    //     node_name: "node".to_string(),
+    //     created_at: humantime::Timestamp::from(SystemTime::from(MillisSinceEpoch::new(0))),
+    //     snapshot_id: SnapshotId::new(),
+    //     key_range: key_range.clone(),
+    //     log_id: Some(LogId::from(partition_id)),
+    //     min_applied_lsn: snapshot.min_applied_lsn,
+    //     db_comparator_name: snapshot.db_comparator_name.clone(),
+    //     files: snapshot.files.clone(),
+    // };
 
-    drop(partition_store);
-    drop(snapshot);
+    // We're not re-importing the snapshots now! PartitionStore::create_snapshot above checks the output
+    // manager.drop_partition(partition_id).await;
 
-    manager.drop_partition(partition_id).await;
+    let mut import_metadata = ExportImportFilesMetaData::default();
+    import_metadata.set_db_comparator_name(snapshot.db_comparator_name.as_str());
+    import_metadata.set_files(&snapshot.files);
 
-    let snapshot_meta: PartitionSnapshotMetadata = serde_json::from_str(&metadata_json).unwrap();
-
-    let snapshot = LocalPartitionSnapshot {
-        base_dir: snapshots_dir.path().into(),
-        log_id: LogId::from(partition_id),
-        min_applied_lsn: snapshot_meta.min_applied_lsn,
-        db_comparator_name: snapshot_meta.db_comparator_name.clone(),
-        files: snapshot_meta.files.clone(),
-        key_range,
-    };
-
-    let worker_options = Live::from_value(WorkerOptions::default());
-
-    let mut new_partition_store = manager
-        .open_partition_store_from_snapshot(
-            partition_id,
-            RangeInclusive::new(0, PartitionKey::MAX - 1),
-            snapshot,
-            &worker_options.pinned().storage.rocksdb,
-        )
-        .await
-        .unwrap();
-
-    verify_restored_data(&mut new_partition_store).await;
+    // verify_restored_data(&mut new_partition_store, lsn).await;
 }
 
-async fn insert_test_data(partition: &mut PartitionStore) {
-    let mut txn = partition.transaction();
-    txn.put_applied_lsn(Lsn::new(100)).await.unwrap();
+async fn insert_test_data(partition_store: &mut PartitionStore, lsn: Lsn) {
+    let mut txn = partition_store.transaction();
+    txn.put_applied_lsn(lsn).await.unwrap();
     txn.commit().await.expect("commit succeeds");
 }
 
-async fn verify_restored_data(partition: &mut PartitionStore) {
-    assert_eq!(
-        Lsn::new(100),
-        partition.get_applied_lsn().await.unwrap().unwrap()
-    );
-}
+// async fn verify_restored_data(partition_store: &mut PartitionStore, lsn: Lsn) {
+//     assert_eq!(
+//         lsn,
+//         partition_store.get_applied_lsn().await.unwrap().unwrap()
+//     );
+// }

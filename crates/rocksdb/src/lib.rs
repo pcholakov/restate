@@ -508,6 +508,14 @@ impl RocksDb {
             .unwrap();
         let _ = manager.async_spawn_unchecked(task).await;
     }
+
+    // #[cfg(test)]
+    pub fn drop_cf(&self, cf_name: CfName) -> Result<(), RocksError> {
+        self.db
+            .as_raw_db()
+            .drop_cf(cf_name.as_str())
+            .map_err(|e| RocksError::Other(e))
+    }
 }
 
 fn is_retryable_error(error_kind: rocksdb::ErrorKind) -> bool {

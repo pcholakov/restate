@@ -18,15 +18,17 @@ use bytes::Bytes;
 use bytes::BytesMut;
 use codederror::CodedError;
 use enum_map::Enum;
+use restate_types::config::RocksDbOptions;
 use rocksdb::DBPinnableSlice;
 use rocksdb::DBRawIteratorWithThreadMode;
+use rocksdb::ExportImportFilesMetaData;
 use rocksdb::PrefixRange;
 use rocksdb::ReadOptions;
 use rocksdb::table_properties::TablePropertiesExt;
 use rocksdb::{BoundColumnFamily, SliceTransform};
 use rocksdb::{DBCompressionType, SnapshotWithThreadMode};
 use static_assertions::const_assert_eq;
-use tracing::trace;
+use tracing::info;
 
 use restate_core::ShutdownError;
 use restate_rocksdb::CfName;
@@ -493,21 +495,82 @@ impl PartitionStore {
             .await
             .map_err(|e| StorageError::SnapshotExport(e.into()))?;
 
-        trace!(
+        info!(
             cf_name = ?self.data_cf_name,
             %applied_lsn,
             "Exported column family snapshot to {:?}",
             snapshot_dir
         );
 
-        Ok(LocalPartitionSnapshot {
+        let snapshot = LocalPartitionSnapshot {
             base_dir: snapshot_dir,
             files: metadata.get_files(),
             db_comparator_name: metadata.get_db_comparator_name(),
             log_id: LogId::from(self.partition_id),
             min_applied_lsn: applied_lsn,
             key_range: self.key_range.clone(),
-        })
+        };
+
+        self.validate_snapshot(snapshot_id, &snapshot, applied_lsn)
+            .await
+            .map_err(|err| SnapshotError::Internal(self.partition_id, err.to_string()))?;
+
+        Ok(snapshot)
+    }
+
+    async fn validate_snapshot(
+        &self,
+        snapshot_id: SnapshotId,
+        snapshot: &LocalPartitionSnapshot,
+        min_applied_lsn: Lsn,
+    ) -> anyhow::Result<()> {
+        let temp_cf = CfName::from(snapshot_id.to_string());
+        assert!(!self.rocksdb.inner().cf_handle(&temp_cf).is_some());
+
+        let mut import_metadata = ExportImportFilesMetaData::default();
+        import_metadata.set_db_comparator_name(snapshot.db_comparator_name.as_str());
+        import_metadata.set_files(&snapshot.files);
+
+        let opts = RocksDbOptions::default();
+        self.rocksdb
+            .import_cf(temp_cf.clone(), &opts, import_metadata)
+            .await?;
+
+        let mut partition_store = PartitionStore::new(
+            self.rocksdb.clone(),
+            CfName::from(snapshot_id.to_string()),
+            self.partition_id,
+            self.key_range.clone(),
+        );
+
+        let applied_lsn = partition_store.get_applied_lsn().await?;
+        // assert!(applied_lsn.is_some_and(|applied| applied >= min_applied_lsn));
+
+        drop(partition_store);
+
+        // #[cfg(test)]
+        self.rocksdb.drop_cf(temp_cf)?;
+
+        match applied_lsn {
+            Some(lsn) if lsn >= min_applied_lsn => {
+                info!(
+                    "Snapshot {} contains applied LSN {} >= reported min applied LSN {}",
+                    snapshot_id, lsn, min_applied_lsn
+                );
+                Ok(())
+            }
+            Some(lsn) => Err(anyhow!(
+                "Expected applied LSN >= {} in snapshot {} but actual applied LSN was {}",
+                min_applied_lsn,
+                snapshot_id,
+                lsn
+            )),
+            None => Err(anyhow!(
+                "Expected applied LSN >= {} in snapshot {} but there was no recorded applied LSN",
+                min_applied_lsn,
+                snapshot_id
+            )),
+        }
     }
 }
 

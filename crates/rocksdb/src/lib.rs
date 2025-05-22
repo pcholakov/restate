@@ -514,7 +514,7 @@ impl RocksDb {
         self.db
             .as_raw_db()
             .drop_cf(cf_name.as_str())
-            .map_err(|e| RocksError::Other(e))
+            .map_err(RocksError::Other)
     }
 }
 

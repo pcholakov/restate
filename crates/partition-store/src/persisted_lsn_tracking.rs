@@ -1,4 +1,5 @@
 use std::ffi::{CStr, CString};
+use std::path::Path;
 use std::sync::Arc;
 
 use ahash::HashMap;
@@ -120,16 +121,25 @@ impl EventListener for PersistedLsnEventListener {
                 .transpose();
 
             if let (Ok(ref partition_id), Ok(Some(ref lsn))) = (partition_id, lsn) {
+                let path = Path::new(&flush_job_info.file_path);
+                let sst_exists = std::fs::exists(path).unwrap_or(false);
                 info!(
                     %partition_id,
                     applied_lsn = %lsn,
                     cf_name = flush_job_info.cf_name,
                     file_path = flush_job_info.file_path,
+                    exists = sst_exists,
                     smallest_seqno = flush_job_info.smallest_seqno,
                     largest_seqno = flush_job_info.largest_seqno,
                     flush_reason = ?flush_job_info.flush_reason,
                     "Partition store flush"
                 );
+                if !sst_exists {
+                    warn!(
+                        "SST file {} did not exist at the time of flush event notification!",
+                        flush_job_info.file_path
+                    )
+                }
 
                 // Note: we only modify, never insert, entries from the event listener. If we don't
                 // find an existing entry for the partition, that means that the

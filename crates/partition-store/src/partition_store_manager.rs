@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ahash::HashMap;
 use rocksdb::ExportImportFilesMetaData;
 use rocksdb::event_listener::EventListenerExt;
-use tokio::sync::{RwLock, RwLockWriteGuard, Semaphore};
+use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
 use tracing::{debug, info, warn};
 
 use restate_core::worker_api::{SnapshotError, SnapshotErrorKind};
@@ -50,7 +50,7 @@ pub struct PartitionStoreManager {
     lookup: Arc<RwLock<PartitionLookup>>,
     persisted_lsns: Arc<PersistedLsnLookup>,
     rocksdb: Arc<RocksDb>,
-    snapshot_limiter: Arc<Semaphore>,
+    snapshot_limiter: Arc<RwLock<HashMap<PartitionId, Mutex<()>>>>,
 }
 
 type PartitionLookup = HashMap<PartitionId, PartitionStore>;
@@ -65,8 +65,13 @@ impl PartitionStoreManager {
         let per_partition_memory_budget = options.rocksdb_memory_budget()
             / options.num_partitions_to_share_memory_budget() as usize;
 
-        let snapshot_limiter =
-            Semaphore::new(options.rocksdb.rocksdb_max_background_jobs().get() as usize);
+        // let snapshot_limiter =
+        //     Semaphore::new(options.rocksdb.rocksdb_max_background_jobs().get() as usize);
+        // warn!("Using snapshot concurrency limit {}", snapshot_limiter.available_permits());
+        let mut snapshot_limiter: HashMap<PartitionId, Mutex<()>> = Default::default();
+        for (partition_id, _) in initial_partition_set {
+            snapshot_limiter.insert(*partition_id, Mutex::new(()));
+        }
 
         let mut db_opts = db_options();
 
@@ -99,7 +104,7 @@ impl PartitionStoreManager {
             lookup: Default::default(),
             persisted_lsns,
             rocksdb,
-            snapshot_limiter: Arc::new(snapshot_limiter),
+            snapshot_limiter: Arc::new(RwLock::new(snapshot_limiter)),
         })
     }
 
@@ -243,6 +248,10 @@ impl PartitionStoreManager {
             }
         };
         self.persisted_lsns.insert(partition_id, applied_lsn);
+        self.snapshot_limiter
+            .write()
+            .await
+            .insert(partition_id, Mutex::new(()));
 
         Ok(partition_store)
     }
@@ -251,6 +260,7 @@ impl PartitionStoreManager {
         self.persisted_lsns.get(&partition_id).map(|lsn| *lsn)
     }
 
+    #[tracing::instrument(skip_all, fields(partition_id = %partition_id, snapshot_id = %snapshot_id))]
     pub async fn export_partition_snapshot(
         &self,
         partition_id: PartitionId,
@@ -260,19 +270,22 @@ impl PartitionStoreManager {
     ) -> Result<LocalPartitionSnapshot, SnapshotError> {
         // Require a lock to prevent closing/reopening stores while a snapshot is ongoing. Failure
         // to do so can lead to exporting a partially-initialized store.
+        info!("Waiting for read-only lock on store lookup table");
         let guard = self.lookup.read().await;
-        info!("Obtained read-only lock for partition store lookup table");
+        // info!("Waiting for read-write lock on store lookup table");
+        // let guard = self.lookup.write().await;
+        info!("Obtained lock for partition store lookup table");
         let mut partition_store = guard.get(&partition_id).cloned().ok_or(SnapshotError {
             partition_id,
             kind: SnapshotErrorKind::PartitionNotFound,
         })?;
 
-        let _permit = self
-            .snapshot_limiter
-            .acquire()
-            .await
-            .expect("we never close the semaphore");
-        info!("Obtained snapshot concurrency limiter permit");
+        let snapshot_limiter_read = self.snapshot_limiter.read().await;
+        let _partition_guard = snapshot_limiter_read
+            .get(&partition_id)
+            .expect("Must have snapshot mutex for partition")
+            .lock();
+        info!("Obtained partition-level snapshot lock");
 
         partition_store
             .create_snapshot(snapshot_base_path, min_target_lsn, snapshot_id)
@@ -293,6 +306,7 @@ impl PartitionStoreManager {
 
         guard.remove(&partition_id);
         self.persisted_lsns.remove(&partition_id);
+        self.snapshot_limiter.write().await.remove(&partition_id);
     }
 
     #[cfg(test)]
@@ -313,6 +327,7 @@ impl PartitionStoreManager {
             partition_store.flush_memtables(true).await?;
         }
         self.persisted_lsns.remove(&partition_id);
+        self.snapshot_limiter.write().await.remove(&partition_id);
         Ok(())
     }
 }

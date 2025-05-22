@@ -496,7 +496,7 @@ impl PartitionStore {
             .map_err(|e| StorageError::SnapshotExport(e.into()))?;
 
         info!(
-            cf_name = ?self.data_cf_name,
+            cf_name = %self.data_cf_name,
             %applied_lsn,
             "Exported column family snapshot to {:?}",
             snapshot_dir
@@ -513,7 +513,7 @@ impl PartitionStore {
 
         self.validate_snapshot(snapshot_id, &snapshot, applied_lsn)
             .await
-            .map_err(|err| SnapshotError::Internal(self.partition_id, err.to_string()))?;
+            .map_err(|err| StorageError::SnapshotExport(anyhow!(err)))?;
 
         Ok(snapshot)
     }
@@ -544,7 +544,6 @@ impl PartitionStore {
         );
 
         let applied_lsn = partition_store.get_applied_lsn().await?;
-        // assert!(applied_lsn.is_some_and(|applied| applied >= min_applied_lsn));
 
         drop(partition_store);
 

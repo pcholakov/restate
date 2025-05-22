@@ -73,7 +73,7 @@ pub struct Service<T> {
     configuration: Live<Configuration>,
     metadata_writer: MetadataWriter,
 
-    processor_manager_client: PartitionProcessorManagerClient<Networking<T>>,
+    ppm_client: PartitionProcessorManagerClient<Networking<T>>,
     command_tx: mpsc::Sender<ClusterControllerCommand>,
     command_rx: mpsc::Receiver<ClusterControllerCommand>,
     health_status: HealthStatus<AdminStatus>,
@@ -136,7 +136,7 @@ where
             cluster_state_refresher,
             _replica_set_states: replica_set_states,
             metadata_writer,
-            processor_manager_client,
+            ppm_client: processor_manager_client,
             command_tx,
             command_rx,
             heartbeat_interval,
@@ -412,7 +412,7 @@ impl<T: TransportConnect> Service<T> {
                     "Asking node to snapshot partition"
                 );
 
-                let node_rpc_client = self.processor_manager_client.clone();
+                let node_rpc_client = self.ppm_client.clone();
                 let _ = TaskCenter::spawn_child(
                     TaskKind::Disposable,
                     "create-snapshot-response",

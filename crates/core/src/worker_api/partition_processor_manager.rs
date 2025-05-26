@@ -51,14 +51,9 @@ impl ProcessorsManagerHandle {
                 tx,
             })
             .await
-            .map_err(|e| SnapshotError {
-                partition_id,
-                kind: SnapshotErrorKind::Internal(e.into()),
-            })?;
-        rx.await.map_err(|e| SnapshotError {
-            partition_id,
-            kind: SnapshotErrorKind::Internal(e.into()),
-        })?
+            .map_err(|err| SnapshotError::internal(partition_id, err))?;
+        rx.await
+            .map_err(|err| SnapshotError::internal(partition_id, err))?
     }
 
     pub async fn get_state(
@@ -106,4 +101,45 @@ pub enum SnapshotErrorKind {
     RepositoryIo(#[source] anyhow::Error),
     #[error("Internal error")]
     Internal(anyhow::Error),
+}
+
+macro_rules! snapshot_error_helpers {
+    (
+        $($(#[$attr:meta])* $method:ident => $variant:ident $(($param_type:ty))?),* $(,)?
+    ) => {
+        impl SnapshotError {
+            $(
+                $(#[$attr])*
+                snapshot_error_helpers!(@method $method, $variant $(, $param_type)?);
+            )*
+        }
+    };
+
+    (@method $method:ident, $variant:ident) => {
+        pub fn $method(partition_id: PartitionId) -> Self {
+            SnapshotError {
+                partition_id,
+                kind: SnapshotErrorKind::$variant,
+            }
+        }
+    };
+
+    (@method $method:ident, $variant:ident, $param_type:ty) => {
+        pub fn $method<E: Into<anyhow::Error>>(partition_id: PartitionId, param: E) -> Self {
+            SnapshotError {
+                partition_id,
+                kind: SnapshotErrorKind::$variant(param.into()),
+            }
+        }
+    };
+}
+
+snapshot_error_helpers! {
+    partition_not_found => PartitionNotFound,
+    snapshot_in_progress => SnapshotInProgress,
+    invalid_state => InvalidState,
+    repository_not_configured => RepositoryNotConfigured,
+    export => Export(anyhow::Error),
+    repository_io => RepositoryIo(anyhow::Error),
+    internal => Internal(anyhow::Error),
 }

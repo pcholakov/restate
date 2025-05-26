@@ -52,7 +52,7 @@ use restate_core::network::{
 };
 use restate_core::worker_api::{
     ProcessorsManagerCommand, ProcessorsManagerHandle, SnapshotCreated, SnapshotError,
-    SnapshotErrorKind, SnapshotResult,
+    SnapshotResult,
 };
 use restate_core::{
     Metadata, MetadataWriter, ShutdownError, TaskCenterFutureExt, TaskHandle, TaskKind,
@@ -873,28 +873,19 @@ impl PartitionProcessorManager {
         let processor_state = match self.processor_states.get(&partition_id) {
             Some(state) => state,
             None => {
-                let _ = sender.send(Err(SnapshotError {
-                    partition_id,
-                    kind: SnapshotErrorKind::PartitionNotFound,
-                }));
+                let _ = sender.send(Err(SnapshotError::partition_not_found(partition_id)));
                 return;
             }
         };
 
         let snapshot_repository = self.snapshot_repository.clone();
         let Some(snapshot_repository) = snapshot_repository else {
-            let _ = sender.send(Err(SnapshotError {
-                partition_id,
-                kind: SnapshotErrorKind::RepositoryNotConfigured,
-            }));
+            let _ = sender.send(Err(SnapshotError::repository_not_configured(partition_id)));
             return;
         };
 
         if !processor_state.should_publish_snapshots() {
-            let _ = sender.send(Err(SnapshotError {
-                partition_id,
-                kind: SnapshotErrorKind::InvalidState,
-            }));
+            let _ = sender.send(Err(SnapshotError::invalid_state(partition_id)));
             return;
         }
 
@@ -1079,10 +1070,7 @@ impl PartitionProcessorManager {
                     }
                     Err(_shutdown) => {
                         if let Some(sender) = sender {
-                            let _ = sender.send(Err(SnapshotError {
-                                partition_id,
-                                kind: SnapshotErrorKind::InvalidState,
-                            }));
+                            let _ = sender.send(Err(SnapshotError::invalid_state(partition_id)));
                         }
                     }
                 }
@@ -1094,10 +1082,7 @@ impl PartitionProcessorManager {
                     "A snapshot export is already in progress, refusing to start a new export"
                 );
                 if let Some(sender) = sender {
-                    let _ = sender.send(Err(SnapshotError {
-                        partition_id,
-                        kind: SnapshotErrorKind::SnapshotInProgress,
-                    }));
+                    let _ = sender.send(Err(SnapshotError::snapshot_in_progress(partition_id)));
                 }
             }
         }

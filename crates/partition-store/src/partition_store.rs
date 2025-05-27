@@ -28,6 +28,7 @@ use rocksdb::table_properties::TablePropertiesExt;
 use rocksdb::{BoundColumnFamily, SliceTransform};
 use rocksdb::{DBCompressionType, SnapshotWithThreadMode};
 use static_assertions::const_assert_eq;
+use tracing::error;
 use tracing::info;
 
 use restate_core::ShutdownError;
@@ -489,6 +490,12 @@ impl PartitionStore {
             .map_err(|e| StorageError::SnapshotExport(e.into()))?;
         let snapshot_dir = snapshot_base_path.join(snapshot_id.to_string());
 
+        info!(
+            cf_name = %self.data_cf_name,
+            "Exporting column family snapshot to {:?}",
+            snapshot_dir
+        );
+
         let metadata = self
             .rocksdb
             .export_cf(self.data_cf_name.clone(), snapshot_dir.clone())
@@ -530,6 +537,7 @@ impl PartitionStore {
         let mut import_metadata = ExportImportFilesMetaData::default();
         import_metadata.set_db_comparator_name(snapshot.db_comparator_name.as_str());
         import_metadata.set_files(&snapshot.files);
+        info!(files = ?snapshot.files, "Testing applied LSN of snapshot {}", snapshot_id);
 
         let opts = RocksDbOptions::default();
         self.rocksdb
@@ -558,17 +566,29 @@ impl PartitionStore {
                 );
                 Ok(())
             }
-            Some(lsn) => Err(anyhow!(
-                "Expected applied LSN >= {} in snapshot {} but actual applied LSN was {}",
-                min_applied_lsn,
-                snapshot_id,
-                lsn
-            )),
-            None => Err(anyhow!(
-                "Expected applied LSN >= {} in snapshot {} but there was no recorded applied LSN",
-                min_applied_lsn,
-                snapshot_id
-            )),
+            Some(lsn) => {
+                error!(
+                    "Expected applied LSN >= {} in snapshot {} but actual applied LSN was {}",
+                    min_applied_lsn, snapshot_id, lsn
+                );
+                Err(anyhow!(
+                    "Expected applied LSN >= {} in snapshot {} but actual applied LSN was {}",
+                    min_applied_lsn,
+                    snapshot_id,
+                    lsn
+                ))
+            }
+            None => {
+                error!(
+                    "Expected applied LSN >= {} in snapshot {} but there was no recorded applied LSN",
+                    min_applied_lsn, snapshot_id
+                );
+                Err(anyhow!(
+                    "Expected applied LSN >= {} in snapshot {} but there was no recorded applied LSN",
+                    min_applied_lsn,
+                    snapshot_id
+                ))
+            }
         }
     }
 }

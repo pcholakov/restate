@@ -17,7 +17,6 @@ use futures::Stream;
 use restate_types::Version;
 use restate_types::partitions::PartitionTable;
 use tokio_stream::StreamExt;
-use tracing::info;
 
 use crate::{OpenMode, PartitionStore, PartitionStoreManager};
 use restate_rocksdb::RocksDbManager;
@@ -57,23 +56,22 @@ mod persisted_lsn_tracking_test;
 async fn storage_test_environment() -> PartitionStore {
     storage_test_environment_with_manager()
         .await
-        .1
+        .2
         .get(&PartitionId::MIN)
         .expect("at least one store available")
         .clone()
 }
 
 async fn storage_test_environment_with_manager()
--> (PartitionStoreManager, HashMap<PartitionId, PartitionStore>) {
+-> (&'static RocksDbManager, PartitionStoreManager, HashMap<PartitionId, PartitionStore>) {
     //
     // create a rocksdb storage from options
     //
     let num_stores = 128;
 
     let common_opts = CommonOptions::default();
-    info!("Test db base dir: {}", common_opts.base_dir().display());
 
-    RocksDbManager::init(Constant::new(common_opts));
+    let rocksdb = RocksDbManager::init(Constant::new(common_opts));
     let storage_options = StorageOptionsBuilder::default()
         .rocksdb_memory_budget(Some(NonZeroUsize::new(4 << 30).unwrap()))
         .num_partitions_to_share_memory_budget(Some(NonZeroU16::new(num_stores).unwrap()))
@@ -108,12 +106,12 @@ async fn storage_test_environment_with_manager()
         stores.insert(*partition_id, store);
     }
 
-    (manager, stores)
+    (rocksdb, manager, stores)
 }
 
 #[test_log::test(restate_core::test(flavor = "multi_thread", worker_threads = 2))]
 async fn test_read_write() {
-    let (manager, stores) = storage_test_environment_with_manager().await;
+    let (_rocksdb, manager, stores) = storage_test_environment_with_manager().await;
 
     //
     // run the tests
@@ -123,7 +121,10 @@ async fn test_read_write() {
     // state_table_test::run_tests(store.clone()).await;
     // virtual_object_status_table_test::run_tests(store.clone()).await;
     // timer_table_test::run_tests(store.clone()).await;
-    snapshots_test::run_snapshot_tests(manager.clone(), stores).await;
+
+    let res = snapshots_test::run_snapshot_tests(manager.clone(), stores).await;
+    // rocksdb.shutdown().await; // give rocksdb a chance to flush log output
+    res.expect("no errors");
 }
 
 pub(crate) fn mock_service_invocation(service_id: ServiceId) -> ServiceInvocation {

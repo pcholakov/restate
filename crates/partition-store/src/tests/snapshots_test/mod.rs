@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use anyhow::{anyhow, bail};
 use tempfile::tempdir;
 
 use restate_storage_api::Transaction;
@@ -24,7 +25,7 @@ use crate::{PartitionStore, PartitionStoreManager};
 pub(crate) async fn run_snapshot_tests(
     manager: PartitionStoreManager,
     stores: HashMap<PartitionId, PartitionStore>,
-) {
+) -> anyhow::Result<()> {
     let snapshots_dir = tempdir().unwrap().into_path();
     let mut workers = JoinSet::new();
 
@@ -49,12 +50,25 @@ pub(crate) async fn run_snapshot_tests(
                         snapshot_base_path.as_path(),
                     )
                     .await
-                    .unwrap();
+                    .map_err(|e| anyhow!("Snapshot error: {}", e))?;
             }
+
+            anyhow::Result::<_>::Ok(())
         });
     }
 
-    workers.join_all().await;
+    while let Some(join_res) = workers.join_next().await {
+        match join_res {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                // short-circuit
+                return Err(err);
+            }
+            Err(join_err) => bail!("Join error: {}", join_err),
+        }
+    }
+
+    Ok(())
 }
 
 async fn update_applied_lsn(partition_store: &mut PartitionStore, lsn: Lsn) {

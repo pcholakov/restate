@@ -413,7 +413,7 @@ impl RocksDb {
     #[tracing::instrument(skip_all, fields(db = %self.name))]
     pub async fn export_cf(
         &self,
-        name: CfName,
+        cf_name: CfName,
         export_dir: PathBuf,
     ) -> Result<ExportImportFilesMetaData, RocksError> {
         let db = self.db.clone();
@@ -423,17 +423,21 @@ impl RocksDb {
             .op(move || {
                 let _x = RocksDbPerfGuard::new("export-column-family");
 
+                info!(%cf_name, "Creating Checkpoint...");
                 let checkpoint = Checkpoint::new(db.as_raw_db()).unwrap();
 
                 let data_cf_handle = db
-                    .cf_handle(name.as_str())
-                    .ok_or_else(|| RocksError::UnknownColumnFamily(name.clone()))?;
+                    .cf_handle(cf_name.as_str())
+                    .ok_or_else(|| RocksError::UnknownColumnFamily(cf_name.clone()))?;
 
+                info!(%cf_name, "Exporting Checkpoint...");
                 let metadata = checkpoint
                     .export_column_family(&data_cf_handle, export_dir.as_path())
                     .map_err(RocksError::Other)?;
 
-                if metadata.get_files().is_empty() {
+                let files = metadata.get_files();
+                info!(%cf_name, ?files, "Exported Checkpoint");
+                if files.is_empty() {
                     error!(
                         "Refusing to create an empty snapshot! RocksDB column family export \
                         returned an empty set of files. The export is retained at: {}",

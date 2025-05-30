@@ -90,7 +90,7 @@ impl From<&PartitionSnapshotMetadata> for SnapshotCreated {
 }
 
 /// A locally-stored partition snapshot.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LocalPartitionSnapshot {
     pub base_dir: PathBuf,
     pub log_id: LogId,

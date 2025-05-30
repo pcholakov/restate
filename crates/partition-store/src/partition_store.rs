@@ -502,6 +502,16 @@ impl PartitionStore {
             .await
             .map_err(|e| StorageError::SnapshotExport(e.into()))?;
 
+        // let rocksdb = self.rocksdb.clone();
+        // let cf_name = self.data_cf_name.clone();
+        // let export_dir = snapshot_dir.clone();
+        // let metadata =
+        //     tokio::task::spawn_blocking(async move || rocksdb.export_cf(cf_name, export_dir).await)
+        //         .await
+        //         .map_err(|e| StorageError::Generic(anyhow::anyhow!(e)))?
+        //         .await
+        //         .map_err(|e| StorageError::SnapshotExport(e.into()))?;
+
         info!(
             cf_name = %self.data_cf_name,
             %applied_lsn,
@@ -518,21 +528,50 @@ impl PartitionStore {
             key_range: self.key_range.clone(),
         };
 
-        self.validate_snapshot(snapshot_id, &snapshot, applied_lsn)
-            .await
-            .map_err(|err| StorageError::SnapshotExport(anyhow!(err)))?;
+        let rocksdb = self.rocksdb.clone();
+        let partition_id = self.partition_id;
+        let key_range = self.key_range.clone();
+        // let import_snapshot = snapshot.clone();
+        // tokio::task::spawn_blocking(async move || {
+        //     Self::validate_snapshot(
+        //         rocksdb,
+        //         partition_id,
+        //         key_range,
+        //         snapshot_id,
+        //         &import_snapshot,
+        //         applied_lsn,
+        //     )
+        //     .await
+        // })
+        // .await
+        // .map_err(|e| StorageError::Generic(anyhow::anyhow!(e)))?
+        // .await
+        // .map_err(|e| StorageError::SnapshotExport(anyhow!(err)))?;
+
+        Self::validate_snapshot(
+            rocksdb,
+            partition_id,
+            key_range,
+            snapshot_id,
+            &snapshot,
+            applied_lsn,
+        )
+        .await
+        .map_err(|err| StorageError::SnapshotExport(anyhow!(err)))?;
 
         Ok(snapshot)
     }
 
     async fn validate_snapshot(
-        &self,
+        rocksdb: Arc<RocksDb>,
+        partition_id: PartitionId,
+        key_range: RangeInclusive<PartitionKey>,
         snapshot_id: SnapshotId,
         snapshot: &LocalPartitionSnapshot,
         min_applied_lsn: Lsn,
     ) -> anyhow::Result<()> {
         let temp_cf = CfName::from(snapshot_id.to_string());
-        assert!(!self.rocksdb.inner().cf_handle(&temp_cf).is_some());
+        assert!(rocksdb.inner().cf_handle(&temp_cf).is_none());
 
         let mut import_metadata = ExportImportFilesMetaData::default();
         import_metadata.set_db_comparator_name(snapshot.db_comparator_name.as_str());
@@ -540,15 +579,15 @@ impl PartitionStore {
         info!(files = ?snapshot.files, "Testing applied LSN of snapshot {}", snapshot_id);
 
         let opts = RocksDbOptions::default();
-        self.rocksdb
+        rocksdb
             .import_cf(temp_cf.clone(), &opts, import_metadata)
             .await?;
 
         let mut partition_store = PartitionStore::new(
-            self.rocksdb.clone(),
+            rocksdb.clone(),
             CfName::from(snapshot_id.to_string()),
-            self.partition_id,
-            self.key_range.clone(),
+            partition_id,
+            key_range.clone(),
         );
 
         let applied_lsn = partition_store.get_applied_lsn().await?;
@@ -556,7 +595,7 @@ impl PartitionStore {
         drop(partition_store);
 
         // #[cfg(test)]
-        self.rocksdb.drop_cf(temp_cf)?;
+        rocksdb.drop_cf(temp_cf)?;
 
         match applied_lsn {
             Some(lsn) if lsn >= min_applied_lsn => {

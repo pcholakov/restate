@@ -417,6 +417,7 @@ impl RocksDb {
         export_dir: PathBuf,
     ) -> Result<ExportImportFilesMetaData, RocksError> {
         let db = self.db.clone();
+        // let db = self.db;
         let task = StorageTask::default()
             .kind(StorageTaskKind::ExportColumnFamily)
             .priority(Priority::Low)

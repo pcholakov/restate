@@ -10,19 +10,44 @@
 
 #![allow(dead_code)]
 
+use ahash::HashMap;
+
 use crate::identifiers::{LeaderEpoch, PartitionId};
+use crate::replication::{NodeSet, ReplicationProperty};
+use crate::time::MillisSinceEpoch;
 use crate::{GenerationalNodeId, Version, Versioned, flexbuffers_storage_encode_decode};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EpochMetadata {
     version: Version,
     leader_metadata: LeaderMetadata,
+    // Optional fields for forward compatibility with newer versions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<PartitionConfiguration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<PartitionConfiguration>,
+    // Optional epoch field for forward compatibility
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_epoch: Option<LeaderEpoch>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LeaderMetadata {
     partition_id: PartitionId,
     node_id: GenerationalNodeId,
+}
+
+/// The Partition configuration contains information about which nodes run partition processors for
+/// the given partition.
+#[serde_with::serde_as]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PartitionConfiguration {
+    pub(crate) version: Version,
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    replication: ReplicationProperty,
+    replica_set: NodeSet,
+    modified_at: MillisSinceEpoch,
+    context: HashMap<String, String>,
 }
 
 impl Versioned for EpochMetadata {
@@ -39,6 +64,9 @@ impl EpochMetadata {
                 node_id,
                 partition_id,
             },
+            current: None,
+            next: None,
+            next_epoch: None,
         }
     }
 
@@ -63,6 +91,10 @@ impl EpochMetadata {
                 node_id,
                 partition_id,
             },
+            // Preserve optional fields for forward compatibility
+            current: self.current,
+            next: self.next,
+            next_epoch: self.next_epoch,
         }
     }
 }

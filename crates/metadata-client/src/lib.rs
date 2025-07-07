@@ -8,11 +8,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-pub mod grpc_svc_handler;
-mod metrics;
-mod pprof;
-mod prometheus_helpers;
-mod service;
-mod state;
+#[cfg(feature = "grpc-client")]
+mod remote_store;
 
-pub use service::NetworkServer;
+#[cfg(feature = "grpc-client")]
+pub use remote_store::*;

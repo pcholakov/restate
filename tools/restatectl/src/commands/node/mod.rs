@@ -47,10 +47,10 @@ pub(crate) async fn update_state<T>(
     metadata_client: &MetadataStoreClient,
     expected_states: &HashMap<GenerationalNodeId, T>,
     target_state: T,
-    state_mut: impl Fn(&mut NodeConfig) -> &mut T,
+    state_mut: impl Fn(&mut NodeConfig) -> &mut T + Send,
 ) -> Result<(), NodeOperationError>
 where
-    T: Copy + PartialEq + fmt::Display,
+    T: Copy + PartialEq + fmt::Display + Sync + Send,
 {
     metadata_client
         .read_modify_write(

@@ -1,0 +1,42 @@
+[package]
+name = "restate-metadata-client"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+test-util = ["restate-types/test-util", "restate-core/test-util", "restate-metadata-store/test-util"]
+grpc-client = ["restate-metadata-store/grpc-client", "tonic/transport", "tonic/gzip", "tonic/zstd", "prost"]
+
+[dependencies]
+restate-workspace-hack = { workspace = true }
+
+restate-core = { workspace = true }
+restate-types = { workspace = true }
+restate-metadata-store = { workspace = true }
+
+async-trait = { workspace = true }
+bytes = { workspace = true }
+bytestring = { workspace = true }
+humantime = { workspace = true }
+metrics = { workspace = true }
+prost = { workspace = true, optional = true }
+rand = { workspace = true }
+static_assertions = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, optional = true, features = ["codegen", "prost"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# restate-core = { workspace = true, features = ["test-util"] }
+restate-node = { workspace = true }
+
+anyhow = { workspace = true }
+googletest = { workspace = true, features = ["anyhow"] }
+test-log = { workspace = true }
+tokio-stream = { workspace = true }

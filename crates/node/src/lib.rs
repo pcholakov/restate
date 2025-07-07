@@ -12,7 +12,7 @@ mod cluster_marker;
 mod failure_detector;
 mod init;
 mod metric_definitions;
-mod network_server;
+pub mod network_server;
 mod roles;
 
 use std::time::Duration;

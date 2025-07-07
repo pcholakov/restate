@@ -34,6 +34,7 @@ restate-cli-util = { workspace = true }
 restate-core = { workspace = true }
 restate-futures-util = { workspace = true }
 restate-log-server-grpc = { workspace = true, features = ["grpc-client"] }
+restate-metadata-client = { workspace = true, features = ["grpc-client"] }
 restate-metadata-server-grpc = { workspace = true, features = ["grpc-client"] }
 restate-metadata-store = { workspace = true, features = ["grpc-client"] }
 restate-types = { workspace = true, features = ["clap"] }

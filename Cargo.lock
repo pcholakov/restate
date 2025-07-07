@@ -7267,6 +7267,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "restate-metadata-client"
+version = "1.4.2-dev"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "bytestring",
+ "googletest",
+ "humantime",
+ "metrics",
+ "prost",
+ "rand 0.9.1",
+ "restate-core",
+ "restate-metadata-store",
+ "restate-node",
+ "restate-types",
+ "restate-workspace-hack",
+ "static_assertions",
+ "test-log",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "restate-metadata-providers"
 version = "1.4.2-dev"
 dependencies = [
@@ -8275,6 +8302,7 @@ dependencies = [
  "restate-futures-util",
  "restate-local-cluster-runner",
  "restate-log-server-grpc",
+ "restate-metadata-client",
  "restate-metadata-server",
  "restate-metadata-server-grpc",
  "restate-metadata-store",

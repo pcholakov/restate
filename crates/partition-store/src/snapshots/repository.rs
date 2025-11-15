@@ -58,6 +58,7 @@ pub struct SnapshotRepository {
     prefix: ObjectPath,
     staging_dir: PathBuf,
     retain_snapshots: Option<std::num::NonZeroU8>,
+    snapshot_kind: restate_types::config::SnapshotKind,
 }
 
 /// S3 and other stores require a certain minimum size for the parts of a multipart upload. It is an
@@ -242,7 +243,10 @@ impl ArchivedLsn {
     pub fn get_latest_snapshot_lsn(&self) -> Lsn {
         match self {
             ArchivedLsn::None => Lsn::INVALID,
-            ArchivedLsn::Snapshot { latest_snapshot_lsn, .. } => *latest_snapshot_lsn,
+            ArchivedLsn::Snapshot {
+                latest_snapshot_lsn,
+                ..
+            } => *latest_snapshot_lsn,
         }
     }
 
@@ -351,6 +355,7 @@ impl SnapshotRepository {
             prefix: ObjectPath::from(prefix),
             staging_dir,
             retain_snapshots: snapshots_options.experimental_retain_snapshots,
+            snapshot_kind: snapshots_options.snapshot_kind,
         }))
     }
 
@@ -402,6 +407,125 @@ impl SnapshotRepository {
         }
     }
 
+    /// Upload SST files with deduplication support.
+    /// Returns a mapping from SST filename to repository key.
+    async fn upload_ssts_with_dedup(
+        &self,
+        snapshot: &PartitionSnapshotMetadata,
+        local_snapshot_path: &Path,
+        buf: &mut BytesMut,
+        progress: &mut SnapshotUploadProgress,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        use restate_types::config::SnapshotKind;
+
+        let mut file_keys = std::collections::BTreeMap::new();
+        let mut total_size = 0usize;
+        let mut uploaded_size = 0usize;
+        let mut files_uploaded = 0usize;
+        let mut files_skipped = 0usize;
+
+        for file in &snapshot.files {
+            let filename = file.name.trim_start_matches("/");
+            total_size += file.size;
+
+            let (repository_key, should_upload) = match self.snapshot_kind {
+                SnapshotKind::Full => {
+                    // Full mode: upload to snapshot-specific prefix (legacy behavior)
+                    let key = self.get_snapshot_file(snapshot, filename);
+                    (key, true)
+                }
+                SnapshotKind::Incremental => {
+                    // Incremental mode: upload to shared ssts/ directory with deduplication
+                    let node_id = Metadata::with_current(|m| m.my_node_id().as_plain());
+                    let sst_key = format!("{}_{}", node_id, filename);
+                    let full_key = self
+                        .get_partition_snapshots_prefix(snapshot.partition_id)
+                        .child("ssts")
+                        .child(sst_key.as_str());
+
+                    // Check if SST already exists
+                    let should_upload = match self.object_store.head(&full_key).await {
+                        Ok(meta) => {
+                            if meta.size == file.size as u64 {
+                                debug!(
+                                    sst = %filename,
+                                    size = file.size,
+                                    "SST already exists in repository, skipping upload"
+                                );
+                                files_skipped += 1;
+                                false
+                            } else {
+                                warn!(
+                                    sst = %filename,
+                                    local_size = file.size,
+                                    remote_size = meta.size,
+                                    "SST size mismatch, re-uploading"
+                                );
+                                true
+                            }
+                        }
+                        Err(object_store::Error::NotFound { .. }) => true,
+                        Err(e) => {
+                            warn!(
+                                sst = %filename,
+                                error = %e,
+                                "Failed to check if SST exists, uploading to be safe"
+                            );
+                            true
+                        }
+                    };
+
+                    (full_key, should_upload)
+                }
+            };
+
+            if should_upload {
+                let local_path = local_snapshot_path.join(filename);
+                put_snapshot_object(&local_path, &repository_key, &self.object_store, buf).await?;
+
+                debug!(
+                    sst = %filename,
+                    size = file.size,
+                    repository_key = %repository_key,
+                    "Uploaded SST to repository"
+                );
+
+                files_uploaded += 1;
+                uploaded_size += file.size;
+                progress.push(file.name.clone());
+            }
+
+            // Store the relative key (for incremental) or empty (for full, backward compat)
+            if matches!(self.snapshot_kind, SnapshotKind::Incremental) {
+                let node_id = Metadata::with_current(|m| m.my_node_id().as_plain());
+                let relative_key = format!("ssts/{}_{}", node_id, filename);
+                file_keys.insert(file.name.clone(), relative_key);
+            }
+        }
+
+        // Log deduplication stats
+        if matches!(self.snapshot_kind, SnapshotKind::Incremental) && files_skipped > 0 {
+            let dedup_rate = if total_size > 0 {
+                ((total_size - uploaded_size) as f64 / total_size as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            info!(
+                partition_id = %snapshot.partition_id,
+                snapshot_id = %snapshot.snapshot_id,
+                files_uploaded = files_uploaded,
+                files_skipped = files_skipped,
+                bytes_uploaded = uploaded_size,
+                bytes_saved = total_size - uploaded_size,
+                dedup_rate = format!("{:.1}%", dedup_rate),
+                "Snapshot SST upload completed with deduplication"
+            );
+        }
+
+        Ok(file_keys)
+    }
+
     // It is the outer put method's responsibility to clean up partial progress.
     async fn put_snapshot_inner(
         &self,
@@ -416,26 +540,22 @@ impl SnapshotRepository {
 
         let mut progress = SnapshotUploadProgress::with_snapshot_path(snapshot_prefix);
         let mut buf = BytesMut::new();
-        for file in &snapshot.files {
-            let filename = file.name.trim_start_matches("/");
-            let key = self.get_snapshot_file(snapshot, filename);
 
-            let put_result = put_snapshot_object(
-                local_snapshot_path.join(filename).as_path(),
-                &key,
-                &self.object_store,
-                &mut buf,
-            )
+        // Upload SSTs and collect file_keys mapping
+        let file_keys = self
+            .upload_ssts_with_dedup(snapshot, local_snapshot_path, &mut buf, &mut progress)
             .await
             .map_err(|e| PutSnapshotError::from(e, progress.clone()))?;
 
-            debug!(etag = put_result.e_tag.unwrap_or_default(), %key, "Put snapshot object completed");
-            progress.push(file.name.clone());
-        }
+        // Create snapshot metadata with file_keys populated
+        let snapshot_with_keys = PartitionSnapshotMetadata {
+            file_keys,
+            ..snapshot.clone()
+        };
 
-        let metadata_key = self.get_snapshot_file(snapshot, "metadata.json");
+        let metadata_key = self.get_snapshot_file(&snapshot_with_keys, "metadata.json");
         let metadata_json_payload = PutPayload::from(
-            serde_json::to_string_pretty(snapshot).expect("Can always serialize JSON"),
+            serde_json::to_string_pretty(&snapshot_with_keys).expect("Can always serialize JSON"),
         );
 
         let put_result = self
@@ -451,20 +571,20 @@ impl SnapshotRepository {
             "Successfully published snapshot metadata",
         );
 
-        let latest_path = self.get_latest_snapshot_pointer(snapshot.partition_id);
+        let latest_path = self.get_latest_snapshot_pointer(snapshot_with_keys.partition_id);
 
         let maybe_stored = self
-            .get_latest_snapshot_metadata_for_update(snapshot, &latest_path)
+            .get_latest_snapshot_metadata_for_update(&snapshot_with_keys, &latest_path)
             .await
             .map_err(|e| PutSnapshotError::from(e, progress.clone()))?;
 
         if maybe_stored.as_ref().is_some_and(|(latest_stored, _)| {
-            latest_stored.min_applied_lsn >= snapshot.min_applied_lsn
+            latest_stored.min_applied_lsn >= snapshot_with_keys.min_applied_lsn
         }) {
             let (latest_stored, _) = maybe_stored.expect("is some");
             info!(
                 repository_latest_lsn = ?latest_stored.min_applied_lsn,
-                new_snapshot_lsn = ?snapshot.min_applied_lsn,
+                new_snapshot_lsn = ?snapshot_with_keys.min_applied_lsn,
                 "The newly uploaded snapshot is no newer than the already-stored latest snapshot, will not update latest pointer"
             );
             return Ok(ArchivedLsn::from(&latest_stored));
@@ -472,9 +592,9 @@ impl SnapshotRepository {
 
         let format_version = self.determine_format_version(maybe_stored.as_ref().map(|(l, _)| l));
         let new_latest = match format_version {
-            LatestSnapshotVersion::V1 => self.build_latest_v1(snapshot),
+            LatestSnapshotVersion::V1 => self.build_latest_v1(&snapshot_with_keys),
             LatestSnapshotVersion::V2 => self
-                .build_latest_v2(snapshot, maybe_stored.as_ref().map(|(l, _)| l))
+                .build_latest_v2(&snapshot_with_keys, maybe_stored.as_ref().map(|(l, _)| l))
                 .map_err(|e| PutSnapshotError::from(e, progress.clone()))?,
         };
 
@@ -614,11 +734,12 @@ impl SnapshotRepository {
         partition_id: PartitionId,
         cleanup_snapshots: Vec<SnapshotReference>,
     ) {
+        let retained_snapshots = self.get_current_retained_snapshots(partition_id).await;
         let mut successfully_deleted = HashSet::new();
 
         for snapshot_ref in &cleanup_snapshots {
             if self
-                .delete_snapshot_files(partition_id, snapshot_ref)
+                .delete_snapshot_files(partition_id, snapshot_ref, &retained_snapshots)
                 .await
                 .is_ok()
             {
@@ -633,10 +754,49 @@ impl SnapshotRepository {
         }
     }
 
+    async fn get_current_retained_snapshots(
+        &self,
+        partition_id: PartitionId,
+    ) -> Vec<SnapshotReference> {
+        let latest_path = self.get_latest_snapshot_pointer(partition_id);
+        match self.object_store.get(&latest_path).await {
+            Ok(result) => match result.bytes().await {
+                Ok(bytes) => match serde_json::from_slice::<LatestSnapshot>(&bytes) {
+                    Ok(latest) => latest.get_effective_retained_snapshots(),
+                    Err(e) => {
+                        debug!(
+                            %partition_id,
+                            error = %e,
+                            "Failed to deserialize latest snapshot during cleanup; continuing without retained snapshot info"
+                        );
+                        vec![]
+                    }
+                },
+                Err(e) => {
+                    debug!(
+                        %partition_id,
+                        error = %e,
+                        "Failed to read latest snapshot during cleanup; continuing without retained snapshot info"
+                    );
+                    vec![]
+                }
+            },
+            Err(e) => {
+                debug!(
+                    %partition_id,
+                    error = %e,
+                    "Failed to fetch latest snapshot during cleanup; continuing without retained snapshot info"
+                );
+                vec![]
+            }
+        }
+    }
+
     async fn delete_snapshot_files(
         &self,
         partition_id: PartitionId,
         snapshot_ref: &SnapshotReference,
+        retained_snapshots: &[SnapshotReference],
     ) -> anyhow::Result<()> {
         let metadata_path = self
             .prefix
@@ -650,27 +810,95 @@ impl SnapshotRepository {
                 serde_json::from_slice::<PartitionSnapshotMetadata>(&bytes)?
             }
             Err(object_store::Error::NotFound { .. }) => {
-                // already deleted, this is fine
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
         };
 
+        let mut referenced_sst_keys = HashSet::new();
+        for retained_ref in retained_snapshots {
+            if retained_ref.snapshot_id == snapshot_ref.snapshot_id {
+                continue;
+            }
+
+            let retained_metadata_path = self
+                .prefix
+                .child(partition_id.to_string())
+                .child(retained_ref.path.as_str())
+                .child("metadata.json");
+
+            if let Ok(data) = self.object_store.get(&retained_metadata_path).await
+                && let Ok(bytes) = data.bytes().await
+                && let Ok(retained_metadata) =
+                    serde_json::from_slice::<PartitionSnapshotMetadata>(&bytes)
+            {
+                for file in &retained_metadata.files {
+                    let filename = file.name.trim_start_matches("/");
+                    let sst_key =
+                        if let Some(relative_key) = retained_metadata.file_keys.get(&file.name) {
+                            let parts: Vec<&str> = relative_key.split('/').collect();
+                            if parts.len() == 2 {
+                                self.prefix
+                                    .child(partition_id.to_string())
+                                    .child(parts[0])
+                                    .child(parts[1])
+                            } else {
+                                self.prefix
+                                    .child(partition_id.to_string())
+                                    .child(relative_key.as_str())
+                            }
+                        } else {
+                            self.prefix
+                                .child(partition_id.to_string())
+                                .child(retained_ref.path.as_str())
+                                .child(filename)
+                        };
+                    referenced_sst_keys.insert(sst_key);
+                }
+            }
+        }
+
         let mut failed_deletes = vec![];
-        for path in metadata
-            .files
-            .iter()
-            .map(|filename| {
-                self.get_snapshot_file(&metadata, filename.name.trim_start_matches("/"))
-            })
-            .chain(vec![metadata_path].into_iter())
-        {
+        for file in &metadata.files {
+            let filename = file.name.trim_start_matches("/");
+
+            // Build the actual path for this SST file, respecting file_keys for incremental snapshots
+            let path = if let Some(relative_key) = metadata.file_keys.get(&file.name) {
+                // Incremental snapshot: SST is in shared directory (e.g., "ssts/N1_001.sst")
+                let parts: Vec<&str> = relative_key.split('/').collect();
+                if parts.len() == 2 {
+                    self.prefix
+                        .child(partition_id.to_string())
+                        .child(parts[0])
+                        .child(parts[1])
+                } else {
+                    self.prefix
+                        .child(partition_id.to_string())
+                        .child(relative_key.as_str())
+                }
+            } else {
+                // Legacy full snapshot: SST is in snapshot-specific directory
+                self.get_snapshot_file(&metadata, filename)
+            };
+
+            if referenced_sst_keys.contains(&path) {
+                debug!(%path, "Skipping deletion of SST file still referenced by retained snapshots");
+                continue;
+            }
+
             if let Err(err) = self.object_store.delete(&path).await
                 && !matches!(err, object_store::Error::NotFound { .. })
             {
                 debug!(%path, "Failed deleting snapshot object: {err}");
                 failed_deletes.push(err);
             }
+        }
+
+        if let Err(err) = self.object_store.delete(&metadata_path).await
+            && !matches!(err, object_store::Error::NotFound { .. })
+        {
+            debug!(%metadata_path, "Failed deleting snapshot metadata: {err}");
+            failed_deletes.push(err);
         }
 
         if failed_deletes.is_empty() {
@@ -892,11 +1120,31 @@ impl SnapshotRepository {
         for file in &mut snapshot_metadata.files {
             let filename = file.name.trim_start_matches("/");
             let expected_size = file.size;
-            let key = self
-                .prefix
-                .child(partition_id.to_string())
-                .child(latest.path.as_str())
-                .child(filename);
+
+            // Check file_keys for incremental snapshots, fallback to legacy path
+            let key = if let Some(relative_key) = snapshot_metadata.file_keys.get(&file.name) {
+                // Incremental snapshot: parse the relative key and build proper path
+                // Expected format: "ssts/{node_id}_{filename}"
+                let parts: Vec<&str> = relative_key.split('/').collect();
+                if parts.len() == 2 {
+                    self.prefix
+                        .child(partition_id.to_string())
+                        .child(parts[0]) // "ssts"
+                        .child(parts[1]) // "{node_id}_{filename}"
+                } else {
+                    // Fallback if format is unexpected
+                    self.prefix
+                        .child(partition_id.to_string())
+                        .child(relative_key.as_str())
+                }
+            } else {
+                // Full/legacy snapshot: use snapshot-specific path
+                self.prefix
+                    .child(partition_id.to_string())
+                    .child(latest.path.as_str())
+                    .child(filename)
+            };
+
             let local_path = snapshot_dir.path().join(filename);
             let concurrency_limiter = Arc::clone(&concurrency_limiter);
             let object_store = Arc::clone(&self.object_store);
@@ -1428,13 +1676,14 @@ mod tests {
                 directory,
                 size,
                 level: 0,
-                start_key: Some(vec![0]),
-                end_key: Some(vec![0xff, 0xff]),
+                start_key: None,
+                end_key: None,
                 num_entries: 0,
                 num_deletions: 0,
                 smallest_seqno: 0,
                 largest_seqno: 0,
             }],
+            file_keys: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1787,6 +2036,288 @@ mod tests {
             archived.get_archived_lsn(),
             Lsn::new(1342),
             "ArchivedLsn should report the earliest snapshot LSN (1342)"
+        );
+
+        Ok(())
+    }
+
+    #[restate_core::test]
+    async fn test_incremental_snapshot_sst_cleanup() -> anyhow::Result<()> {
+        use super::*;
+        use bytes::Bytes;
+        use object_store::PutPayload;
+        use restate_core::{MetadataBuilder, TaskCenter};
+        use std::collections::BTreeMap;
+        use std::num::NonZeroU8;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+        use url::Url;
+
+        let metadata_builder = MetadataBuilder::default();
+        TaskCenter::try_set_global_metadata(metadata_builder.to_metadata());
+        metadata_builder
+            .to_metadata()
+            .set(Arc::new(create_mock_nodes_config(1, 1)).into());
+
+        let snapshots_destination = TempDir::new()?;
+        let destination = Url::from_file_path(snapshots_destination.path())
+            .unwrap()
+            .to_string();
+
+        let opts = SnapshotsOptions {
+            destination: Some(destination.clone()),
+            experimental_retain_snapshots: Some(NonZeroU8::new(2).unwrap()),
+            ..SnapshotsOptions::default()
+        };
+
+        let repository =
+            SnapshotRepository::create_if_configured(&opts, TempDir::new().unwrap().keep())
+                .await?
+                .unwrap();
+
+        let partition_prefix = repository.prefix.child(PartitionId::MIN.to_string());
+        let ssts_prefix = partition_prefix.child("ssts");
+
+        // Manually create SST files in the ssts/ directory
+        let sst_001_path = ssts_prefix.child("N1_001.sst");
+        let sst_002_path = ssts_prefix.child("N1_002.sst");
+        let sst_003_path = ssts_prefix.child("N1_003.sst");
+        let sst_004_path = ssts_prefix.child("N1_004.sst");
+
+        repository
+            .object_store
+            .put(&sst_001_path, PutPayload::from(Bytes::from("data-001")))
+            .await?;
+        repository
+            .object_store
+            .put(&sst_002_path, PutPayload::from(Bytes::from("data-002")))
+            .await?;
+        repository
+            .object_store
+            .put(&sst_003_path, PutPayload::from(Bytes::from("data-003")))
+            .await?;
+        repository
+            .object_store
+            .put(&sst_004_path, PutPayload::from(Bytes::from("data-004")))
+            .await?;
+
+        // Create snapshot metadata manually
+        let mut file_keys_1 = BTreeMap::new();
+        file_keys_1.insert("/001.sst".to_string(), "ssts/N1_001.sst".to_string());
+        file_keys_1.insert("/002.sst".to_string(), "ssts/N1_002.sst".to_string());
+
+        let snapshot1 = PartitionSnapshotMetadata {
+            version: SnapshotFormatVersion::V1,
+            cluster_name: "test".to_string(),
+            cluster_fingerprint: None,
+            partition_id: PartitionId::MIN,
+            node_name: "node1".to_string(),
+            created_at: humantime::Timestamp::from(SystemTime::now()),
+            snapshot_id: SnapshotId::new(),
+            key_range: PartitionKey::MIN..=PartitionKey::MAX,
+            log_id: LogId::MIN,
+            min_applied_lsn: Lsn::new(1000),
+            db_comparator_name: "test".to_string(),
+            files: vec![
+                rocksdb::LiveFile {
+                    column_family_name: "default".to_string(),
+                    name: "/001.sst".to_string(),
+                    directory: "".to_string(),
+                    size: 8,
+                    level: 0,
+                    start_key: None,
+                    end_key: None,
+                    smallest_seqno: 0,
+                    largest_seqno: 0,
+                    num_entries: 0,
+                    num_deletions: 0,
+                },
+                rocksdb::LiveFile {
+                    column_family_name: "default".to_string(),
+                    name: "/002.sst".to_string(),
+                    directory: "".to_string(),
+                    size: 8,
+                    level: 0,
+                    start_key: None,
+                    end_key: None,
+                    smallest_seqno: 0,
+                    largest_seqno: 0,
+                    num_entries: 0,
+                    num_deletions: 0,
+                },
+            ],
+            file_keys: file_keys_1,
+        };
+
+        // Upload snapshot1 metadata
+        let snap1_prefix =
+            partition_prefix.child(UniqueSnapshotKey::from_metadata(&snapshot1).padded_key());
+        repository
+            .object_store
+            .put(
+                &snap1_prefix.child("metadata.json"),
+                PutPayload::from(serde_json::to_string_pretty(&snapshot1)?),
+            )
+            .await?;
+
+        // Create snapshot 2
+        let mut file_keys_2 = BTreeMap::new();
+        file_keys_2.insert("/002.sst".to_string(), "ssts/N1_002.sst".to_string());
+        file_keys_2.insert("/003.sst".to_string(), "ssts/N1_003.sst".to_string());
+
+        let snapshot2 = PartitionSnapshotMetadata {
+            min_applied_lsn: Lsn::new(2000),
+            snapshot_id: SnapshotId::new(),
+            files: vec![
+                rocksdb::LiveFile {
+                    column_family_name: "default".to_string(),
+                    name: "/002.sst".to_string(),
+                    directory: "".to_string(),
+                    size: 8,
+                    level: 0,
+                    start_key: None,
+                    end_key: None,
+                    smallest_seqno: 0,
+                    largest_seqno: 0,
+                    num_entries: 0,
+                    num_deletions: 0,
+                },
+                rocksdb::LiveFile {
+                    column_family_name: "default".to_string(),
+                    name: "/003.sst".to_string(),
+                    directory: "".to_string(),
+                    size: 8,
+                    level: 0,
+                    start_key: None,
+                    end_key: None,
+                    smallest_seqno: 0,
+                    largest_seqno: 0,
+                    num_entries: 0,
+                    num_deletions: 0,
+                },
+            ],
+            file_keys: file_keys_2,
+            ..snapshot1.clone()
+        };
+
+        let snap2_prefix =
+            partition_prefix.child(UniqueSnapshotKey::from_metadata(&snapshot2).padded_key());
+        repository
+            .object_store
+            .put(
+                &snap2_prefix.child("metadata.json"),
+                PutPayload::from(serde_json::to_string_pretty(&snapshot2)?),
+            )
+            .await?;
+
+        // Create snapshot 3
+        let mut file_keys_3 = BTreeMap::new();
+        file_keys_3.insert("/003.sst".to_string(), "ssts/N1_003.sst".to_string());
+        file_keys_3.insert("/004.sst".to_string(), "ssts/N1_004.sst".to_string());
+
+        let snapshot3 = PartitionSnapshotMetadata {
+            min_applied_lsn: Lsn::new(3000),
+            snapshot_id: SnapshotId::new(),
+            files: vec![
+                rocksdb::LiveFile {
+                    column_family_name: "default".to_string(),
+                    name: "/003.sst".to_string(),
+                    directory: "".to_string(),
+                    size: 8,
+                    level: 0,
+                    start_key: None,
+                    end_key: None,
+                    smallest_seqno: 0,
+                    largest_seqno: 0,
+                    num_entries: 0,
+                    num_deletions: 0,
+                },
+                rocksdb::LiveFile {
+                    column_family_name: "default".to_string(),
+                    name: "/004.sst".to_string(),
+                    directory: "".to_string(),
+                    size: 8,
+                    level: 0,
+                    start_key: None,
+                    end_key: None,
+                    smallest_seqno: 0,
+                    largest_seqno: 0,
+                    num_entries: 0,
+                    num_deletions: 0,
+                },
+            ],
+            file_keys: file_keys_3,
+            ..snapshot1.clone()
+        };
+
+        let snap3_prefix =
+            partition_prefix.child(UniqueSnapshotKey::from_metadata(&snapshot3).padded_key());
+        repository
+            .object_store
+            .put(
+                &snap3_prefix.child("metadata.json"),
+                PutPayload::from(serde_json::to_string_pretty(&snapshot3)?),
+            )
+            .await?;
+
+        // Create latest.json with retention (snapshot 1 pending deletion, snapshots 2 and 3 retained)
+        let latest = LatestSnapshot {
+            version: LatestSnapshotVersion::V2,
+            partition_id: PartitionId::MIN,
+            cluster_name: "test".to_string(),
+            cluster_fingerprint: None,
+            node_name: "node1".to_string(),
+            created_at: humantime::Timestamp::from(SystemTime::now()),
+            snapshot_id: snapshot3.snapshot_id,
+            min_applied_lsn: snapshot3.min_applied_lsn,
+            path: UniqueSnapshotKey::from_metadata(&snapshot3).padded_key(),
+            retained_snapshots: vec![
+                SnapshotReference::from_metadata(&snapshot3),
+                SnapshotReference::from_metadata(&snapshot2),
+            ],
+            pending_deletions: vec![SnapshotReference::from_metadata(&snapshot1)],
+        };
+
+        repository
+            .object_store
+            .put(
+                &partition_prefix.child("latest.json"),
+                PutPayload::from(serde_json::to_string_pretty(&latest)?),
+            )
+            .await?;
+
+        // Trigger cleanup manually
+        repository
+            .cleanup_pending_deletions(PartitionId::MIN, latest.pending_deletions.clone())
+            .await;
+
+        // After cleanup:
+        // - SST 001 should be DELETED (only in snapshot 1, which was deleted)
+        // - SST 002 should exist (still in retained snapshot 2)
+        // - SST 003 should exist (in snapshots 2 and 3, both retained)
+        // - SST 004 should exist (in snapshot 3, which is retained)
+
+        let sst_001_result = repository.object_store.get(&sst_001_path).await;
+        let sst_002_result = repository.object_store.get(&sst_002_path).await;
+        let sst_003_result = repository.object_store.get(&sst_003_path).await;
+        let sst_004_result = repository.object_store.get(&sst_004_path).await;
+
+        // BUG: This will fail because SST 001 is NOT deleted (it's orphaned)
+        assert!(
+            sst_001_result.is_err(),
+            "SST 001 should be deleted (only in deleted snapshot 1)"
+        );
+        assert!(
+            sst_002_result.is_ok(),
+            "SST 002 should exist (still in retained snapshot 2)"
+        );
+        assert!(
+            sst_003_result.is_ok(),
+            "SST 003 should exist (in retained snapshots 2 and 3)"
+        );
+        assert!(
+            sst_004_result.is_ok(),
+            "SST 004 should exist (in retained snapshot 3)"
         );
 
         Ok(())

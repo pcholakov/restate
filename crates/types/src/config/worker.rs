@@ -434,6 +434,23 @@ impl Default for StorageOptions {
     }
 }
 
+/// # Snapshot kind
+///
+/// Controls whether snapshots use full or incremental mode.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum SnapshotKind {
+    /// Each snapshot uploads all SST files to a snapshot-specific directory.
+    /// This is the traditional behavior with no deduplication.
+    #[default]
+    Full,
+    /// SST files are uploaded to a shared ssts/ directory with deduplication.
+    /// Files are named {node_id}_{filename} (e.g., N1_000752.sst) where node_id is the plain node ID.
+    /// This enables reuse across snapshots from the same node while avoiding collisions.
+    Incremental,
+}
+
 /// # Snapshot options
 ///
 /// Partition store object-store snapshotting settings. At a minimum, set `destination` to enable
@@ -507,6 +524,20 @@ pub struct SnapshotsOptions {
     #[cfg_attr(feature = "schemars", schemars(skip))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experimental_retain_snapshots: Option<NonZeroU8>,
+
+    /// # Snapshot kind
+    ///
+    /// Controls whether snapshots use full or incremental mode.
+    /// - Full: Each snapshot uploads all SST files to snapshot-specific prefix (default)
+    /// - Incremental: SST files uploaded to shared ssts/ directory with deduplication
+    ///
+    /// Incremental mode reduces network bandwidth by skipping upload of SST files that
+    /// already exist in the repository. This is most effective for frequent snapshots
+    /// where many SST files remain unchanged between snapshots.
+    ///
+    /// Default: `Full`
+    #[serde(default)]
+    pub snapshot_kind: SnapshotKind,
 }
 
 impl Default for SnapshotsOptions {
@@ -518,6 +549,7 @@ impl Default for SnapshotsOptions {
             object_store: Default::default(),
             object_store_retry_policy: Self::default_retry_policy(),
             experimental_retain_snapshots: None,
+            snapshot_kind: SnapshotKind::default(),
         }
     }
 }

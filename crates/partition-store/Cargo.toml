@@ -32,6 +32,7 @@ enum-map = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 humantime = { workspace = true }
+metrics = { workspace = true }
 object_store = { workspace = true }
 parking_lot = { workspace = true }
 paste = { workspace = true }

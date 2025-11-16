@@ -7595,6 +7595,7 @@ dependencies = [
  "futures-util",
  "googletest",
  "humantime",
+ "metrics",
  "num-bigint",
  "object_store",
  "parking_lot",

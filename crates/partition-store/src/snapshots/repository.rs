@@ -374,8 +374,13 @@ impl SnapshotRepository {
         snapshot: &PartitionSnapshotMetadata,
         local_snapshot_path: PathBuf,
     ) -> anyhow::Result<ArchivedLsn> {
+        use crate::metric_definitions::{
+            SNAPSHOT_UPLOAD_DURATION, SNAPSHOT_UPLOAD_FAILED, SNAPSHOT_UPLOAD_SUCCESS,
+        };
+
         debug!("Publishing partition snapshot to: {}", self.destination);
 
+        let start = std::time::Instant::now();
         let put_result = self
             .put_snapshot_inner(snapshot, local_snapshot_path.as_path())
             .await;
@@ -387,9 +392,15 @@ impl SnapshotRepository {
             .await
             .inspect_err(|e| warn!("Failed to delete local snapshot files: {}", e));
 
+        metrics::histogram!(SNAPSHOT_UPLOAD_DURATION).record(start.elapsed().as_secs_f64());
+
         match put_result {
-            Ok(archived_lsn) => Ok(archived_lsn),
+            Ok(archived_lsn) => {
+                metrics::counter!(SNAPSHOT_UPLOAD_SUCCESS).increment(1);
+                Ok(archived_lsn)
+            }
             Err(put_error) => {
+                metrics::counter!(SNAPSHOT_UPLOAD_FAILED).increment(1);
                 for filename in put_error.uploaded_files {
                     let path = put_error.full_snapshot_path.child(filename);
 
@@ -501,6 +512,16 @@ impl SnapshotRepository {
                 let relative_key = format!("ssts/{}_{}", node_id, filename);
                 file_keys.insert(file.name.clone(), relative_key);
             }
+        }
+
+        use crate::metric_definitions::{
+            SNAPSHOT_UPLOAD_BYTES, SNAPSHOT_UPLOAD_BYTES_DEDUPLICATED,
+        };
+        metrics::counter!(SNAPSHOT_UPLOAD_BYTES).increment(uploaded_size as u64);
+        let deduplicated_bytes = total_size - uploaded_size;
+        if deduplicated_bytes > 0 {
+            metrics::counter!(SNAPSHOT_UPLOAD_BYTES_DEDUPLICATED)
+                .increment(deduplicated_bytes as u64);
         }
 
         // Log deduplication stats
@@ -1031,6 +1052,23 @@ impl SnapshotRepository {
         fields(%partition_id, snapshot_id = tracing::field::Empty),
     )]
     pub async fn get_latest(
+        &self,
+        partition_id: PartitionId,
+    ) -> anyhow::Result<Option<LocalPartitionSnapshot>> {
+        use crate::metric_definitions::{SNAPSHOT_DOWNLOAD_DURATION, SNAPSHOT_DOWNLOAD_FAILED};
+
+        let start = std::time::Instant::now();
+        let result = self.get_latest_inner(partition_id).await;
+
+        if result.is_err() {
+            metrics::counter!(SNAPSHOT_DOWNLOAD_FAILED).increment(1);
+        }
+        metrics::histogram!(SNAPSHOT_DOWNLOAD_DURATION).record(start.elapsed().as_secs_f64());
+
+        result
+    }
+
+    async fn get_latest_inner(
         &self,
         partition_id: PartitionId,
     ) -> anyhow::Result<Option<LocalPartitionSnapshot>> {

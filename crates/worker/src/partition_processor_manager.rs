@@ -342,8 +342,16 @@ impl PartitionProcessorManager {
         let mut partition_table_version_watcher = metadata.watch(MetadataKind::PartitionTable);
         gauge!(NUM_PARTITIONS).set(self.partition_table.live_load().len() as f64);
 
+        let startup_delay = with_jitter(
+            self.updateable_config
+                .pinned()
+                .worker
+                .snapshots
+                .effective_startup_delay(),
+            0.1,
+        );
         let mut snapshot_check_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(rand::rng().random_range(30..60)), // delay scheduled snapshots on startup
+            tokio::time::Instant::now() + startup_delay,
             with_jitter(Duration::from_secs(1), 0.1),
         );
         snapshot_check_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);

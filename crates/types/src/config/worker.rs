@@ -538,6 +538,16 @@ pub struct SnapshotsOptions {
     /// Default: `Full`
     #[serde(default)]
     pub snapshot_kind: SnapshotKind,
+
+    /// # Startup delay
+    ///
+    /// Delay before starting automatic snapshot checks after worker startup. This helps avoid
+    /// creating snapshots immediately on startup and spreads snapshot activity across nodes.
+    /// A random jitter of ±10% is applied to the configured value.
+    ///
+    /// Default: `30s`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_delay: Option<FriendlyDuration>,
 }
 
 impl Default for SnapshotsOptions {
@@ -550,6 +560,7 @@ impl Default for SnapshotsOptions {
             object_store_retry_policy: Self::default_retry_policy(),
             experimental_retain_snapshots: None,
             snapshot_kind: SnapshotKind::default(),
+            startup_delay: None,
         }
     }
 }
@@ -562,6 +573,12 @@ impl SnapshotsOptions {
             Some(10),
             Some(Duration::from_secs(10)),
         )
+    }
+
+    pub fn effective_startup_delay(&self) -> Duration {
+        self.startup_delay
+            .map(|d| d.into())
+            .unwrap_or_else(|| Duration::from_secs(30))
     }
 
     pub fn snapshots_base_dir(&self) -> PathBuf {

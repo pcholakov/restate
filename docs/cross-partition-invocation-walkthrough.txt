@@ -1,0 +1,380 @@
+================================================================================
+CROSS-PARTITION INVOCATION WALKTHROUGH
+================================================================================
+
+This document explains how partition processors interact across partitions,
+illustrating with two partition state machines how they interact with their
+own logs and their peer's log via shuffle.
+
+SEE ALSO: distributed-snapshot-walkthrough.txt
+  - Describes the Chandy-Lamport based cluster snapshot mechanism
+  - Explains how acks-through-Bifrost solves "THE GAP" problem documented here
+  - Details the deferred truncation protocol for snapshot consistency
+
+================================================================================
+THE SETUP: TWO PARTITIONS
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                                     CLUSTER                                              │
+│                                                                                          │
+│  ┌─────────────────────────────────┐        ┌─────────────────────────────────┐         │
+│  │        PARTITION A (0)          │        │        PARTITION B (1)          │         │
+│  │                                 │        │                                 │         │
+│  │  ┌───────────────────────────┐  │        │  ┌───────────────────────────┐  │         │
+│  │  │   Partition Processor A   │  │        │  │   Partition Processor B   │  │         │
+│  │  │                           │  │        │  │                           │  │         │
+│  │  │  ┌─────────────────────┐  │  │        │  │  ┌─────────────────────┐  │  │         │
+│  │  │  │   State Machine A   │  │  │        │  │  │   State Machine B   │  │  │         │
+│  │  │  │   (RocksDB Store)   │  │  │        │  │  │   (RocksDB Store)   │  │  │         │
+│  │  │  │                     │  │  │        │  │  │                     │  │  │         │
+│  │  │  │  * Invocations      │  │  │        │  │  │  * Invocations      │  │  │         │
+│  │  │  │  * Journal          │  │  │        │  │  │  * Journal          │  │  │         │
+│  │  │  │  * Outbox <─────────┼──┼──┼────────┼──┼──┼──────────────────┐  │  │  │         │
+│  │  │  │  * Dedup Table      │  │  │        │  │  │  * Dedup Table <──┼──┼──┼──┐       │
+│  │  │  │  * Timers           │  │  │        │  │  │  * Timers         │  │  │  │       │
+│  │  │  └─────────────────────┘  │  │        │  │  └─────────────────────┘  │  │       │
+│  │  │                           │  │        │  │                           │  │       │
+│  │  │  ┌─────────────────────┐  │  │        │  │                           │  │       │
+│  │  │  │    Shuffle A        │──┼──┼────┐   │  │                           │  │       │
+│  │  │  │  (reads outbox,     │  │  │    │   │  │                           │  │       │
+│  │  │  │   sends to Bifrost) │  │  │    │   │  │                           │  │       │
+│  │  │  └─────────────────────┘  │  │    │   │  │                           │  │       │
+│  │  └───────────────────────────┘  │    │   │  └───────────────────────────┘  │       │
+│  └─────────────────────────────────┘    │   └─────────────────────────────────┘       │
+│                                         │                                              │
+│  ════════════════════════════════════════════════════════════════════════════════     │
+│                                    BIFROST (Replicated Log)                           │
+│                                                                                        │
+│  ┌──────────────────────────┐           ┌──────────────────────────┐                  │
+│  │     Log for Partition A  │           │     Log for Partition B  │                  │
+│  │     (Log ID = 0)         │           │     (Log ID = 1)         │                  │
+│  │                          │           │                          │                  │
+│  │  PP-A reads from here    │           │  PP-B reads from here <──┼──────────────────┘
+│  │  to apply commands       │           │  Shuffle-A writes here <─┘                  │
+│  └──────────────────────────┘           └──────────────────────────┘                  │
+│                                                                                        │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+
+KEY INSIGHT: Each Partition Reads Its OWN Log
+
+- Partition A reads from Log A (Bifrost log ID 0)
+- Partition B reads from Log B (Bifrost log ID 1)
+- When A wants to send a message to B, Shuffle A writes to Log B (not Log A!)
+
+================================================================================
+STEP-BY-STEP: INVOCATION FROM PARTITION A TO PARTITION B
+================================================================================
+
+Let's trace what happens when an invocation running on Partition A calls a
+service on Partition B.
+
+--------------------------------------------------------------------------------
+STEP 1: State Machine A Writes to Outbox
+--------------------------------------------------------------------------------
+
+Location: state_machine/mod.rs:4541-4552
+
+    // Inside state machine A, when processing a "Call" journal entry:
+    self.storage.put_outbox_message(seq_number, &message)?;
+    self.storage.put_outbox_seq_number(seq_number + 1)?;
+
+    // Notify shuffle about new message
+    self.action_collector.push(Action::NewOutboxMessage { seq_number, message });
+
+What's in the outbox message (storage-api/src/outbox_table/mod.rs:22-39):
+
+    pub enum OutboxMessage {
+        ServiceInvocation(Box<ServiceInvocation>),  // <-- Our case
+        ServiceResponse(InvocationResponse),
+        InvocationTermination(InvocationTermination),
+        AttachInvocation(AttachInvocationRequest),
+        NotifySignal(NotifySignalRequest),
+    }
+
+State at this point:
+
+    Partition A Store:
+      outbox_table: [(seq=42, ServiceInvocation{target: ServiceB, ...})]
+
+    Bifrost Log B: (unchanged)
+    Partition B Store: (unchanged)
+
+--------------------------------------------------------------------------------
+STEP 2: Shuffle A Reads Outbox and Sends to Log B
+--------------------------------------------------------------------------------
+
+Location: shuffle.rs:498-575 (state machine), shuffle.rs:62-91 (envelope creation)
+
+Shuffle A runs as a separate task. It:
+
+1. Gets hint about new outbox message (or scans outbox periodically)
+2. Reads the message from outbox
+3. Wraps in Envelope with deduplication info:
+
+    fn create_header(dest_partition_key, seq_number, shuffle_metadata) -> Header {
+        Header {
+            source: Source::Processor {
+                partition_id: None,
+                partition_key: None,
+                leader_epoch: shuffle_metadata.leader_epoch,  // A's leader epoch
+            },
+            dest: Destination::Processor {
+                partition_key: dest_partition_key,  // Points to Partition B
+                dedup: Some(DedupInformation::cross_partition(
+                    shuffle_metadata.partition_id,  // Source = Partition A (ID 0)
+                    seq_number,                      // Outbox seq = 42
+                )),
+            },
+        }
+    }
+
+4. Sends to Bifrost via IngestionClient:
+
+    // shuffle.rs:516-519
+    self.state = State::Ingesting {
+        ingest: self.ingestion.ingest(envelope.partition_key(), envelope),  // -> Log B
+        sn,
+    };
+
+How does IngestionClient know which log? It uses the partition_key in the
+envelope's destination to determine the target partition, then writes to that
+partition's Bifrost log.
+
+--------------------------------------------------------------------------------
+STEP 3: Bifrost Acknowledges the Append
+--------------------------------------------------------------------------------
+
+When Bifrost confirms the record is durably stored, shuffle gets a RecordCommit:
+
+    // shuffle.rs:535-547
+    State::Ingesting { ingest, sn } => {
+        let commit_token = ingest.await?.map(|_| sn);  // Wait for Bifrost ack
+        self.next_sequence_number = sn + 1;
+        return Ok(commit_token);
+    }
+
+--------------------------------------------------------------------------------
+STEP 4: Shuffle A Triggers Truncation (LEGACY BEHAVIOR - BEING REPLACED)
+--------------------------------------------------------------------------------
+
+NOTE: This section documents legacy behavior that creates "THE GAP" problem.
+The solution is acks-through-Bifrost: B sends an OutboxProcessedAck to A's log
+after processing. A truncates its outbox only after receiving the ack, ensuring
+the message is captured in at least one partition's state at all times.
+See distributed-snapshot-walkthrough.txt for the complete protocol.
+
+Location: shuffle.rs:325 (or 421 for legacy)
+
+    // Immediately after Bifrost ack (LEGACY - to be replaced with ack-based):
+    let _ = truncation_tx.try_send(OutboxTruncation::new(message_index));
+
+This tells Partition Processor A to delete the outbox entry:
+
+State at this point:
+
+    Partition A Store:
+      outbox_table: []  <-- DELETED!
+
+    Bifrost Log B: [Envelope{dest: B, dedup: (A, 42), cmd: ServiceInvocation}]
+
+    Partition B Store: (unchanged - hasn't read the message yet!)
+
+*** THE GAP ***: Message exists ONLY in Bifrost Log B. If we snapshot now
+and restore without Bifrost, message is lost!
+
+--------------------------------------------------------------------------------
+STEP 5: Partition Processor B Reads from Log B
+--------------------------------------------------------------------------------
+
+Location: mod.rs:550-569 (main loop), mod.rs:881-958 (apply_record)
+
+PP-B continuously reads from its own Bifrost log:
+
+    // Main loop - reading from Bifrost Log B
+    tokio::select! {
+        biased;
+        Some(lsn, record) = ... => {
+            let record = LsnEnvelope { lsn, envelope: record.decode_arc()? };
+            self.apply_record(record, &mut transaction, ...).await?;
+        }
+    }
+
+--------------------------------------------------------------------------------
+STEP 6: PP-B Checks Deduplication
+--------------------------------------------------------------------------------
+
+Location: mod.rs:890-906
+
+    async fn apply_record(&mut self, record: LsnEnvelope, ...) {
+        if let Some(dedup_information) = self.is_targeted_to_me(&record.envelope.header) {
+            if let Some(dedup_information) = dedup_information {
+                // Check if we've seen this before
+                if Self::is_outdated_or_duplicate(dedup_information, transaction).await? {
+                    debug!("Ignoring outdated or duplicate message");
+                    return Ok(None);  // Skip!
+                }
+
+                // Not a duplicate - record in dedup table
+                transaction.put_dedup_seq_number(
+                    dedup_information.producer_id.clone(),  // ProducerId::Partition(0) = Partition A
+                    &dedup_information.sequence_number,     // Sn(42)
+                )?;
+            }
+
+            // Apply the command
+            self.state_machine.apply(envelope.command, ...).await?;
+        }
+    }
+
+Dedup check logic (mod.rs:976-999):
+
+    async fn is_outdated_or_duplicate(dedup_info, resolver) -> bool {
+        let last_dsn = resolver.get_dedup_sequence_number(&dedup_info.producer_id).await?;
+
+        if let Some(last_dsn) = last_dsn {
+            // Have we seen seq 42 from Partition A before?
+            match (last_dsn, &dedup_info.sequence_number) {
+                (Sn(last_sn), Sn(sn)) => last_sn >= *sn,  // If last_sn >= 42, it's duplicate
+                ...
+            }
+        } else {
+            false  // Never seen anything from Partition A
+        }
+    }
+
+--------------------------------------------------------------------------------
+STEP 7: PP-B Applies the Command
+--------------------------------------------------------------------------------
+
+If not a duplicate, PP-B applies the ServiceInvocation command via its state
+machine, creating the invocation on Partition B.
+
+Final state:
+
+    Partition A Store:
+      outbox_table: []  (truncated)
+      dedup_table: [...]
+
+    Bifrost Log B: [Envelope{...}]  (will be trimmed eventually)
+
+    Partition B Store:
+      dedup_table: [(ProducerId::Partition(0), Sn(42))]  <-- Recorded!
+      invocations: [new invocation created]
+
+================================================================================
+THE COMPLETE FLOW DIAGRAM (LEGACY - shows THE GAP problem)
+================================================================================
+
+NOTE: This diagram shows the LEGACY flow with immediate truncation.
+The corrected flow adds an ack from B→A via Bifrost before truncation.
+See distributed-snapshot-walkthrough.txt for the corrected flow diagram.
+
+TIME ──────────────────────────────────────────────────────────────────────────────────>
+
+PARTITION A                           BIFROST                         PARTITION B
+═══════════                           ══════                          ═══════════
+
+State Machine A
+    │
+    │ 1. Call to ServiceB
+    v
+┌─────────────┐
+│ Write to    │
+│ Outbox      │
+│ (seq=42)    │
+└──────┬──────┘
+       │
+       │ Action::NewOutboxMessage
+       v
+┌─────────────┐
+│ Shuffle A   │
+│ reads       │
+│ outbox      │
+└──────┬──────┘
+       │
+       │ 2. Wrap in Envelope with:
+       │    - dest: partition_key -> B
+       │    - dedup: (Partition A, seq 42)
+       v
+       ├────────────────────────────────>┌─────────────┐
+       │         Bifrost Append          │   LOG B     │
+       │                                 │             │
+       │<────────────────────────────────┤  [Envelope] │
+       │         RecordCommit            │             │
+       │                                 └──────┬──────┘
+       │                                        │
+┌──────v──────┐                                 │ 3. PP-B reads from Log B
+│ 4. Truncate │                                 v
+│ outbox      │                          ┌─────────────┐
+│ (seq <= 42) │                          │ Dedup Check │
+└─────────────┘                          │ seq 42 from │
+                                         │ Partition A │
+                                         └──────┬──────┘
+      THE GAP! (fixed by ack-based truncation)  │
+  ┌──────────────────────────────────────────┐  │
+  │ At this moment (LEGACY behavior):        │  │
+  │ * A's outbox: EMPTY (truncated too early)│  │
+  │ * B's dedup:  NOT YET UPDATED            │  │ 5. Not duplicate
+  │ * Message:    ONLY IN BIFROST!           │  │    -> Update dedup table
+  └──────────────────────────────────────────┘  │    -> Apply command
+                                                v
+                                         ┌─────────────┐
+                                         │ State       │
+                                         │ Machine B   │
+                                         │ applies     │
+                                         │ invocation  │
+                                         └─────────────┘
+
+================================================================================
+KEY TAKEAWAYS
+================================================================================
+
+1. Each partition reads its own log - PP-A reads Log A, PP-B reads Log B
+
+2. Shuffle writes to the TARGET's log - Shuffle A writes to Log B (not Log A)
+
+3. Dedup info travels with the message - (source_partition_id, seq_number)
+
+4. Dedup table tracks "highest seen seq per source" - B stores "from Partition A,
+   I've processed up to seq 42"
+
+5. THE GAP - Legacy truncation happens on Bifrost ack, before target processes.
+   Message can exist only in Bifrost, which breaks snapshot consistency.
+
+THE SOLUTION: Acks-Through-Bifrost
+──────────────────────────────────
+Instead of truncating immediately after Bifrost ack, the corrected flow is:
+
+  1. B processes message M, updates dedup table
+  2. B's shuffle sends OutboxProcessedAck(from=B, seq=42) to Log A
+  3. A reads ack from its own log
+  4. A truncates outbox entry seq=42
+
+This ensures the message is always captured in at least one partition's state:
+- Either in A's outbox (ack not yet processed)
+- Or in B's dedup table (message processed)
+
+See distributed-snapshot-walkthrough.txt for the complete Chandy-Lamport based
+cluster snapshot protocol that leverages this deferred truncation mechanism.
+
+================================================================================
+CODE REFERENCES
+================================================================================
+
+Current implementation (documents THE GAP problem):
+- shuffle.rs:62-91      - Envelope creation with dedup info
+- shuffle.rs:325, 421   - Truncation after Bifrost ack (legacy - to be replaced)
+- shuffle.rs:498-575    - Shuffle state machine
+- mod.rs:550-569        - PP main loop reading from Bifrost
+- mod.rs:881-958        - apply_record with dedup check
+- mod.rs:976-999        - is_outdated_or_duplicate logic
+- state_machine/mod.rs:4541-4552 - Writing to outbox
+- storage-api/src/outbox_table/mod.rs:22-39 - OutboxMessage types
+- storage-api/src/deduplication_table/mod.rs:61-71 - ProducerId types
+
+Planned changes for ack-based truncation (see distributed-snapshot-walkthrough.txt):
+- wal-protocol/src/lib.rs - Add Command::OutboxProcessedAck
+- mod.rs:893-898         - Send ack even for duplicate messages (critical fix)
+- shuffle.rs             - Send acks to source partition's log
+- state_machine/mod.rs   - Handle incoming OutboxProcessedAck, trigger truncation

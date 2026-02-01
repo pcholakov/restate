@@ -34,7 +34,7 @@ use restate_storage_api::{Storage, Transaction};
 use restate_types::deployment::PinnedDeployment;
 use restate_types::errors::InvocationError;
 use restate_types::identifiers::{
-    DeploymentId, InvocationId, PartitionKey, ServiceId, WithPartitionKey,
+    DeploymentId, InvocationId, InvocationUuid, PartitionKey, ServiceId, WithPartitionKey,
 };
 use restate_types::invocation::{InvocationTarget, ServiceInvocation, Source};
 use restate_types::journal_v2::Entry;
@@ -346,7 +346,7 @@ where
         invoker_behavior: InvokerBehavior,
     ) -> Self {
         let rng = StdRng::seed_from_u64(config.seed);
-        let clock = SimulationClock::at_epoch();
+        let clock = SimulationClock::new_at_base_time();
 
         let state_machine = StateMachine::new(
             0,    // inbox_seq_number
@@ -438,6 +438,8 @@ where
     }
 
     /// Creates a random invocation targeting this partition with a random key.
+    ///
+    /// Uses deterministic ID generation based on the simulation's seeded RNG.
     pub fn random_invocation(&mut self) -> ServiceInvocation {
         let target = InvocationTarget::virtual_object(
             VO_TEST_SERVICE,
@@ -445,12 +447,13 @@ where
             VO_TEST_HANDLER,
             restate_types::invocation::VirtualObjectHandlerType::Exclusive,
         );
-        let invocation_id = InvocationId::generate(&target, None);
-        ServiceInvocation::initialize(invocation_id, target, Source::Ingress(Default::default()))
+        self.create_invocation(target)
     }
 
     /// Creates a random invocation from a small key space to force collisions.
     /// This is useful for testing VO exclusivity invariants.
+    ///
+    /// Uses deterministic ID generation based on the simulation's seeded RNG.
     pub fn random_vo_invocation(&mut self) -> ServiceInvocation {
         let key_idx = self.rng.random_range(0..VO_TEST_KEYS.len());
         let key = VO_TEST_KEYS[key_idx];
@@ -460,11 +463,12 @@ where
             VO_TEST_HANDLER,
             restate_types::invocation::VirtualObjectHandlerType::Exclusive,
         );
-        let invocation_id = InvocationId::generate(&target, None);
-        ServiceInvocation::initialize(invocation_id, target, Source::Ingress(Default::default()))
+        self.create_invocation(target)
     }
 
     /// Creates an invocation for a specific VO key.
+    ///
+    /// Uses deterministic ID generation based on the simulation's seeded RNG.
     pub fn invocation_for_key(&mut self, key: &str) -> ServiceInvocation {
         let target = InvocationTarget::virtual_object(
             VO_TEST_SERVICE,
@@ -472,7 +476,26 @@ where
             VO_TEST_HANDLER,
             restate_types::invocation::VirtualObjectHandlerType::Exclusive,
         );
-        let invocation_id = InvocationId::generate(&target, None);
+        self.create_invocation(target)
+    }
+
+    /// Creates an invocation with a deterministic ID based on the simulation's seeded RNG.
+    ///
+    /// This avoids using `InvocationId::generate` which falls back to `Ulid::new()`
+    /// for non-workflow/non-idempotent targets, making it non-deterministic.
+    fn create_invocation(&mut self, target: InvocationTarget) -> ServiceInvocation {
+        // Generate deterministic partition key from RNG
+        let partition_key: PartitionKey = self.rng.random();
+
+        // Generate deterministic invocation UUID from RNG (as u128)
+        let uuid_high: u64 = self.rng.random();
+        let uuid_low: u64 = self.rng.random();
+        let uuid = ((uuid_high as u128) << 64) | (uuid_low as u128);
+        // Ensure non-zero (required by InvocationUuid)
+        let uuid = if uuid == 0 { 1 } else { uuid };
+
+        let invocation_id =
+            InvocationId::from_parts(partition_key, InvocationUuid::from_u128(uuid));
         ServiceInvocation::initialize(invocation_id, target, Source::Ingress(Default::default()))
     }
 
@@ -697,9 +720,14 @@ where
     /// This takes the next command from the queue (or advances time to fire a timer),
     /// applies it to the state machine, and processes the resulting actions.
     ///
-    /// When tokio time is paused (`start_paused = true`), this method synchronizes
-    /// the simulation clock with tokio's paused time, ensuring that timer-based
-    /// operations complete at the correct simulated time.
+    /// # Requirements
+    ///
+    /// This method **requires** tokio time to be paused (`start_paused = true`).
+    /// It calls `tokio::time::advance()` to synchronize the simulation clock with
+    /// tokio's paused time when firing timers.
+    ///
+    /// Use `#[restate_core::test(start_paused = true)]` or
+    /// `#[tokio::test(start_paused = true)]` for tests.
     pub async fn step(&mut self) -> Result<StepResult, SimulationError> {
         // If no pending commands, try to advance to the next timer
         // Use async version to synchronize with tokio's paused time

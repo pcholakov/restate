@@ -122,6 +122,11 @@ impl Clock for TokioClock {
 ///
 /// This clock can be advanced manually, providing full control over time progression
 /// in the simulation. The clock is thread-safe and can be shared across components.
+///
+/// # Important
+///
+/// When used with tokio paused time (`start_paused = true`), call the async methods
+/// (`advance_async`, `advance_to_async`) to keep tokio time synchronized.
 #[derive(Debug, Clone)]
 pub struct SimulationClock {
     inner: Arc<SimulationClockInner>,
@@ -134,10 +139,22 @@ struct SimulationClockInner {
 }
 
 impl SimulationClock {
+    /// Default base time for simulation (well after RESTATE_EPOCH).
+    /// This is Nov 14, 2023 22:13:20 UTC - same as TokioClock::BASE_TIME.
+    ///
+    /// Using a non-zero time is important because `MillisSinceEpoch::now()` only uses
+    /// the cached WallClock when it is non-zero; otherwise it falls back to system time.
+    pub const BASE_TIME: MillisSinceEpoch = MillisSinceEpoch::new(1_700_000_000_000);
+
     /// Creates a new simulation clock starting at the given time.
     ///
     /// Also sets the restate WallClock cached time so that `MillisSinceEpoch::now()`
     /// returns the simulated time from the start.
+    ///
+    /// # Note
+    ///
+    /// The start time should be non-zero to ensure `MillisSinceEpoch::now()` uses
+    /// the cached time instead of falling back to system time.
     pub fn new(start_time: MillisSinceEpoch) -> Self {
         // Initialize WallClock with the starting simulated time
         WallClock::set_recent(start_time);
@@ -149,9 +166,20 @@ impl SimulationClock {
         }
     }
 
-    /// Creates a new simulation clock starting at the Restate epoch (time 0).
-    pub fn at_epoch() -> Self {
-        Self::new(MillisSinceEpoch::UNIX_EPOCH)
+    /// Creates a new simulation clock starting at [`BASE_TIME`](Self::BASE_TIME).
+    ///
+    /// This is the recommended way to create a simulation clock as it starts
+    /// at a non-zero time, ensuring `MillisSinceEpoch::now()` uses the cached time.
+    pub fn new_at_base_time() -> Self {
+        Self::new(Self::BASE_TIME)
+    }
+
+    /// Clears the global WallClock cache, causing `MillisSinceEpoch::now()` to
+    /// fall back to system time.
+    ///
+    /// Call this at the end of tests to avoid leaking simulated time to other tests.
+    pub fn clear_wallclock() {
+        WallClock::clear_recent();
     }
 
     /// Returns the current time.
@@ -233,20 +261,19 @@ impl SimulationClock {
             target.as_u64()
         );
 
-        // Calculate the duration to advance
-        let delta_ms = target.as_u64().saturating_sub(current.as_u64());
-        if delta_ms > 0 {
-            // Advance tokio's paused time first
-            tokio::time::advance(Duration::from_millis(delta_ms)).await;
-        }
-
-        // Update our internal time
+        // Update our internal time and WallClock BEFORE advancing tokio time.
+        // This ensures that any tasks that wake up during tokio::time::advance()
+        // will see the new simulated time via MillisSinceEpoch::now().
         self.inner
             .current_time
             .store(target.as_u64(), Ordering::Release);
-
-        // Also update the global WallClock cache so MillisSinceEpoch::now() returns simulated time
         WallClock::set_recent(target);
+
+        // Now advance tokio's paused time
+        let delta_ms = target.as_u64().saturating_sub(current.as_u64());
+        if delta_ms > 0 {
+            tokio::time::advance(Duration::from_millis(delta_ms)).await;
+        }
     }
 
     /// Advances both the simulation clock and tokio's paused time by the given duration.
@@ -263,8 +290,9 @@ impl SimulationClock {
 }
 
 impl Default for SimulationClock {
+    /// Creates a simulation clock at [`BASE_TIME`](Self::BASE_TIME).
     fn default() -> Self {
-        Self::at_epoch()
+        Self::new_at_base_time()
     }
 }
 
@@ -274,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_clock_advance() {
-        let clock = SimulationClock::at_epoch();
+        let clock = SimulationClock::new(MillisSinceEpoch::UNIX_EPOCH);
         assert_eq!(clock.now(), MillisSinceEpoch::UNIX_EPOCH);
 
         clock.advance_ms(1000);
@@ -286,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_clock_advance_to() {
-        let clock = SimulationClock::at_epoch();
+        let clock = SimulationClock::new(MillisSinceEpoch::UNIX_EPOCH);
 
         clock.advance_to(MillisSinceEpoch::new(5000));
         assert_eq!(clock.now().as_u64(), 5000);
@@ -301,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_clock_clone_shares_state() {
-        let clock1 = SimulationClock::at_epoch();
+        let clock1 = SimulationClock::new(MillisSinceEpoch::UNIX_EPOCH);
         let clock2 = clock1.clone();
 
         clock1.advance_ms(1000);
@@ -310,7 +338,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_clock_advance_async_with_tokio_paused_time() {
-        let clock = SimulationClock::at_epoch();
+        let clock = SimulationClock::new(MillisSinceEpoch::UNIX_EPOCH);
         let tokio_start = tokio::time::Instant::now();
 
         // Advance clock by 5 seconds
@@ -326,7 +354,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_clock_advance_to_async_with_tokio_paused_time() {
-        let clock = SimulationClock::at_epoch();
+        let clock = SimulationClock::new(MillisSinceEpoch::UNIX_EPOCH);
         let tokio_start = tokio::time::Instant::now();
 
         // Advance to specific time
@@ -345,7 +373,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let clock = SimulationClock::at_epoch();
+        let clock = SimulationClock::new(MillisSinceEpoch::UNIX_EPOCH);
         let sleep_completed = Arc::new(AtomicBool::new(false));
         let sleep_completed_clone = sleep_completed.clone();
 

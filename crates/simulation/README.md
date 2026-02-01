@@ -32,7 +32,7 @@ All sources of non-determinism must be controlled:
 |--------|----------|
 | Random number generation | Seeded `StdRng` passed to all components |
 | Time | Deterministic `SimulationClock` + tokio `start_paused` |
-| HashMap iteration order | Use `ahash` (deterministic) or `BTreeMap` |
+| HashMap iteration order | State machine uses sets for membership only (order doesn't affect outcome) |
 | `tokio::select!` ordering | Use `rng_seed` in `restate_core::test` macro |
 | UUID generation | Pre-generate invocations with fixed IDs |
 
@@ -53,11 +53,14 @@ affect determinism are properly controlled.
 
 ### Invariant Checking
 
-The simulation can verify invariants after each step:
+The simulation verifies invariants after each step when `check_invariants` is enabled:
 
 - **VO Exclusivity**: At most one invocation is active per Virtual Object key
-- **State Transitions**: Invocations follow valid state machine transitions
-- **Journal Consistency**: No duplicate or missing entries
+  - Checks that locked VOs have an active lock holder (Invoked/Suspended/Paused)
+
+Future invariants (not yet implemented):
+- State Transitions: Invocations follow valid state machine transitions
+- Journal Consistency: No duplicate or missing entries
 
 ## Architecture
 
@@ -172,10 +175,10 @@ comparing traces across separate process runs:
 
 ```bash
 # Run test and capture trace summary
-cargo test -p restate-simulation test_partition_simulation -- --nocapture 2>&1 | tee run1.log
+cargo nextest run -p restate-simulation test_partition_simulation --no-capture 2>&1 | tee run1.log
 
 # Run again
-cargo test -p restate-simulation test_partition_simulation -- --nocapture 2>&1 | tee run2.log
+cargo nextest run -p restate-simulation test_partition_simulation --no-capture 2>&1 | tee run2.log
 
 # Compare trace summaries - look for "Trace Summary" sections
 diff <(grep -A3 "Trace Summary" run1.log) <(grep -A3 "Trace Summary" run2.log)

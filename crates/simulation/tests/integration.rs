@@ -23,7 +23,7 @@ use restate_simulation::{
     InvokerBehavior, PartitionSimulation, PartitionSimulationConfig, SimulationTrace,
 };
 use restate_types::config::StorageOptions;
-use restate_types::identifiers::{PartitionId, PartitionKey};
+use restate_types::identifiers::{InvocationId, InvocationUuid, PartitionId, PartitionKey};
 use restate_types::partitions::Partition;
 use restate_worker::state_machine::Action;
 
@@ -519,7 +519,6 @@ fn create_deterministic_invocations(
     count: usize,
 ) -> Vec<restate_types::invocation::ServiceInvocation> {
     use rand::{Rng, SeedableRng, rngs::StdRng};
-    use restate_types::identifiers::InvocationId;
     use restate_types::invocation::{
         InvocationTarget, ServiceInvocation, Source, VirtualObjectHandlerType,
     };
@@ -537,7 +536,16 @@ fn create_deterministic_invocations(
             "handler",
             VirtualObjectHandlerType::Exclusive,
         );
-        let invocation_id = InvocationId::generate(&target, None);
+        // Generate deterministic invocation ID using seeded RNG instead of
+        // InvocationId::generate which uses Ulid::new() (non-deterministic)
+        let partition_key: PartitionKey = rng.random();
+        let uuid_high: u64 = rng.random();
+        let uuid_low: u64 = rng.random();
+        let uuid = ((uuid_high as u128) << 64) | (uuid_low as u128);
+        // Ensure non-zero UUID (zero is not a valid invocation UUID)
+        let uuid = if uuid == 0 { 1 } else { uuid };
+        let invocation_id =
+            InvocationId::from_parts(partition_key, InvocationUuid::from_u128(uuid));
         invocations.push(ServiceInvocation::initialize(
             invocation_id,
             target,

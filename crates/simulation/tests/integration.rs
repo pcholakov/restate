@@ -86,7 +86,7 @@ async fn shutdown_test_env() {
 ///    `shutdown()`. This closes all DBs but resets `shutting_down = false`, allowing new
 ///    `PartitionStoreManager` instances to open fresh DBs. Note that you need a new
 ///    `PartitionStoreManager` after reset since it caches DB handles.
-#[test(restate_core::test(start_paused = true))]
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
 async fn test_partition_simulation() -> googletest::Result<()> {
     let storage = create_test_storage().await;
 
@@ -298,7 +298,7 @@ async fn test_partition_simulation() -> googletest::Result<()> {
 
 /// Tests that tokio's auto-advance works correctly with start_paused.
 /// This demonstrates the infrastructure for time acceleration.
-#[test(restate_core::test(start_paused = true))]
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
 async fn test_tokio_auto_advance() {
     use std::time::Duration;
 

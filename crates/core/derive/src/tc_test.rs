@@ -79,6 +79,7 @@ struct FinalConfig {
     flavor: RuntimeFlavor,
     worker_threads: Option<usize>,
     start_paused: Option<bool>,
+    rng_seed: Option<u64>,
     crate_name: Option<Path>,
     unhandled_panic: Option<UnhandledPanic>,
 }
@@ -88,6 +89,7 @@ const DEFAULT_ERROR_CONFIG: FinalConfig = FinalConfig {
     flavor: RuntimeFlavor::CurrentThread,
     worker_threads: None,
     start_paused: None,
+    rng_seed: None,
     crate_name: None,
     unhandled_panic: None,
 };
@@ -98,6 +100,7 @@ struct Configuration {
     flavor: Option<RuntimeFlavor>,
     worker_threads: Option<(usize, Span)>,
     start_paused: Option<(bool, Span)>,
+    rng_seed: Option<(u64, Span)>,
     crate_name: Option<Path>,
     unhandled_panic: Option<(UnhandledPanic, Span)>,
 }
@@ -110,6 +113,7 @@ impl Configuration {
             flavor: None,
             worker_threads: None,
             start_paused: None,
+            rng_seed: None,
             crate_name: None,
             unhandled_panic: None,
         }
@@ -154,6 +158,16 @@ impl Configuration {
 
         let start_paused = parse_bool(start_paused, span, "start_paused")?;
         self.start_paused = Some((start_paused, span));
+        Ok(())
+    }
+
+    fn set_rng_seed(&mut self, rng_seed: syn::Lit, span: Span) -> Result<(), syn::Error> {
+        if self.rng_seed.is_some() {
+            return Err(syn::Error::new(span, "`rng_seed` set multiple times."));
+        }
+
+        let rng_seed = parse_int(rng_seed, span, "rng_seed")? as u64;
+        self.rng_seed = Some((rng_seed, span));
         Ok(())
     }
 
@@ -239,11 +253,15 @@ impl Configuration {
             (_, None) => None,
         };
 
+        // rng_seed is allowed with any flavor but is most useful with current_thread
+        let rng_seed = self.rng_seed.map(|(seed, _)| seed);
+
         Ok(FinalConfig {
             crate_name: self.crate_name.clone(),
             flavor,
             worker_threads,
             start_paused,
+            rng_seed,
             unhandled_panic,
         })
     }
@@ -355,9 +373,12 @@ fn build_config(
                         config
                             .set_unhandled_panic(lit.clone(), syn::spanned::Spanned::span(lit))?;
                     }
+                    "rng_seed" => {
+                        config.set_rng_seed(lit.clone(), syn::spanned::Spanned::span(lit))?;
+                    }
                     name => {
                         let msg = format!(
-                            "Unknown attribute {name} is specified; expected one of: `flavor`, `worker_threads`, `start_paused`, `crate`, `unhandled_panic`",
+                            "Unknown attribute {name} is specified; expected one of: `flavor`, `worker_threads`, `start_paused`, `rng_seed`, `crate`, `unhandled_panic`",
                         );
                         return Err(syn::Error::new_spanned(namevalue, msg));
                     }
@@ -380,12 +401,13 @@ fn build_config(
                             "Set the runtime flavor with #[{macro_name}(flavor = \"current_thread\")]."
                         )
                     }
-                    "flavor" | "worker_threads" | "start_paused" | "crate" | "unhandled_panic" => {
+                    "flavor" | "worker_threads" | "start_paused" | "rng_seed" | "crate"
+                    | "unhandled_panic" => {
                         format!("The `{name}` attribute requires an argument.")
                     }
                     name => {
                         format!(
-                            "Unknown attribute {name} is specified; expected one of: `flavor`, `worker_threads`, `start_paused`, `crate`, `unhandled_panic`."
+                            "Unknown attribute {name} is specified; expected one of: `flavor`, `worker_threads`, `start_paused`, `rng_seed`, `crate`, `unhandled_panic`."
                         )
                     }
                 };
@@ -446,6 +468,11 @@ fn parse_knobs(mut input: ItemFn, config: FinalConfig) -> TokenStream {
     if let Some(v) = config.unhandled_panic {
         let unhandled_panic = v.into_tokens(&crate_path);
         rt = quote_spanned! {last_stmt_start_span=> #rt.unhandled_panic(#unhandled_panic) };
+    }
+    if let Some(seed) = config.rng_seed {
+        rt = quote_spanned! {last_stmt_start_span=>
+            #rt.rng_seed(::tokio::runtime::RngSeed::from_bytes(&(#seed as u64).to_le_bytes()))
+        };
     }
 
     let generated_attrs = quote! {

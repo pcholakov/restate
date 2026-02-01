@@ -272,6 +272,42 @@ impl SimulationTrace {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
+
+    /// Returns a fingerprint hash of the trace for quick comparison.
+    ///
+    /// This is useful for quickly detecting non-determinism across runs without
+    /// comparing full traces. If two traces have the same fingerprint, they are
+    /// very likely identical (but should be verified with `compare()` to be certain).
+    ///
+    /// The fingerprint captures:
+    /// - Total number of entries
+    /// - First entry's step number and time
+    /// - Last entry's step number and time
+    /// - Total action count across all entries
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+        self.entries.len().hash(&mut hasher);
+
+        if let Some(first) = self.entries.first() {
+            first.step.hash(&mut hasher);
+            first.time.as_u64().hash(&mut hasher);
+            std::mem::discriminant(&first.command).hash(&mut hasher);
+        }
+
+        if let Some(last) = self.entries.last() {
+            last.step.hash(&mut hasher);
+            last.time.as_u64().hash(&mut hasher);
+            std::mem::discriminant(&last.command).hash(&mut hasher);
+        }
+
+        // Hash total action count
+        let total_actions: usize = self.entries.iter().map(|e| e.actions.len()).sum();
+        total_actions.hash(&mut hasher);
+
+        hasher.finish()
+    }
 }
 
 /// Describes a difference between two traces.

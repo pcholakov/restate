@@ -2774,33 +2774,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                     "When the handler type is Exclusive, the invocation target must have a key",
                 );
 
-                // Trip wire for simulation testing: occasionally skip the unlock
-                #[cfg(feature = "test-util")]
-                if trip_wire::should_skip_unlock() {
-                    warn!(
-                        rpc.service = %keyed_service_id.service_name,
-                        "Trip wire: Skipping VO unlock in end_invocation"
-                    );
-                } else {
-                    // We consumed the inbox, nothing else to do here
-                    self.storage
-                        .put_virtual_object_status(
-                            &keyed_service_id,
-                            &VirtualObjectStatus::Unlocked,
-                        )
-                        .map_err(Error::Storage)?;
-                }
-
-                #[cfg(not(feature = "test-util"))]
-                {
-                    // We consumed the inbox, nothing else to do here
-                    self.storage
-                        .put_virtual_object_status(
-                            &keyed_service_id,
-                            &VirtualObjectStatus::Unlocked,
-                        )
-                        .map_err(Error::Storage)?;
-                }
+                self.do_unlock_service(keyed_service_id).await?;
             }
 
             let record_unique_ts =
@@ -3142,27 +3116,8 @@ impl<S> StateMachineApplyContext<'_, S> {
                 }
             }
 
-            // Trip wire for simulation testing: occasionally skip the unlock
-            #[cfg(feature = "test-util")]
-            if trip_wire::should_skip_unlock() {
-                warn!(
-                    rpc.service = %keyed_service_id.service_name,
-                    "Trip wire: Skipping VO unlock in consume_inbox"
-                );
-            } else {
-                // We consumed the inbox, nothing else to do here
-                self.storage
-                    .put_virtual_object_status(&keyed_service_id, &VirtualObjectStatus::Unlocked)
-                    .map_err(Error::Storage)?;
-            }
-
-            #[cfg(not(feature = "test-util"))]
-            {
-                // We consumed the inbox, nothing else to do here
-                self.storage
-                    .put_virtual_object_status(&keyed_service_id, &VirtualObjectStatus::Unlocked)
-                    .map_err(Error::Storage)?;
-            }
+            // We consumed the inbox, unlock the service
+            self.do_unlock_service(keyed_service_id).await?;
         }
 
         Ok(())

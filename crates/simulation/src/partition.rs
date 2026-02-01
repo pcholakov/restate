@@ -14,7 +14,7 @@
 //! where actions emitted by the state machine (timer registrations, outbox messages)
 //! are fed back as commands.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 
 use bytes::Bytes;
@@ -327,9 +327,10 @@ pub struct PartitionSimulation<S> {
     active_invocations: HashSet<InvocationId>,
     /// Number of steps executed so far.
     steps_executed: usize,
-    /// Track VO keys we've seen for invariant checking.
-    /// Maps ServiceId to the invocation that should hold the lock.
-    vo_locks_expected: HashMap<ServiceId, InvocationId>,
+    /// Track VO keys we've touched for invariant checking.
+    /// This allows checking invariants for dynamically generated keys,
+    /// not just the hardcoded test keys.
+    vo_keys_touched: HashSet<ServiceId>,
     /// Optional trace recorder for determinism verification.
     trace: Option<SimulationTrace>,
 }
@@ -364,8 +365,10 @@ where
                 message,
             } => Box::new(ImmediateFailInvoker::new(error_code, message)),
             InvokerBehavior::RandomJournal { .. } => {
-                // TODO: Implement random journal invoker
-                Box::new(ImmediateSuccessInvoker)
+                unimplemented!(
+                    "RandomJournal invoker not yet implemented. \
+                     Use ImmediateSuccess, ImmediateFail, Probabilistic, or Custom instead."
+                )
             }
             InvokerBehavior::Probabilistic {
                 success_rate,
@@ -386,7 +389,7 @@ where
             deleted_timers: HashSet::new(),
             active_invocations: HashSet::new(),
             steps_executed: 0,
-            vo_locks_expected: HashMap::new(),
+            vo_keys_touched: HashSet::new(),
             trace: None,
         }
     }
@@ -561,6 +564,16 @@ where
                     invoke_input_journal,
                 } => {
                     self.active_invocations.insert(*invocation_id);
+                    // Track VO keys for invariant checking (only small test key space)
+                    if let Some(key) = invocation_target.key()
+                        && VO_TEST_KEYS.contains(&key.as_ref())
+                    {
+                        let service_id = ServiceId::new(
+                            invocation_target.service_name().clone(),
+                            key.clone(),
+                        );
+                        self.vo_keys_touched.insert(service_id);
+                    }
                     let commands = self.invoker.on_invoke(
                         *invocation_id,
                         invocation_target,
@@ -579,6 +592,16 @@ where
                     ..
                 } => {
                     self.active_invocations.insert(*invocation_id);
+                    // Track VO keys for invariant checking (only small test key space)
+                    if let Some(key) = invocation_target.key()
+                        && VO_TEST_KEYS.contains(&key.as_ref())
+                    {
+                        let service_id = ServiceId::new(
+                            invocation_target.service_name().clone(),
+                            key.clone(),
+                        );
+                        self.vo_keys_touched.insert(service_id);
+                    }
                     let commands = self.invoker.on_invoke(
                         *invocation_id,
                         invocation_target,
@@ -663,18 +686,16 @@ where
 
     /// Checks the virtual object exclusivity invariant.
     ///
-    /// For each VO key, verifies that:
+    /// For each VO key we've touched, verifies that:
     /// 1. If locked, the lock holder is in an active state (Invoked/Suspended/Paused)
     /// 2. No two invocations are simultaneously active for the same key
     async fn check_vo_exclusivity(&mut self) -> Result<(), InvariantViolation> {
-        // Check each VO key we've touched
-        for key in VO_TEST_KEYS {
-            let service_id = ServiceId::new(VO_TEST_SERVICE, *key);
-
+        // Check each VO key we've touched during this simulation
+        for service_id in &self.vo_keys_touched {
             // Get the lock status from storage
             let lock_status = self
                 .storage
-                .get_virtual_object_status(&service_id)
+                .get_virtual_object_status(service_id)
                 .await
                 .map_err(|e| InvariantViolation::Custom(format!("Storage error: {}", e)))?;
 
@@ -704,7 +725,7 @@ where
                         InvocationStatus::Free => "Free",
                     };
                     return Err(InvariantViolation::VoLockHeldByNonActiveInvocation {
-                        service_id,
+                        service_id: service_id.clone(),
                         locked_by,
                         status: status_name.to_string(),
                     });
@@ -867,7 +888,7 @@ pub enum InvariantViolation {
 
 /// The outcome of running a simulation.
 #[derive(Debug)]
-#[allow(dead_code)]
+#[must_use = "simulation outcome contains success/failure status that should be checked"]
 pub struct SimulationOutcome {
     /// Total number of steps executed.
     pub steps_executed: usize,

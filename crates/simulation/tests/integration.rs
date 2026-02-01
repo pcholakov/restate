@@ -57,18 +57,11 @@ async fn create_test_storage() -> restate_partition_store::PartitionStore {
 /// This closes all open databases but allows new ones to be opened afterward.
 /// Use this at the start of each test to ensure a clean state.
 /// If the manager isn't initialized yet, this is a no-op.
+#[allow(dead_code)]
 async fn reset_test_env() {
     if let Some(manager) = RocksDbManager::maybe_get() {
         let _ = manager.reset().await;
     }
-}
-
-/// Shuts down the test environment completely.
-///
-/// Call this only at the end of all tests - after this, no new DBs can be opened.
-async fn shutdown_test_env() {
-    TaskCenter::shutdown_node("test complete", 0).await;
-    RocksDbManager::get().shutdown().await;
 }
 
 /// Main integration test that runs all simulation scenarios.
@@ -430,8 +423,8 @@ async fn test_partition_simulation() -> googletest::Result<()> {
         info!("Test 6 passed: Trace recorded for determinism verification");
     }
 
-    // Note: Don't call shutdown_test_env() here - tests share RocksDB and
-    // shutdown prevents other tests from running. Let z_zz_cleanup handle it.
+    // Note: Don't shut down RocksDB here - tests share the singleton.
+    // The z_zz_cleanup test handles final cleanup.
     info!("=== All tests passed ===");
     Ok(())
 }
@@ -583,7 +576,12 @@ async fn run_simulation_with_trace(
         sim.enqueue_invocation(invocation);
     }
 
-    sim.run().await.expect("Simulation failed");
+    let outcome = sim.run().await.expect("Simulation failed");
+    assert!(
+        outcome.success,
+        "Simulation had violations: {:?}",
+        outcome.violations
+    );
     sim.take_trace().expect("Trace should be present")
 }
 
@@ -847,8 +845,8 @@ async fn long_running_stress() -> googletest::Result<()> {
     );
     println!("╚══════════════════════════════════════════════════════════════════════╝");
 
-    // Note: Don't call shutdown_test_env() here - tests share RocksDB and
-    // shutdown prevents other tests from running. Let z_zz_cleanup handle it.
+    // Note: Don't shut down RocksDB here - tests share the singleton.
+    // The z_zz_cleanup test handles final cleanup.
     Ok(())
 }
 
@@ -1013,7 +1011,7 @@ async fn z_test_trip_wire_detection() -> googletest::Result<()> {
     // Assert that we found a violation - this is the whole point of the test
     assert_that!(found_violation, eq(true));
 
-    // Note: Don't call shutdown_test_env() here - let z_test_cleanup handle it
+    // Note: Don't shut down RocksDB here - the z_zz_cleanup test handles final cleanup
     Ok(())
 }
 
@@ -1067,9 +1065,14 @@ async fn test_seed_reproduction() -> googletest::Result<()> {
 
     // Run the simulation
     let outcome = sim.run().await?;
+    assert_that!(outcome.success, eq(true));
     let trace = sim.take_trace().expect("Trace should be present");
 
-    println!("Simulation completed: {} trace entries", trace.len());
+    println!(
+        "Simulation completed: {} steps, {} trace entries",
+        outcome.steps_executed,
+        trace.len()
+    );
     println!("Generated {} invocations", invocation_ids.len());
     println!();
 
@@ -1097,53 +1100,28 @@ async fn test_seed_reproduction() -> googletest::Result<()> {
     println!("║  crates/simulation/README.md                                         ║");
     println!("╚══════════════════════════════════════════════════════════════════════╝");
 
-    // Note: Don't call shutdown_test_env() here - tests share RocksDB and
-    // shutdown prevents other tests from running. Let z_zz_cleanup handle it.
+    // Note: Don't shut down RocksDB here - tests share the singleton.
+    // The z_zz_cleanup test handles final cleanup.
     Ok(())
-}
-
-/// Helper function to run a simulation and return its trace.
-async fn run_simulation_and_get_trace(
-    seed: u64,
-    num_invocations: usize,
-    storage: restate_partition_store::PartitionStore,
-) -> SimulationTrace {
-    let config = PartitionSimulationConfig {
-        seed,
-        max_steps: 500,
-        partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
-        check_invariants: true,
-    };
-
-    let mut sim = PartitionSimulation::new(
-        config,
-        storage,
-        InvokerBehavior::Probabilistic {
-            success_rate: 0.5,
-            failure_rate: 0.3,
-        },
-    );
-    sim.enable_tracing();
-
-    // Enqueue VO invocations
-    for _ in 0..num_invocations {
-        let invocation = sim.random_vo_invocation();
-        sim.enqueue_invocation(invocation);
-    }
-
-    sim.run().await.expect("Simulation failed");
-    sim.take_trace().expect("Trace should be present")
 }
 
 /// Final cleanup test that shuts down RocksDB.
 ///
-/// This test must run last (alphabetically after all z_ prefixed tests).
-/// It handles proper cleanup of the RocksDB singleton.
+/// # IMPORTANT: Test Naming Convention
 ///
-/// Note: With nextest, each test typically runs in its own process, so this
-/// cleanup may not be strictly necessary, but it's good practice and allows
-/// cargo test to work correctly too.
+/// This test MUST run last. It uses the `z_zz_` prefix to ensure alphabetical
+/// ordering places it after all other tests (including `z_test_*` tests).
+///
+/// **DO NOT** create tests with names that sort after `z_zz_cleanup` (e.g., `z_zzz_*`).
+///
+/// After this test runs, the RocksDB singleton is shut down and no new databases
+/// can be opened in the same process.
+///
+/// Note: With nextest, each test runs in its own process, making this cleanup
+/// less critical. However, it ensures `cargo test` works correctly when tests
+/// run sequentially in the same process.
 #[test(restate_core::test(start_paused = true))]
 async fn z_zz_cleanup() {
-    shutdown_test_env().await;
+    TaskCenter::shutdown_node("test complete", 0).await;
+    RocksDbManager::get().shutdown().await;
 }

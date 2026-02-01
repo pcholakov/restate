@@ -396,6 +396,38 @@ async fn test_partition_simulation() -> googletest::Result<()> {
         );
     }
 
+    // Test 6: Trace recording for cross-run determinism verification
+    // Demonstrates how to capture and log trace information for comparison across runs
+    info!("=== Test 6: Trace recording for determinism verification ===");
+    {
+        let invocations = create_deterministic_invocations(99999, 30);
+        info!(
+            "Generated {} invocations for determinism test",
+            invocations.len()
+        );
+
+        let trace = run_simulation_with_trace(99999, invocations, storage.clone()).await;
+        info!("Simulation completed: {} trace entries", trace.len());
+
+        // Verify serialization roundtrip
+        let json = trace.to_json().expect("Serialization failed");
+        let restored = SimulationTrace::from_json(&json).expect("Deserialization failed");
+        assert_that!(trace.compare(&restored), ok(eq(())));
+        info!("Trace serialization verified: {} bytes JSON", json.len());
+
+        // Log summary for cross-run comparison
+        // When verifying determinism across process runs, compare these values
+        info!("=== Trace Summary (for cross-run comparison) ===");
+        info!("Total steps: {}", trace.len());
+        if let Some(first) = trace.entries().first() {
+            info!("First entry: step={}, command={:?}", first.step, first.command);
+        }
+        if let Some(last) = trace.entries().last() {
+            info!("Last entry: step={}, command={:?}", last.step, last.command);
+        }
+        info!("Test 6 passed: Trace recorded for determinism verification");
+    }
+
     shutdown_test_env().await;
     info!("=== All tests passed ===");
     Ok(())
@@ -476,3 +508,66 @@ fn z_test_trace_comparison() {
     let restored = SimulationTrace::from_json(&json).expect("Deserialization failed");
     assert!(restored.compare(&trace1).is_ok());
 }
+
+/// Creates a deterministic set of invocations for repeated history testing.
+/// Uses a seeded RNG to generate consistent invocations.
+fn create_deterministic_invocations(seed: u64, count: usize) -> Vec<restate_types::invocation::ServiceInvocation> {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use restate_types::identifiers::InvocationId;
+    use restate_types::invocation::{InvocationTarget, ServiceInvocation, Source, VirtualObjectHandlerType};
+
+    let keys = ["key-a", "key-b", "key-c"];
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut invocations = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let key_idx = rng.random_range(0..keys.len());
+        let key = keys[key_idx];
+        let target = InvocationTarget::virtual_object(
+            "TestService",
+            key,
+            "handler",
+            VirtualObjectHandlerType::Exclusive,
+        );
+        let invocation_id = InvocationId::generate(&target, None);
+        invocations.push(ServiceInvocation::initialize(
+            invocation_id,
+            target,
+            Source::Ingress(Default::default()),
+        ));
+    }
+
+    invocations
+}
+
+/// Runs a simulation with the given invocations and returns the trace.
+async fn run_simulation_with_trace(
+    seed: u64,
+    invocations: Vec<restate_types::invocation::ServiceInvocation>,
+    storage: restate_partition_store::PartitionStore,
+) -> SimulationTrace {
+    let config = PartitionSimulationConfig {
+        seed,
+        max_steps: 2000,
+        partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
+        check_invariants: true,
+    };
+
+    let mut sim = PartitionSimulation::new(
+        config,
+        storage,
+        InvokerBehavior::Probabilistic {
+            success_rate: 0.5,
+            failure_rate: 0.3,
+        },
+    );
+    sim.enable_tracing();
+
+    for invocation in invocations {
+        sim.enqueue_invocation(invocation);
+    }
+
+    sim.run().await.expect("Simulation failed");
+    sim.take_trace().expect("Trace should be present")
+}
+

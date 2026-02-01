@@ -186,6 +186,68 @@ diff <(grep -A3 "Trace Summary" run1.log) <(grep -A3 "Trace Summary" run2.log)
 
 If the simulation is deterministic, trace summaries across runs should be identical.
 
+## Long-Running Stress Test
+
+The `long_running_stress` test runs multiple simulation iterations with random seeds
+for a configurable duration. This is useful for finding rare edge cases.
+
+**Note**: This test is NOT run as part of normal `cargo nextest run` because it runs
+for 60 seconds by default. To run it, use the commands below.
+
+### Running the Stress Test
+
+```bash
+# Run for 60 seconds (default) with random seeds
+cargo nextest run -p restate-simulation long_running_stress --no-capture
+
+# Run for 15 minutes with random seeds
+SIM_DURATION_SECS=900 cargo nextest run -p restate-simulation long_running_stress --no-capture
+
+# Run for 24 hours (useful for nightly CI)
+SIM_DURATION_SECS=86400 cargo nextest run -p restate-simulation long_running_stress --no-capture
+```
+
+### Configuration
+
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `SIM_DURATION_SECS` | How long to run the stress test | 60 |
+| `SIM_SEED` | Fixed seed to reproduce a specific failure | Random |
+| `SIM_INVOCATIONS` | Number of invocations per iteration | 50 |
+| `SIM_MAX_STEPS` | Maximum steps per iteration | 2000 |
+
+### Reproducing Failures
+
+When the stress test finds a failure, it prints reproduction instructions:
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║                    ❌ SIMULATION FAILURE DETECTED                    ║
+╠══════════════════════════════════════════════════════════════════════╣
+║ Iteration:            42                                             ║
+║ Seed:          12345678                                              ║
+╠══════════════════════════════════════════════════════════════════════╣
+║ To reproduce this failure:                                           ║
+║   SIM_SEED=12345678 \                                                ║
+║   cargo nextest run -p restate-simulation long_running_stress \      ║
+║   --no-capture                                                       ║
+╚══════════════════════════════════════════════════════════════════════╝
+```
+
+## Trip Wire Testing
+
+The simulation includes a "trip wire" mechanism to verify that invariant checking
+works correctly. When enabled, it injects controlled failures that the simulation
+should detect.
+
+The trip wire test (`z_test_trip_wire_detection`) runs automatically and verifies:
+
+1. A controlled bug (skipping VO unlock) is injected into the state machine
+2. The simulation's invariant checker detects the violation
+3. The failure is reported with actionable information
+
+This is a "meta-test" that validates the simulation framework itself catches bugs.
+
 ## Future Work
 
 - [ ] Multi-partition simulation with cross-partition messaging

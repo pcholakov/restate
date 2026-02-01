@@ -67,6 +67,12 @@ pub use crate::subscription_integration::SubscriptionControllerHandle;
 // Re-export state machine types for simulation testing
 pub mod state_machine {
     pub use crate::partition::state_machine::{Action, ActionCollector, Error, StateMachine};
+
+    /// Trip wire module for injecting controlled failures during simulation testing.
+    #[cfg(feature = "test-util")]
+    pub mod trip_wire {
+        pub use crate::partition::state_machine::trip_wire::*;
+    }
 }
 
 type PartitionProcessorBuilder = partition::PartitionProcessorBuilder<

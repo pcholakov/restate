@@ -25,7 +25,7 @@ restate-storage-api = { workspace = true }
 restate-types = { workspace = true, features = ["test-util"] }
 restate-vqueues = { workspace = true }
 restate-wal-protocol = { workspace = true }
-restate-worker = { workspace = true }
+restate-worker = { workspace = true, features = ["test-util"] }
 
 # External dependencies
 bytes = { workspace = true }

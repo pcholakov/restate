@@ -11,6 +11,8 @@
 mod actions;
 mod entries;
 mod lifecycle;
+#[cfg(feature = "test-util")]
+pub mod trip_wire;
 mod utils;
 
 pub use actions::{Action, ActionCollector};
@@ -2771,10 +2773,34 @@ impl<S> StateMachineApplyContext<'_, S> {
                 let keyed_service_id = invocation_target.as_keyed_service_id().expect(
                     "When the handler type is Exclusive, the invocation target must have a key",
                 );
-                // We consumed the inbox, nothing else to do here
-                self.storage
-                    .put_virtual_object_status(&keyed_service_id, &VirtualObjectStatus::Unlocked)
-                    .map_err(Error::Storage)?;
+
+                // Trip wire for simulation testing: occasionally skip the unlock
+                #[cfg(feature = "test-util")]
+                if trip_wire::should_skip_unlock() {
+                    warn!(
+                        rpc.service = %keyed_service_id.service_name,
+                        "Trip wire: Skipping VO unlock in end_invocation"
+                    );
+                } else {
+                    // We consumed the inbox, nothing else to do here
+                    self.storage
+                        .put_virtual_object_status(
+                            &keyed_service_id,
+                            &VirtualObjectStatus::Unlocked,
+                        )
+                        .map_err(Error::Storage)?;
+                }
+
+                #[cfg(not(feature = "test-util"))]
+                {
+                    // We consumed the inbox, nothing else to do here
+                    self.storage
+                        .put_virtual_object_status(
+                            &keyed_service_id,
+                            &VirtualObjectStatus::Unlocked,
+                        )
+                        .map_err(Error::Storage)?;
+                }
             }
 
             let record_unique_ts =
@@ -3116,10 +3142,27 @@ impl<S> StateMachineApplyContext<'_, S> {
                 }
             }
 
-            // We consumed the inbox, nothing else to do here
-            self.storage
-                .put_virtual_object_status(&keyed_service_id, &VirtualObjectStatus::Unlocked)
-                .map_err(Error::Storage)?;
+            // Trip wire for simulation testing: occasionally skip the unlock
+            #[cfg(feature = "test-util")]
+            if trip_wire::should_skip_unlock() {
+                warn!(
+                    rpc.service = %keyed_service_id.service_name,
+                    "Trip wire: Skipping VO unlock in consume_inbox"
+                );
+            } else {
+                // We consumed the inbox, nothing else to do here
+                self.storage
+                    .put_virtual_object_status(&keyed_service_id, &VirtualObjectStatus::Unlocked)
+                    .map_err(Error::Storage)?;
+            }
+
+            #[cfg(not(feature = "test-util"))]
+            {
+                // We consumed the inbox, nothing else to do here
+                self.storage
+                    .put_virtual_object_status(&keyed_service_id, &VirtualObjectStatus::Unlocked)
+                    .map_err(Error::Storage)?;
+            }
         }
 
         Ok(())
@@ -4687,6 +4730,17 @@ impl<S> StateMachineApplyContext<'_, S> {
             rpc.service = %service_id.service_name,
             "Effect: Unlock service id",
         );
+
+        // Trip wire for simulation testing: occasionally skip the unlock to trigger
+        // invariant violations that the simulation checker should detect.
+        #[cfg(feature = "test-util")]
+        if trip_wire::should_skip_unlock() {
+            warn!(
+                rpc.service = %service_id.service_name,
+                "Trip wire: Skipping VO unlock to inject invariant violation"
+            );
+            return Ok(());
+        }
 
         self.storage
             .put_virtual_object_status(&service_id, &VirtualObjectStatus::Unlocked)

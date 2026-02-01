@@ -17,7 +17,9 @@ mod quota;
 mod state_machine_manager;
 mod status_store;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use ahash::HashSet;
 use std::io::ErrorKind;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;

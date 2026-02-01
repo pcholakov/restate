@@ -13,7 +13,7 @@ mod service_protocol_runner_v4;
 
 use super::Notification;
 
-use std::collections::HashSet;
+use ahash::HashSet;
 use std::convert::Infallible;
 use std::iter::Empty;
 use std::num::NonZeroUsize;

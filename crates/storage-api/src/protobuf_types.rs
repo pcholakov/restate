@@ -123,7 +123,7 @@ pub mod v1 {
     ));
 
     pub mod pb_conversion {
-        use std::collections::HashSet;
+        use ahash::HashSet;
 
         use anyhow::anyhow;
         use bytes::{Buf, Bytes};

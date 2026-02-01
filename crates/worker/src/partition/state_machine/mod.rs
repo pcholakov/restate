@@ -15,8 +15,8 @@ mod utils;
 
 pub use actions::{Action, ActionCollector};
 
+use ahash::HashSet;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::ops::RangeInclusive;

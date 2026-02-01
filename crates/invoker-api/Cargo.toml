@@ -19,6 +19,7 @@ restate-errors = { workspace = true }
 restate-futures-util = { workspace = true }
 restate-types = { workspace = true }
 
+ahash = { workspace = true }
 bytes = { workspace = true }
 codederror = { workspace = true }
 futures = { workspace = true }

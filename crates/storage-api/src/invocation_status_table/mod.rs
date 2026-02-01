@@ -8,7 +8,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::HashSet;
+use ahash::HashSet;
 use std::future::Future;
 use std::ops::{ControlFlow, RangeInclusive};
 use std::time::Duration;
@@ -849,7 +849,7 @@ mod test_util {
                     VirtualObjectHandlerType::Exclusive,
                 ),
                 created_using_restate_version: RestateVersion::current(),
-                response_sinks: HashSet::new(),
+                response_sinks: HashSet::default(),
                 timestamps: StatusTimestamps::mock(),
                 source: Source::Ingress(PartitionProcessorRpcRequestId::default()),
                 execution_time: None,
@@ -878,7 +878,7 @@ mod test_util {
                 created_using_restate_version: RestateVersion::current(),
                 journal_metadata: JournalMetadata::initialize(ServiceInvocationSpanContext::empty()),
                 pinned_deployment: None,
-                response_sinks: HashSet::new(),
+                response_sinks: HashSet::default(),
                 timestamps: StatusTimestamps::mock(),
                 source: Source::Ingress(PartitionProcessorRpcRequestId::default()),
                 execution_time: None,

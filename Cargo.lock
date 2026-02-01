@@ -7425,6 +7425,7 @@ dependencies = [
 name = "restate-invoker-api"
 version = "1.6.1-dev"
 dependencies = [
+ "ahash",
  "bytes",
  "codederror",
  "futures",
@@ -7441,6 +7442,7 @@ dependencies = [
 name = "restate-invoker-impl"
 version = "1.6.1-dev"
 dependencies = [
+ "ahash",
  "anyhow",
  "bytes",
  "bytestring",

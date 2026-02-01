@@ -9,13 +9,13 @@
 // by the Apache License, Version 2.0.
 
 use crate::partition::state_machine::{CommandHandler, Error, ParkCause, StateMachineApplyContext};
+use ahash::HashSet;
 use restate_storage_api::invocation_status_table::{InvocationStatus, WriteInvocationStatusTable};
 use restate_storage_api::journal_table_v2::ReadJournalTable;
 use restate_storage_api::vqueue_table::{ReadVQueueTable, WriteVQueueTable};
 use restate_types::config::Configuration;
 use restate_types::identifiers::InvocationId;
 use restate_types::journal_v2::NotificationId;
-use std::collections::HashSet;
 use tracing::trace;
 
 pub struct OnSuspendCommand {

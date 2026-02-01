@@ -219,6 +219,81 @@ async fn test_partition_simulation() -> googletest::Result<()> {
         info!("Test 3 passed: Lock released after failure");
     }
 
+    // Throughput benchmark: measure commands/second
+    info!("=== Throughput benchmark ===");
+    {
+        let config = PartitionSimulationConfig {
+            seed: 789,
+            max_steps: 10_000,
+            partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
+            check_invariants: false, // Disable for raw throughput
+        };
+
+        let mut sim = PartitionSimulation::new(
+            config,
+            storage.clone(),
+            InvokerBehavior::ImmediateSuccess,
+        );
+
+        // Enqueue many invocations
+        for _ in 0..1000 {
+            let invocation = sim.random_invocation();
+            sim.enqueue_invocation(invocation);
+        }
+
+        let start = std::time::Instant::now();
+        let outcome = sim.run().await?;
+        let elapsed = start.elapsed();
+
+        let steps_per_sec = outcome.steps_executed as f64 / elapsed.as_secs_f64();
+        let simulated_time_ms = sim.clock().now().as_u64();
+
+        info!(
+            steps = outcome.steps_executed,
+            elapsed_ms = elapsed.as_millis(),
+            steps_per_sec = steps_per_sec as u64,
+            simulated_time_ms = simulated_time_ms,
+            "Throughput benchmark completed"
+        );
+
+        // With 1000 invocations * 4 steps each = 4000 steps expected
+        assert_that!(outcome.steps_executed, ge(3000));
+        info!(
+            "Throughput (no invariants): {} commands/sec",
+            steps_per_sec as u64
+        );
+
+        // Now with invariant checking
+        let config_with_invariants = PartitionSimulationConfig {
+            seed: 790,
+            max_steps: 10_000,
+            partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
+            check_invariants: true,
+        };
+
+        let mut sim2 = PartitionSimulation::new(
+            config_with_invariants,
+            storage.clone(),
+            InvokerBehavior::ImmediateSuccess,
+        );
+
+        for _ in 0..1000 {
+            let invocation = sim2.random_invocation();
+            sim2.enqueue_invocation(invocation);
+        }
+
+        let start2 = std::time::Instant::now();
+        let outcome2 = sim2.run().await?;
+        let elapsed2 = start2.elapsed();
+        let steps_per_sec2 = outcome2.steps_executed as f64 / elapsed2.as_secs_f64();
+
+        info!(
+            "Throughput (with invariants): {} commands/sec, overhead: {:.1}%",
+            steps_per_sec2 as u64,
+            ((steps_per_sec - steps_per_sec2) / steps_per_sec) * 100.0
+        );
+    }
+
     shutdown_test_env().await;
     info!("=== All tests passed ===");
     Ok(())

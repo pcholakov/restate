@@ -586,3 +586,323 @@ async fn run_simulation_with_trace(
     sim.run().await.expect("Simulation failed");
     sim.take_trace().expect("Trace should be present")
 }
+
+/// Long-running simulation stress test with random seeds.
+///
+/// This test runs multiple simulation iterations with random seeds for a configurable
+/// duration. On failure, it prints detailed reproduction information including the
+/// seed, invariant violation, and trace.
+///
+/// # Environment Variables
+///
+/// - `SIM_DURATION_SECS`: Duration to run (default: 60 seconds)
+/// - `SIM_SEED`: Optional fixed seed for reproduction (if not set, uses random seeds)
+/// - `SIM_INVOCATIONS`: Number of invocations per iteration (default: 50)
+/// - `SIM_MAX_STEPS`: Max steps per iteration (default: 2000)
+///
+/// # Example Usage
+///
+/// Run for 15 minutes with random seeds:
+/// ```bash
+/// SIM_DURATION_SECS=900 cargo nextest run -p restate-simulation long_running_stress --no-capture
+/// ```
+///
+/// Reproduce a specific failure:
+/// ```bash
+/// SIM_SEED=12345 cargo nextest run -p restate-simulation long_running_stress --no-capture
+/// ```
+#[test(restate_core::test(start_paused = true))]
+async fn long_running_stress() -> googletest::Result<()> {
+    use std::time::{Duration, Instant};
+
+    // Parse configuration from environment
+    let duration_secs: u64 = std::env::var("SIM_DURATION_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let fixed_seed: Option<u64> = std::env::var("SIM_SEED").ok().and_then(|s| s.parse().ok());
+    let num_invocations: usize = std::env::var("SIM_INVOCATIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    let max_steps: usize = std::env::var("SIM_MAX_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
+
+    let duration = Duration::from_secs(duration_secs);
+    let start = Instant::now();
+
+    // Generate initial random seed from system entropy
+    let master_seed = fixed_seed.unwrap_or_else(|| {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let state = RandomState::new();
+        let mut hasher = state.build_hasher();
+        hasher.write_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64,
+        );
+        hasher.finish()
+    });
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════════╗");
+    println!("║              DETERMINISTIC SIMULATION STRESS TEST                    ║");
+    println!("╠══════════════════════════════════════════════════════════════════════╣");
+    println!(
+        "║ Duration:      {:>10} seconds                                    ║",
+        duration_secs
+    );
+    println!(
+        "║ Master seed:   {:>20}                              ║",
+        master_seed
+    );
+    println!(
+        "║ Invocations:   {:>10} per iteration                              ║",
+        num_invocations
+    );
+    println!(
+        "║ Max steps:     {:>10} per iteration                              ║",
+        max_steps
+    );
+    if fixed_seed.is_some() {
+        println!("║ Mode:          REPRODUCTION (fixed seed)                            ║");
+    } else {
+        println!("║ Mode:          EXPLORATION (random seeds)                           ║");
+    }
+    println!("╚══════════════════════════════════════════════════════════════════════╝");
+    println!();
+
+    let storage = create_test_storage().await;
+
+    let mut iteration = 0u64;
+    let mut total_steps = 0usize;
+    let mut rng = {
+        use rand::{SeedableRng, rngs::StdRng};
+        StdRng::seed_from_u64(master_seed)
+    };
+
+    while start.elapsed() < duration {
+        // Generate seed for this iteration
+        let iteration_seed = if fixed_seed.is_some() {
+            master_seed // Use the same seed for reproduction
+        } else {
+            use rand::Rng;
+            rng.random()
+        };
+
+        iteration += 1;
+
+        // Run simulation with this seed
+        let result =
+            run_single_iteration(iteration_seed, num_invocations, max_steps, storage.clone()).await;
+
+        match result {
+            Ok(steps) => {
+                total_steps += steps;
+                if iteration.is_multiple_of(10) {
+                    let elapsed = start.elapsed();
+                    let remaining = duration.saturating_sub(elapsed);
+                    println!(
+                        "[{:>6.1}s] Iteration {:>6} | seed: {:>20} | steps: {:>5} | total: {:>8} | remaining: {:>6.1}s",
+                        elapsed.as_secs_f64(),
+                        iteration,
+                        iteration_seed,
+                        steps,
+                        total_steps,
+                        remaining.as_secs_f64()
+                    );
+                }
+            }
+            Err((error, trace)) => {
+                let trace: Option<SimulationTrace> = trace;
+                // FAILURE - Print detailed reproduction information
+                println!();
+                println!(
+                    "╔══════════════════════════════════════════════════════════════════════╗"
+                );
+                println!(
+                    "║                    ❌ SIMULATION FAILURE DETECTED                    ║"
+                );
+                println!(
+                    "╠══════════════════════════════════════════════════════════════════════╣"
+                );
+                println!(
+                    "║ Iteration:     {:>10}                                           ║",
+                    iteration
+                );
+                println!(
+                    "║ Seed:          {:>20}                             ║",
+                    iteration_seed
+                );
+                println!(
+                    "║ Steps before:  {:>10}                                           ║",
+                    trace.as_ref().map(|t| t.len()).unwrap_or(0)
+                );
+                println!(
+                    "╠══════════════════════════════════════════════════════════════════════╣"
+                );
+                println!(
+                    "║ Error:                                                               ║"
+                );
+                for line in format!("{}", error).lines() {
+                    println!("║   {}", line);
+                }
+                println!(
+                    "╠══════════════════════════════════════════════════════════════════════╣"
+                );
+                println!(
+                    "║ TO REPRODUCE:                                                        ║"
+                );
+                println!(
+                    "║                                                                      ║"
+                );
+                println!("║   SIM_SEED={} \\", iteration_seed);
+                println!(
+                    "║   cargo nextest run -p restate-simulation long_running_stress \\     ║"
+                );
+                println!(
+                    "║   --no-capture                                                       ║"
+                );
+                println!(
+                    "╚══════════════════════════════════════════════════════════════════════╝"
+                );
+
+                // Print trace summary if available
+                if let Some(ref trace) = trace {
+                    println!();
+                    println!("=== TRACE SUMMARY ===");
+                    println!("Total entries: {}", trace.len());
+
+                    // Print last 10 trace entries for context
+                    let entries = trace.entries();
+                    let start_idx = entries.len().saturating_sub(10);
+                    println!("Last {} entries:", entries.len() - start_idx);
+                    for entry in entries.iter().skip(start_idx) {
+                        println!(
+                            "  Step {:>4}: time={:>12}, command={:?}, actions={}",
+                            entry.step,
+                            entry.time.as_u64(),
+                            entry.command,
+                            entry.actions.len()
+                        );
+                    }
+
+                    // Save trace to file for analysis
+                    if let Ok(json) = trace.to_json() {
+                        let filename = format!("simulation_failure_seed_{}.json", iteration_seed);
+                        if std::fs::write(&filename, &json).is_ok() {
+                            println!();
+                            println!("Trace saved to: {}", filename);
+                        }
+                    }
+                }
+
+                println!();
+
+                // In reproduction mode, we want to fail immediately
+                if fixed_seed.is_some() {
+                    return Err(error.into());
+                }
+
+                // In exploration mode, record and continue (or fail - your choice)
+                // For now, fail on first error to investigate
+                return Err(error.into());
+            }
+        }
+
+        // Break early if in fixed seed mode (only run once)
+        if fixed_seed.is_some() {
+            break;
+        }
+    }
+
+    let elapsed = start.elapsed();
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════════╗");
+    println!("║                    ✅ STRESS TEST COMPLETED                          ║");
+    println!("╠══════════════════════════════════════════════════════════════════════╣");
+    println!(
+        "║ Duration:      {:>10.1} seconds                                   ║",
+        elapsed.as_secs_f64()
+    );
+    println!(
+        "║ Iterations:    {:>10}                                           ║",
+        iteration
+    );
+    println!(
+        "║ Total steps:   {:>10}                                           ║",
+        total_steps
+    );
+    println!(
+        "║ Steps/second:  {:>10.0}                                           ║",
+        total_steps as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "║ Master seed:   {:>20}                             ║",
+        master_seed
+    );
+    println!("╚══════════════════════════════════════════════════════════════════════╝");
+
+    shutdown_test_env().await;
+    Ok(())
+}
+
+/// Result type for single iteration - not using googletest::Result since we need custom error.
+type IterationResult =
+    std::result::Result<usize, (restate_simulation::SimulationError, Option<SimulationTrace>)>;
+
+/// Runs a single simulation iteration and returns the number of steps or an error with trace.
+async fn run_single_iteration(
+    seed: u64,
+    num_invocations: usize,
+    max_steps: usize,
+    storage: restate_partition_store::PartitionStore,
+) -> IterationResult {
+    let config = PartitionSimulationConfig {
+        seed,
+        max_steps,
+        partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
+        check_invariants: true,
+    };
+
+    let mut sim = PartitionSimulation::new(
+        config,
+        storage,
+        InvokerBehavior::Probabilistic {
+            success_rate: 0.5,
+            failure_rate: 0.3,
+        },
+    );
+    sim.enable_tracing();
+
+    // Enqueue invocations targeting small key space
+    for _ in 0..num_invocations {
+        let invocation = sim.random_vo_invocation();
+        sim.enqueue_invocation(invocation);
+    }
+
+    match sim.run().await {
+        Ok(outcome) => {
+            if outcome.success {
+                Ok(outcome.steps_executed)
+            } else {
+                // Invariant violation
+                let trace = sim.take_trace();
+                let error = if let Some(violation) = outcome.violations.into_iter().next() {
+                    restate_simulation::SimulationError::Invariant(violation)
+                } else {
+                    restate_simulation::SimulationError::NoPendingWork
+                };
+                Err((error, trace))
+            }
+        }
+        Err(e) => {
+            let trace = sim.take_trace();
+            Err((e, trace))
+        }
+    }
+}

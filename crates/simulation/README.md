@@ -136,6 +136,24 @@ async fn test_simulation() {
 }
 ```
 
+## Verifying Determinism
+
+Due to RocksDB singleton constraints, true determinism verification requires
+comparing traces across separate process runs:
+
+```bash
+# Run test and capture trace summary
+cargo test -p restate-simulation test_partition_simulation -- --nocapture 2>&1 | tee run1.log
+
+# Run again
+cargo test -p restate-simulation test_partition_simulation -- --nocapture 2>&1 | tee run2.log
+
+# Compare trace summaries - look for "Trace Summary" sections
+diff <(grep -A3 "Trace Summary" run1.log) <(grep -A3 "Trace Summary" run2.log)
+```
+
+If the simulation is deterministic, trace summaries across runs should be identical.
+
 ## Future Work
 
 - [ ] Multi-partition simulation with cross-partition messaging

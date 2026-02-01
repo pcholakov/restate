@@ -10,29 +10,113 @@
 
 //! Deterministic clock for simulation testing.
 //!
-//! This module provides a [`SimulationClock`] that can be manually advanced for
-//! deterministic simulation testing. When running with tokio's paused time
-//! (`start_paused = true`), the clock integrates with tokio's time to ensure
-//! all time-dependent operations see consistent simulated time.
+//! This module provides clocks for deterministic simulation testing:
+//!
+//! - [`SimulationClock`]: Manually advanced clock with explicit time control
+//! - [`TokioClock`]: Uses `tokio::time::Instant` for automatic paused time integration
 //!
 //! # Tokio Integration
 //!
 //! When using `#[restate_core::test(start_paused = true)]`, tokio's time is paused.
-//! The [`SimulationClock`] synchronizes with tokio's paused time via
-//! [`advance_to_async`](SimulationClock::advance_to_async) and
-//! [`advance_async`](SimulationClock::advance_async).
 //!
-//! This ensures that:
-//! - All `tokio::time::sleep` and `tokio::time::timeout` calls use simulated time
-//! - Timer-based logic in the partition processor works correctly
-//! - The simulation has deterministic control over all time sources
+//! [`TokioClock`] automatically synchronizes with tokio's paused time by using
+//! `tokio::time::Instant`. When tokio time is paused:
+//! - `tokio::time::Instant::now()` returns a frozen instant initially
+//! - When time auto-advances or is advanced via `tokio::time::advance()`,
+//!   subsequent `Instant::now()` calls reflect that advancement
+//!
+//! [`SimulationClock`] provides explicit control via `advance_to_async` which
+//! calls `tokio::time::advance()` to advance tokio's paused time.
+//!
+//! Both clocks update the global [`WallClock`] cache so that
+//! `MillisSinceEpoch::now()` returns the simulated time.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use restate_clock::WallClock;
+use restate_clock::{Clock, WallClock};
 use restate_types::time::MillisSinceEpoch;
+
+/// A clock that uses `tokio::time::Instant` for automatic paused time integration.
+///
+/// When tokio time is paused (`start_paused = true`), this clock automatically
+/// tracks the simulated time as tokio advances it (either via auto-advance
+/// when blocked on timers, or via explicit `tokio::time::advance()` calls).
+///
+/// This is useful for code that needs a `Clock` implementation that automatically
+/// stays synchronized with tokio's paused time.
+///
+/// # Example
+///
+/// ```ignore
+/// #[tokio::test(start_paused = true)]
+/// async fn test_with_tokio_clock() {
+///     let clock = TokioClock::new();
+///
+///     // Initial time is BASE_TIME
+///     let t0 = clock.now();
+///
+///     // After a tokio sleep, clock reflects elapsed time
+///     tokio::time::sleep(Duration::from_secs(5)).await;
+///     let t1 = clock.now();
+///
+///     assert_eq!(t1.as_u64() - t0.as_u64(), 5000);
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct TokioClock {
+    initial_instant: tokio::time::Instant,
+}
+
+impl TokioClock {
+    /// Fixed base time for deterministic tests (well after RESTATE_EPOCH).
+    /// This is Nov 14, 2023 22:13:20 UTC.
+    pub const BASE_TIME: MillisSinceEpoch = MillisSinceEpoch::new(1_700_000_000_000);
+
+    /// Creates a new `TokioClock` starting from the current tokio instant.
+    ///
+    /// Also initializes the global WallClock cache to BASE_TIME so that
+    /// `MillisSinceEpoch::now()` returns simulated time.
+    pub fn new() -> Self {
+        // Initialize WallClock with the base simulated time
+        WallClock::set_recent(Self::BASE_TIME);
+
+        Self {
+            initial_instant: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Returns the elapsed time since this clock was created.
+    pub fn elapsed(&self) -> Duration {
+        tokio::time::Instant::now().duration_since(self.initial_instant)
+    }
+
+    /// Updates the global WallClock cache to reflect the current simulated time.
+    ///
+    /// Call this after tokio time advances to ensure `MillisSinceEpoch::now()`
+    /// returns the correct simulated time.
+    pub fn sync_wallclock(&self) {
+        WallClock::set_recent(self.now());
+    }
+}
+
+impl Default for TokioClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for TokioClock {
+    fn recent(&self) -> MillisSinceEpoch {
+        let elapsed = tokio::time::Instant::now().duration_since(self.initial_instant);
+        Self::BASE_TIME + elapsed
+    }
+
+    fn now(&self) -> MillisSinceEpoch {
+        self.recent()
+    }
+}
 
 /// A deterministic clock for simulation testing.
 ///
@@ -318,5 +402,68 @@ mod tests {
 
         // MillisSinceEpoch::now() should return the new time
         assert_eq!(MillisSinceEpoch::now(), MillisSinceEpoch::new(2_001_000));
+    }
+
+    // --- TokioClock tests ---
+
+    #[tokio::test(start_paused = true)]
+    async fn test_tokio_clock_starts_at_base_time() {
+        let clock = TokioClock::new();
+        assert_eq!(clock.now(), TokioClock::BASE_TIME);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_tokio_clock_tracks_elapsed_time() {
+        let clock = TokioClock::new();
+        let t0 = clock.now();
+
+        // Advance tokio time by 5 seconds
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let t1 = clock.now();
+        assert_eq!(t1.as_u64() - t0.as_u64(), 5000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_tokio_clock_auto_advances_with_sleep() {
+        let clock = TokioClock::new();
+        let t0 = clock.now();
+
+        // Sleep for 3 seconds - tokio will auto-advance when paused
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let t1 = clock.now();
+        assert_eq!(t1.as_u64() - t0.as_u64(), 3000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_tokio_clock_sync_wallclock() {
+        let clock = TokioClock::new();
+
+        // Advance tokio time
+        tokio::time::advance(Duration::from_secs(10)).await;
+
+        // Sync WallClock
+        clock.sync_wallclock();
+
+        // MillisSinceEpoch::now() should return the advanced time
+        let expected = TokioClock::BASE_TIME + Duration::from_secs(10);
+        assert_eq!(MillisSinceEpoch::now(), expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_tokio_clock_implements_clock_trait() {
+        use restate_clock::Clock;
+
+        let clock = TokioClock::new();
+
+        // Both now() and recent() should return the same value
+        assert_eq!(clock.now(), clock.recent());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        // After advancing, both should still be equal
+        assert_eq!(clock.now(), clock.recent());
+        assert_eq!(clock.now(), TokioClock::BASE_TIME + Duration::from_secs(1));
     }
 }

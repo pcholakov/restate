@@ -15,7 +15,7 @@ default = []
 restate-workspace-hack = { workspace = true }
 
 # Restate crates
-restate-clock = { workspace = true }
+restate-clock = { workspace = true, features = ["test-util"] }
 restate-invoker-api = { workspace = true }
 restate-partition-store = { workspace = true }
 restate-rocksdb = { workspace = true }
@@ -37,7 +37,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time", "test-util"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

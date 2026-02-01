@@ -486,9 +486,34 @@ where
 
     /// Advances time to fire the next scheduled timer (if any).
     /// Returns true if a timer was fired.
+    ///
+    /// This method is synchronous and only updates the simulation clock.
+    /// For tests that need tokio time integration, use [`advance_to_next_timer_async`].
     fn advance_to_next_timer(&mut self) -> bool {
         if let Some((&wake_time, _)) = self.timers.first_key_value() {
             self.clock.advance_to(wake_time);
+            if let Some(timers) = self.timers.remove(&wake_time) {
+                for timer in timers {
+                    let timer_key = timer.timer_key();
+                    if !self.deleted_timers.remove(timer_key) {
+                        self.pending_commands.push_back(Command::Timer(timer));
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Advances time to fire the next scheduled timer (if any), synchronizing with tokio's paused time.
+    /// Returns true if a timer was fired.
+    ///
+    /// This method should be used when running with `start_paused = true` to ensure
+    /// that `tokio::time::sleep` and other timer-based operations complete correctly.
+    async fn advance_to_next_timer_async(&mut self) -> bool {
+        if let Some((&wake_time, _)) = self.timers.first_key_value() {
+            self.clock.advance_to_async(wake_time).await;
             if let Some(timers) = self.timers.remove(&wake_time) {
                 for timer in timers {
                     let timer_key = timer.timer_key();
@@ -671,9 +696,14 @@ where
     ///
     /// This takes the next command from the queue (or advances time to fire a timer),
     /// applies it to the state machine, and processes the resulting actions.
+    ///
+    /// When tokio time is paused (`start_paused = true`), this method synchronizes
+    /// the simulation clock with tokio's paused time, ensuring that timer-based
+    /// operations complete at the correct simulated time.
     pub async fn step(&mut self) -> Result<StepResult, SimulationError> {
         // If no pending commands, try to advance to the next timer
-        if self.pending_commands.is_empty() && !self.advance_to_next_timer() {
+        // Use async version to synchronize with tokio's paused time
+        if self.pending_commands.is_empty() && !self.advance_to_next_timer_async().await {
             return Err(SimulationError::NoPendingWork);
         }
 

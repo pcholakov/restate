@@ -147,3 +147,30 @@ impl Clock for WallClock {
         WallClock::recent_ms()
     }
 }
+
+#[cfg(feature = "test-util")]
+impl WallClock {
+    /// Sets the cached recent timestamp directly.
+    ///
+    /// This is intended for simulation testing where deterministic time control is needed.
+    /// When set to a non-zero value, `MillisSinceEpoch::now()` will return this value
+    /// instead of calling `SystemTime::now()`.
+    ///
+    /// Only available with the `test-util` feature.
+    ///
+    /// # Warning
+    ///
+    /// This bypasses the normal clock upkeep mechanism. Use only in tests.
+    pub fn set_recent(timestamp: MillisSinceEpoch) {
+        // Store in microseconds (internal representation)
+        RECENT_UNIX_TIMESTAMP_US.store(timestamp.as_u64() * 1_000, Ordering::Relaxed);
+    }
+
+    /// Clears the cached recent timestamp (resets to 0).
+    ///
+    /// This causes `MillisSinceEpoch::now()` to fall back to `SystemTime::now()`.
+    /// Only available with the `test-util` feature.
+    pub fn clear_recent() {
+        RECENT_UNIX_TIMESTAMP_US.store(0, Ordering::Relaxed);
+    }
+}

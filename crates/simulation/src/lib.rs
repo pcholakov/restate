@@ -49,6 +49,6 @@ mod trace;
 pub use clock::SimulationClock;
 pub use partition::{
     InvokerBehavior, InvokerSimulator, PartitionSimulation, PartitionSimulationConfig,
-    SimulationError, SimulationOutcome, StepResult, VO_TEST_KEYS, VO_TEST_HANDLER, VO_TEST_SERVICE,
+    SimulationError, SimulationOutcome, StepResult, VO_TEST_HANDLER, VO_TEST_KEYS, VO_TEST_SERVICE,
 };
 pub use trace::{ActionTrace, CommandTrace, SimulationTrace, TraceDiff, TraceEntry};

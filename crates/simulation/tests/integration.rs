@@ -420,7 +420,10 @@ async fn test_partition_simulation() -> googletest::Result<()> {
         info!("=== Trace Summary (for cross-run comparison) ===");
         info!("Total steps: {}", trace.len());
         if let Some(first) = trace.entries().first() {
-            info!("First entry: step={}, command={:?}", first.step, first.command);
+            info!(
+                "First entry: step={}, command={:?}",
+                first.step, first.command
+            );
         }
         if let Some(last) = trace.entries().last() {
             info!("Last entry: step={}, command={:?}", last.step, last.command);
@@ -511,10 +514,15 @@ fn z_test_trace_comparison() {
 
 /// Creates a deterministic set of invocations for repeated history testing.
 /// Uses a seeded RNG to generate consistent invocations.
-fn create_deterministic_invocations(seed: u64, count: usize) -> Vec<restate_types::invocation::ServiceInvocation> {
+fn create_deterministic_invocations(
+    seed: u64,
+    count: usize,
+) -> Vec<restate_types::invocation::ServiceInvocation> {
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use restate_types::identifiers::InvocationId;
-    use restate_types::invocation::{InvocationTarget, ServiceInvocation, Source, VirtualObjectHandlerType};
+    use restate_types::invocation::{
+        InvocationTarget, ServiceInvocation, Source, VirtualObjectHandlerType,
+    };
 
     let keys = ["key-a", "key-b", "key-c"];
     let mut rng = StdRng::seed_from_u64(seed);
@@ -570,4 +578,3 @@ async fn run_simulation_with_trace(
     sim.run().await.expect("Simulation failed");
     sim.take_trace().expect("Trace should be present")
 }
-

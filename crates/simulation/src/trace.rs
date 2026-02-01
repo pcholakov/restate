@@ -254,8 +254,8 @@ impl SimulationTrace {
             if a != b {
                 return Err(TraceDiff::EntryMismatch {
                     step: i,
-                    expected: a.clone(),
-                    actual: b.clone(),
+                    expected: Box::new(a.clone()),
+                    actual: Box::new(b.clone()),
                 });
             }
         }
@@ -282,8 +282,8 @@ pub enum TraceDiff {
     /// Traces diverge at a specific step.
     EntryMismatch {
         step: usize,
-        expected: TraceEntry,
-        actual: TraceEntry,
+        expected: Box<TraceEntry>,
+        actual: Box<TraceEntry>,
     },
 }
 

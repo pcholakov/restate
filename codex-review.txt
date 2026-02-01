@@ -1,0 +1,155 @@
+• Findings
+
+  - High: long_running_stress is a normal test (not ignored/feature‑gated) with a 60s default wall‑clock duration, so it will run in a standard cargo nextest run even though the
+    README says it is not part of normal runs. crates/simulation/tests/integration.rs:612 crates/simulation/tests/integration.rs:616 crates/simulation/README.md:194
+  - High: Deterministic invocation IDs are now built from RNG‑generated partition_key rather than the invocation target’s deterministic partition key; this can create
+    invocations that don’t map to the target key’s partition and can fall outside partition_key_range when it’s not full, triggering the state machine’s partition range
+    assertion. crates/simulation/src/partition.rs:490 crates/simulation/src/partition.rs:500 crates/simulation/tests/integration.rs:534 crates/types/src/identifiers.rs:452
+    crates/types/src/invocation/mod.rs:516 crates/worker/src/partition/state_machine/mod.rs:699
+  - Medium: vo_keys_touched is a HashSet and check_vo_exclusivity iterates it; when a violation exists, the first reported key depends on set iteration order, so you can get
+    different “first violation” reports even with the same seed. Consider a deterministic set if you want stable failure reporting. crates/simulation/src/partition.rs:333
+    crates/simulation/src/partition.rs:694
+  - Low: The struct comment says VO keys are tracked for “dynamically generated keys, not just the hardcoded test keys,” but the actual tracking only inserts keys in
+    VO_TEST_KEYS, so non‑test keys are skipped. Either update the comment or broaden tracking. crates/simulation/src/partition.rs:330 crates/simulation/src/partition.rs:567
+  - Low: z_test_trip_wire_detection is intentionally probabilistic and asserts it found a violation within 100 iterations; with a 5% skip rate and probabilistic invoker
+    outcomes, this can still be flaky in practice. crates/simulation/tests/integration.rs:938 crates/simulation/tests/integration.rs:944 crates/simulation/tests/
+    integration.rs:962 crates/simulation/tests/integration.rs:1011
+  - Low: Cleanup relies on test name ordering to run last; if the runner doesn’t preserve that ordering, the RocksDB shutdown can race other tests. crates/simulation/tests/
+    integration.rs:1110 crates/simulation/tests/integration.rs:1124
+
+  Questions
+
+  - Should deterministic IDs use InvocationId::generate_or_else with the seeded RNG so the partition key stays consistent with the invocation target when possible, instead of
+    always randomizing it? crates/simulation/src/partition.rs:490 crates/types/src/identifiers.rs:452
+  - Do you want long_running_stress behind #[ignore] or a feature flag so it truly isn’t part of “normal” runs as documented? crates/simulation/tests/integration.rs:612 crates/
+    simulation/README.md:194
+  - Is the intent to check VO exclusivity only for VO_TEST_KEYS, or should invariant coverage expand to all touched keys (and then likely use a deterministic set)? crates/
+    simulation/src/partition.rs:567 crates/simulation/src/partition.rs:694
+  - Should we make the trip‑wire test deterministic (e.g., fixed number of unlock attempts) so it can’t flake while still validating invariant detection? crates/simulation/
+    tests/integration.rs:938 crates/simulation/tests/integration.rs:1011
+
+  Change Summary
+
+  - Added TokioClock and updated SimulationClock to use a non‑zero base time and to update WallClock before advancing tokio time. crates/simulation/src/clock.rs:41 crates/
+    simulation/src/clock.rs:141 crates/simulation/src/clock.rs:264
+  - Added deterministic invocation ID generation helpers and VO‑key tracking in the simulation. crates/simulation/src/partition.rs:485 crates/simulation/src/partition.rs:567
+  - Added long‑running stress testing, trip‑wire detection, and seed reproduction tests plus documentation updates. crates/simulation/tests/integration.rs:588 crates/simulation/
+    tests/integration.rs:909 crates/simulation/tests/integration.rs:1018 crates/simulation/README.md:189
+
+  Tests not run (review only).
+
+
+---
+
+also:
+
+        FAIL [   0.315s] restate-simulation::integration z_zz_cleanup
+──── STDOUT:             restate-simulation::integration z_zz_cleanup
+
+running 1 test
+test z_zz_cleanup ...
+──── STDERR:             restate-simulation::integration z_zz_cleanup
+!!!! Running with test-util enabled !!!!
+2026-02-01T18:52:45.666783Z  INFO shutdown_node{reason="test complete"}: restate_core::task_center: ** Shutdown requested reason=test complete
+2026-02-01T18:52:45.666816Z  INFO shutdown_node{reason="test complete"}: restate_core::task_center: Task center has stopped
+2026-02-01T18:52:45.666827Z  INFO shutdown_node{reason="test complete"}: restate_core::task_center: Restate has gracefully shutdown in 0ns
+
+thread 'z_zz_cleanup' (80424645) panicked at crates/simulation/tests/integration.rs:1126:5:
+DBManager not initialized
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/panicking.rs:80:14
+   2: core::panicking::panic_display
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/panicking.rs:259:5
+   3: core::option::expect_failed
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/option.rs:2184:5
+   4: core::option::Option<T>::expect
+             at /Users/pavel/.rustup/toolchains/1.93.0-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/option.rs:971:21
+   5: restate_rocksdb::db_manager::RocksDbManager::get
+             at /Users/pavel/restate/restate/crates/rocksdb/src/db_manager.rs:52:26
+   6: integration::z_zz_cleanup::{{closure}}
+             at ./tests/integration.rs:1126:5
+   7: <core::pin::Pin<P> as core::future::future::Future>::poll
+             at /Users/pavel/.rustup/toolchains/1.93.0-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:133:9
+   8: <tokio::task::task_local::TaskLocalFuture<T,F> as core::future::future::Future>::poll::{{closure}}
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/task_local.rs:401:35
+   9: tokio::task::task_local::LocalKey<T>::scope_inner
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/task_local.rs:217:19
+  10: <tokio::task::task_local::TaskLocalFuture<T,F> as core::future::future::Future>::poll
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/task_local.rs:399:14
+  11: <tokio::task::task_local::TaskLocalFuture<T,F> as core::future::future::Future>::poll::{{closure}}
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/task_local.rs:401:35
+  12: tokio::task::task_local::LocalKey<T>::scope_inner
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/task_local.rs:217:19
+  13: <tokio::task::task_local::TaskLocalFuture<T,F> as core::future::future::Future>::poll
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/task_local.rs:399:14
+  14: <tokio::task::task_local::TaskLocalFuture<T,F> as core::future::future::Future>::poll::{{closure}}
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/task_local.rs:401:35
+  15: tokio::task::task_local::LocalKey<T>::scope_inner
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/task_local.rs:217:19
+  16: <tokio::task::task_local::TaskLocalFuture<T,F> as core::future::future::Future>::poll
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/task_local.rs:399:14
+  17: <restate_core::task_center::extensions::WithTaskCenter<T> as core::future::future::Future>::poll
+             at /Users/pavel/restate/restate/crates/core/src/task_center/extensions.rs:137:24
+  18: <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-0.1.41/src/instrument.rs:321:15
+  19: <core::pin::Pin<P> as core::future::future::Future>::poll
+             at /Users/pavel/.rustup/toolchains/1.93.0-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:133:9
+  20: tokio::runtime::scheduler::current_thread::CoreGuard::block_on::{{closure}}::{{closure}}::{{closure}}
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/scheduler/current_thread/mod.rs:742:70
+  21: tokio::task::coop::with_budget
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/coop/mod.rs:167:5
+  22: tokio::task::coop::budget
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/task/coop/mod.rs:133:5
+  23: tokio::runtime::scheduler::current_thread::CoreGuard::block_on::{{closure}}::{{closure}}
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/scheduler/current_thread/mod.rs:742:25
+  24: tokio::runtime::scheduler::current_thread::Context::enter
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/scheduler/current_thread/mod.rs:432:19
+  25: tokio::runtime::scheduler::current_thread::CoreGuard::block_on::{{closure}}
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/scheduler/current_thread/mod.rs:741:44
+  26: tokio::runtime::scheduler::current_thread::CoreGuard::enter::{{closure}}
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/scheduler/current_thread/mod.rs:829:68
+  27: tokio::runtime::context::scoped::Scoped<T>::set
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/context/scoped.rs:40:9
+  28: tokio::runtime::context::set_scheduler::{{closure}}
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/context.rs:176:38
+  29: std::thread::local::LocalKey<T>::try_with
+             at /Users/pavel/.rustup/toolchains/1.93.0-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/thread/local.rs:513:12
+  30: std::thread::local::LocalKey<T>::with
+             at /Users/pavel/.rustup/toolchains/1.93.0-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/thread/local.rs:477:20
+  31: tokio::runtime::context::set_scheduler
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/context.rs:176:17
+  32: tokio::runtime::scheduler::current_thread::CoreGuard::enter
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/scheduler/current_thread/mod.rs:829:27
+  33: tokio::runtime::scheduler::current_thread::CoreGuard::block_on
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/scheduler/current_thread/mod.rs:729:24
+  34: tokio::runtime::scheduler::current_thread::CurrentThread::block_on::{{closure}}
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/scheduler/current_thread/mod.rs:200:33
+  35: tokio::runtime::context::runtime::enter_runtime
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/context/runtime.rs:65:16
+  36: tokio::runtime::scheduler::current_thread::CurrentThread::block_on
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/scheduler/current_thread/mod.rs:188:9
+  37: tokio::runtime::runtime::Runtime::block_on_inner
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/runtime.rs:368:52
+  38: tokio::runtime::runtime::Runtime::block_on
+             at /Users/pavel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.48.0/src/runtime/runtime.rs:342:18
+  39: integration::z_zz_cleanup
+             at ./tests/integration.rs:1124:25
+  40: integration::z_zz_cleanup::{{closure}}
+             at ./tests/integration.rs:1124:24
+  41: core::ops::function::FnOnce::call_once
+             at /Users/pavel/.rustup/toolchains/1.93.0-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  42: core::ops::function::FnOnce::call_once
+             at /rustc/254b59607d4417e9dffbc307138ae5c86280fe4c/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+  Cancelling due to test failure: 2 tests still running
+        PASS [   0.806s] restate-simulation::integration test_partition_simulation
+        SLOW [> 60.000s] restate-simulation::integration long_running_stress
+        PASS [  60.154s] restate-simulation::integration long_running_stress
+────────────
+     Summary [  60.236s] 26 tests run: 25 passed (1 slow), 1 failed, 0 skipped
+        FAIL [   0.315s] restate-simulation::integration z_zz_cleanup
+error: test run failed

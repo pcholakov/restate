@@ -86,7 +86,7 @@ async fn shutdown_test_env() {
 ///    `shutdown()`. This closes all DBs but resets `shutting_down = false`, allowing new
 ///    `PartitionStoreManager` instances to open fresh DBs. Note that you need a new
 ///    `PartitionStoreManager` after reset since it caches DB handles.
-#[test(restate_core::test)]
+#[test(restate_core::test(start_paused = true))]
 async fn test_partition_simulation() -> googletest::Result<()> {
     let storage = create_test_storage().await;
 
@@ -229,11 +229,8 @@ async fn test_partition_simulation() -> googletest::Result<()> {
             check_invariants: false, // Disable for raw throughput
         };
 
-        let mut sim = PartitionSimulation::new(
-            config,
-            storage.clone(),
-            InvokerBehavior::ImmediateSuccess,
-        );
+        let mut sim =
+            PartitionSimulation::new(config, storage.clone(), InvokerBehavior::ImmediateSuccess);
 
         // Enqueue many invocations
         for _ in 0..1000 {
@@ -297,6 +294,42 @@ async fn test_partition_simulation() -> googletest::Result<()> {
     shutdown_test_env().await;
     info!("=== All tests passed ===");
     Ok(())
+}
+
+/// Tests that tokio's auto-advance works correctly with start_paused.
+/// This demonstrates the infrastructure for time acceleration.
+#[test(restate_core::test(start_paused = true))]
+async fn test_tokio_auto_advance() {
+    use std::time::Duration;
+
+    // Record both wall clock and simulated time
+    let wall_start = std::time::Instant::now();
+    let sim_start = tokio::time::Instant::now();
+
+    // Sleep for 1 hour in simulated time
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+
+    let wall_elapsed = wall_start.elapsed();
+    let sim_elapsed = sim_start.elapsed();
+
+    // Verify that 1 hour of simulated time has passed
+    assert!(
+        sim_elapsed >= Duration::from_secs(3600),
+        "Should have advanced 1 hour simulated"
+    );
+
+    // Wall clock time should be nearly instant
+    assert!(
+        wall_elapsed < Duration::from_secs(1),
+        "Wall clock should be < 1s, got {:?}",
+        wall_elapsed
+    );
+
+    let acceleration = sim_elapsed.as_secs_f64() / wall_elapsed.as_secs_f64();
+    info!(
+        "Time acceleration: simulated {:?} in {:?} wall clock = {:.0}x",
+        sim_elapsed, wall_elapsed, acceleration
+    );
 }
 
 /// Tests that the seeded RNG produces deterministic results.

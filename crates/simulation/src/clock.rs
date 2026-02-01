@@ -9,9 +9,14 @@
 // by the Apache License, Version 2.0.
 
 //! Deterministic clock for simulation testing.
+//!
+//! This module provides a [`SimulationClock`] that can be manually advanced for
+//! deterministic simulation testing. When running with tokio's paused time
+//! (`start_paused = true`), tokio auto-advances when blocked on timers.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use restate_types::time::MillisSinceEpoch;
 
@@ -78,6 +83,13 @@ impl SimulationClock {
         self.inner
             .current_time
             .store(time.as_u64(), Ordering::Release);
+    }
+
+    /// Advances the clock by the specified duration.
+    /// Returns the new current time.
+    pub fn advance(&self, duration: Duration) -> MillisSinceEpoch {
+        let millis = u64::try_from(duration.as_millis()).expect("duration fits in u64");
+        self.advance_ms(millis)
     }
 }
 

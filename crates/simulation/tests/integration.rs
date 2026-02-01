@@ -270,6 +270,60 @@ async fn test_partition_simulation() -> googletest::Result<()> {
         info!("Test 4 passed: Trace recording and serialization verified");
     }
 
+    // Test 5: Racey scenario stress test for determinism
+    // This exercises patterns that could expose non-determinism:
+    // - Many concurrent invocations to the same keys
+    // - Mix of success/failure/timeout outcomes
+    // - Rapid enqueue/process cycles
+    info!("=== Test 5: Racey scenario stress test ===");
+    {
+        let config = PartitionSimulationConfig {
+            seed: 555,
+            max_steps: 2000,
+            partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
+            check_invariants: true,
+        };
+
+        let mut sim = PartitionSimulation::new(
+            config,
+            storage.clone(),
+            // Mix of outcomes to create more complex interleavings
+            InvokerBehavior::Probabilistic {
+                success_rate: 0.5,
+                failure_rate: 0.3,
+                // 0.2 timeout - no response
+            },
+        );
+        sim.enable_tracing();
+
+        // Rapidly enqueue many invocations targeting the same small key space
+        // This creates contention and races for VO locks
+        for _ in 0..50 {
+            let invocation = sim.random_vo_invocation();
+            sim.enqueue_invocation(invocation);
+        }
+
+        let outcome = sim.run().await?;
+        let trace = sim.take_trace().expect("Trace should be present");
+
+        info!(
+            steps = outcome.steps_executed,
+            trace_entries = trace.len(),
+            success = outcome.success,
+            "Racey scenario completed"
+        );
+
+        assert_that!(outcome.success, eq(true));
+        assert_that!(outcome.violations, empty());
+
+        // The trace should be deterministic - same seed should always produce same trace
+        // This is verified by the failing repeated history test (next task)
+        info!(
+            "Test 5 passed: Racey scenario completed with {} trace entries",
+            trace.len()
+        );
+    }
+
     // Throughput benchmark: measure commands/second
     info!("=== Throughput benchmark ===");
     {

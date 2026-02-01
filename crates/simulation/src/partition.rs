@@ -50,6 +50,7 @@ use restate_wal_protocol::timer::TimerKeyValue;
 use restate_worker::state_machine::{Action, ActionCollector, StateMachine};
 
 use crate::clock::SimulationClock;
+use crate::trace::SimulationTrace;
 
 /// Small key space for virtual object invocations to force key collisions.
 /// This is critical for testing VO exclusivity invariants.
@@ -329,6 +330,8 @@ pub struct PartitionSimulation<S> {
     /// Track VO keys we've seen for invariant checking.
     /// Maps ServiceId to the invocation that should hold the lock.
     vo_locks_expected: HashMap<ServiceId, InvocationId>,
+    /// Optional trace recorder for determinism verification.
+    trace: Option<SimulationTrace>,
 }
 
 #[allow(dead_code)]
@@ -384,6 +387,7 @@ where
             active_invocations: HashSet::new(),
             steps_executed: 0,
             vo_locks_expected: HashMap::new(),
+            trace: None,
         }
     }
 
@@ -400,6 +404,26 @@ where
     /// Returns the number of steps executed.
     pub fn steps_executed(&self) -> usize {
         self.steps_executed
+    }
+
+    /// Enables trace recording for determinism verification.
+    pub fn enable_tracing(&mut self) {
+        self.trace = Some(SimulationTrace::new());
+    }
+
+    /// Disables trace recording.
+    pub fn disable_tracing(&mut self) {
+        self.trace = None;
+    }
+
+    /// Returns a reference to the current trace, if tracing is enabled.
+    pub fn trace(&self) -> Option<&SimulationTrace> {
+        self.trace.as_ref()
+    }
+
+    /// Takes the trace, leaving tracing disabled.
+    pub fn take_trace(&mut self) -> Option<SimulationTrace> {
+        self.trace.take()
     }
 
     /// Enqueues an external command to be processed.
@@ -691,11 +715,18 @@ where
 
         self.steps_executed += 1;
 
-        Ok(StepResult {
+        let step_result = StepResult {
             command,
             time,
             actions: action_collector,
-        })
+        };
+
+        // Record the step in the trace if enabled
+        if let Some(ref mut trace) = self.trace {
+            trace.record(&step_result);
+        }
+
+        Ok(step_result)
     }
 
     /// Runs the simulation until completion or max steps reached.

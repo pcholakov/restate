@@ -25,12 +25,30 @@
 //! - Time is controlled via a deterministic clock
 //! - Random number generation uses a seeded RNG
 //! - Command ordering is deterministic based on the seed
+//!
+//! # Trace Recording
+//!
+//! The simulation supports trace recording for verifying determinism:
+//!
+//! ```ignore
+//! let mut sim = PartitionSimulation::new(config, storage, InvokerBehavior::ImmediateSuccess);
+//! sim.enable_tracing();
+//!
+//! // Run simulation
+//! sim.enqueue_invocation(invocation);
+//! let outcome = sim.run().await?;
+//!
+//! // Get trace for comparison
+//! let trace = sim.take_trace();
+//! ```
 
 mod clock;
 mod partition;
+mod trace;
 
 pub use clock::SimulationClock;
 pub use partition::{
     InvokerBehavior, InvokerSimulator, PartitionSimulation, PartitionSimulationConfig,
-    SimulationError, SimulationOutcome, StepResult,
+    SimulationError, SimulationOutcome, StepResult, VO_TEST_KEYS, VO_TEST_HANDLER, VO_TEST_SERVICE,
 };
+pub use trace::{ActionTrace, CommandTrace, SimulationTrace, TraceDiff, TraceEntry};

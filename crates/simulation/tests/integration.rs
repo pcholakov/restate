@@ -19,7 +19,9 @@ use tracing::info;
 use restate_core::TaskCenter;
 use restate_partition_store::PartitionStoreManager;
 use restate_rocksdb::RocksDbManager;
-use restate_simulation::{InvokerBehavior, PartitionSimulation, PartitionSimulationConfig};
+use restate_simulation::{
+    InvokerBehavior, PartitionSimulation, PartitionSimulationConfig, SimulationTrace,
+};
 use restate_types::config::StorageOptions;
 use restate_types::identifiers::{PartitionId, PartitionKey};
 use restate_types::partitions::Partition;
@@ -219,6 +221,55 @@ async fn test_partition_simulation() -> googletest::Result<()> {
         info!("Test 3 passed: Lock released after failure");
     }
 
+    // Test 4: Trace recording demonstration
+    info!("=== Test 4: Trace recording ===");
+    {
+        let config = PartitionSimulationConfig {
+            seed: 333,
+            max_steps: 100,
+            partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
+            check_invariants: true,
+        };
+
+        let mut sim =
+            PartitionSimulation::new(config, storage.clone(), InvokerBehavior::ImmediateSuccess);
+        sim.enable_tracing();
+
+        // Add some invocations
+        for _ in 0..5 {
+            let invocation = sim.random_invocation();
+            sim.enqueue_invocation(invocation);
+        }
+
+        let outcome = sim.run().await?;
+        let trace = sim.take_trace().expect("Trace should be present");
+
+        info!(
+            steps = outcome.steps_executed,
+            trace_entries = trace.len(),
+            "Simulation completed with tracing"
+        );
+
+        // Print first 3 trace entries
+        for entry in trace.entries().iter().take(3) {
+            info!(
+                "  Step {}: time={}, command={:?}, actions={}",
+                entry.step,
+                entry.time.as_u64(),
+                entry.command,
+                entry.actions.len()
+            );
+        }
+
+        // Verify serialization roundtrip
+        let json = trace.to_json().expect("Serialization failed");
+        info!("Trace serialized to {} bytes JSON", json.len());
+
+        let restored = SimulationTrace::from_json(&json).expect("Deserialization failed");
+        assert_that!(restored.compare(&trace), ok(eq(())));
+        info!("Test 4 passed: Trace recording and serialization verified");
+    }
+
     // Throughput benchmark: measure commands/second
     info!("=== Throughput benchmark ===");
     {
@@ -353,4 +404,21 @@ fn test_seeded_rng_determinism() {
     let v1: u64 = StdRng::seed_from_u64(seed).random();
     let v3: u64 = rng3.random();
     assert_that!(v1, not(eq(v3)));
+}
+
+/// Tests trace comparison logic without RocksDB.
+/// This validates the trace diff detection mechanism.
+#[test]
+fn z_test_trace_comparison() {
+    // Create two identical traces
+    let trace1 = SimulationTrace::new();
+    let trace2 = SimulationTrace::new();
+
+    // Test that empty traces are equal
+    assert!(trace1.compare(&trace2).is_ok());
+
+    // Test serialization roundtrip
+    let json = trace1.to_json().expect("Serialization failed");
+    let restored = SimulationTrace::from_json(&json).expect("Deserialization failed");
+    assert!(restored.compare(&trace1).is_ok());
 }

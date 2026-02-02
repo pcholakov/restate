@@ -22,7 +22,7 @@ use restate_rocksdb::RocksDbManager;
 use restate_simulation::{
     InvokerBehavior, PartitionSimulation, PartitionSimulationConfig, SimulationTrace,
 };
-use restate_types::config::StorageOptions;
+use restate_types::config::{reset_base_temp_dir, StorageOptions};
 use restate_types::identifiers::{InvocationId, InvocationUuid, PartitionId, PartitionKey};
 use restate_types::partitions::Partition;
 use restate_worker::state_machine::Action;
@@ -57,7 +57,6 @@ async fn create_test_storage() -> restate_partition_store::PartitionStore {
 /// This closes all open databases but allows new ones to be opened afterward.
 /// Use this at the start of each test to ensure a clean state.
 /// If the manager isn't initialized yet, this is a no-op.
-#[allow(dead_code)]
 async fn reset_test_env() {
     if let Some(manager) = RocksDbManager::maybe_get() {
         let _ = manager.reset().await;
@@ -675,7 +674,7 @@ async fn long_running_stress() -> googletest::Result<()> {
     println!("╚══════════════════════════════════════════════════════════════════════╝");
     println!();
 
-    let storage = create_test_storage().await;
+    let mut storage = create_test_storage().await;
 
     let mut iteration = 0u64;
     let mut total_steps = 0usize;
@@ -684,7 +683,21 @@ async fn long_running_stress() -> googletest::Result<()> {
         StdRng::seed_from_u64(master_seed)
     };
 
+    // Reset storage periodically to avoid "too many open files" from RocksDB SST accumulation.
+    // 250 iterations keeps FD usage well below typical ulimit (256 on macOS default).
+    const RESET_INTERVAL: u64 = 250;
+
     while start.elapsed() < duration {
+        // Periodically reset RocksDB to reclaim file descriptors
+        if iteration > 0 && iteration.is_multiple_of(RESET_INTERVAL) {
+            drop(storage);
+            reset_test_env().await;
+            // Yield to let async cleanup tasks complete and FDs be released
+            tokio::task::yield_now().await;
+            reset_base_temp_dir(); // Use fresh temp directory to avoid lock conflicts
+            storage = create_test_storage().await;
+            info!("Reset RocksDB environment after {} iterations", iteration);
+        }
         // Generate seed for this iteration
         let iteration_seed = if fixed_seed.is_some() {
             master_seed // Use the same seed for reproduction

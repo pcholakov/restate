@@ -8063,8 +8063,10 @@ dependencies = [
 name = "restate-simulation"
 version = "1.6.1-dev"
 dependencies = [
+ "anyhow",
  "bytes",
  "bytestring",
+ "clap",
  "derive_more",
  "futures",
  "googletest",
@@ -8086,6 +8088,7 @@ dependencies = [
  "restate-workspace-hack",
  "serde",
  "serde_json",
+ "tempfile",
  "test-log",
  "thiserror 2.0.17",
  "tokio",

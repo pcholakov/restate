@@ -8,14 +8,28 @@ license.workspace = true
 publish = false
 description = "Deterministic simulation testing framework for Restate"
 
+[[bin]]
+name = "simulation-stress"
+path = "src/bin/stress.rs"
+required-features = ["stress-bin"]
+
 [features]
 default = []
+stress-bin = [
+    "dep:clap",
+    "dep:anyhow",
+    "dep:tracing-subscriber",
+    "restate-core/test-util",
+    "restate-partition-store/test-util",
+    "restate-rocksdb/test-util",
+]
 
 [dependencies]
 restate-workspace-hack = { workspace = true }
 
 # Restate crates
 restate-clock = { workspace = true, features = ["test-util"] }
+restate-core = { workspace = true, optional = true }
 restate-invoker-api = { workspace = true }
 restate-partition-store = { workspace = true }
 restate-rocksdb = { workspace = true }
@@ -28,8 +42,10 @@ restate-wal-protocol = { workspace = true }
 restate-worker = { workspace = true, features = ["test-util"] }
 
 # External dependencies
+anyhow = { workspace = true, optional = true }
 bytes = { workspace = true }
 bytestring = { workspace = true }
+clap = { workspace = true, features = ["derive"], optional = true }
 derive_more = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
@@ -39,6 +55,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing = { workspace = true }
+tempfile = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 restate-core = { workspace = true, features = ["test-util"] }

@@ -188,33 +188,47 @@ If the simulation is deterministic, trace summaries across runs should be identi
 
 ## Long-Running Stress Test
 
-The `long_running_stress` test runs multiple simulation iterations with random seeds
+The `simulation-stress` binary runs multiple simulation iterations with random seeds
 for a configurable duration. This is useful for finding rare edge cases.
-
-**Note**: This test is NOT run as part of normal `cargo nextest run` because it runs
-for 60 seconds by default. To run it, use the commands below.
 
 ### Running the Stress Test
 
 ```bash
 # Run for 60 seconds (default) with random seeds
-cargo nextest run -p restate-simulation long_running_stress --run-ignored=only --no-capture
+cargo run -p restate-simulation --bin simulation-stress --features stress-bin
 
 # Run for 15 minutes with random seeds
-SIM_DURATION_SECS=900 cargo nextest run -p restate-simulation long_running_stress --run-ignored=only --no-capture
+cargo run -p restate-simulation --bin simulation-stress --features stress-bin -- --duration 900
 
 # Run for 24 hours (useful for nightly CI)
-SIM_DURATION_SECS=86400 cargo nextest run -p restate-simulation long_running_stress --run-ignored=only --no-capture
+cargo run -p restate-simulation --bin simulation-stress --features stress-bin -- --duration 86400
 ```
 
 ### Configuration
 
-| Environment Variable | Description | Default |
-|---------------------|-------------|---------|
-| `SIM_DURATION_SECS` | How long to run the stress test | 60 |
-| `SIM_SEED` | Fixed seed to reproduce a specific failure | Random |
-| `SIM_INVOCATIONS` | Number of invocations per iteration | 50 |
-| `SIM_MAX_STEPS` | Maximum steps per iteration | 2000 |
+| CLI Flag | Description | Default |
+|----------|-------------|---------|
+| `--duration` | How long to run the stress test (seconds) | 60 |
+| `--seed` | Fixed seed to reproduce a specific failure | Random |
+| `--invocations` | Number of invocations per iteration | 50 |
+| `--max-steps` | Maximum steps per iteration | 2000 |
+
+### CPU Parallelism
+
+Due to RocksDB singleton constraints, each stress test process runs single-threaded.
+To utilize multiple CPU cores, run multiple processes in parallel:
+
+```bash
+# Run 4 parallel stress test processes for 1 hour
+for i in {1..4}; do
+  cargo run -p restate-simulation --bin simulation-stress --features stress-bin \
+    -- --duration 3600 &
+done
+wait
+```
+
+Each process uses an independent random seed, so they explore different parts of
+the state space concurrently.
 
 ### Reproducing Failures
 
@@ -227,10 +241,10 @@ When the stress test finds a failure, it prints reproduction instructions:
 ║ Iteration:            42                                             ║
 ║ Seed:          12345678                                              ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║ To reproduce this failure:                                           ║
-║   SIM_SEED=12345678 \                                                ║
-║   cargo nextest run -p restate-simulation long_running_stress \      ║
-║   --run-ignored=only --no-capture                                    ║
+║ TO REPRODUCE:                                                        ║
+║                                                                      ║
+║   cargo run -p restate-simulation --bin simulation-stress \          ║
+║     --features stress-bin -- --seed 12345678                         ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
 

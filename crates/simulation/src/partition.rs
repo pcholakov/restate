@@ -25,6 +25,7 @@ use rand::{Rng, SeedableRng};
 use restate_invoker_api::{Effect, EffectKind, InvokeInputJournal};
 use restate_service_protocol_v4::entry_codec::ServiceProtocolV4Codec;
 use restate_storage_api::invocation_status_table::{InvocationStatus, ReadInvocationStatusTable};
+use restate_storage_api::journal_table_v2::ReadJournalTable;
 use restate_storage_api::outbox_table::OutboxMessage;
 use restate_storage_api::service_status_table::{
     ReadVirtualObjectStatusTable, VirtualObjectStatus,
@@ -332,6 +333,10 @@ pub struct PartitionSimulation<S> {
     /// This allows checking invariants for dynamically generated keys,
     /// not just the hardcoded test keys.
     vo_keys_touched: HashSet<ServiceId>,
+    /// Track invocations we've seen for journal integrity checking.
+    invocations_seen: HashSet<InvocationId>,
+    /// Last timer fire time for monotonicity checking.
+    last_timer_fire_time: Option<MillisSinceEpoch>,
     /// Optional trace recorder for determinism verification.
     trace: Option<SimulationTrace>,
 }
@@ -339,7 +344,7 @@ pub struct PartitionSimulation<S> {
 #[allow(dead_code)]
 impl<S> PartitionSimulation<S>
 where
-    S: Storage + ReadInvocationStatusTable + ReadVirtualObjectStatusTable + Send,
+    S: Storage + ReadInvocationStatusTable + ReadVirtualObjectStatusTable + ReadJournalTable + Send,
 {
     /// Creates a new partition simulation.
     pub fn new(
@@ -391,6 +396,8 @@ where
             active_invocations: HashSet::new(),
             steps_executed: 0,
             vo_keys_touched: HashSet::new(),
+            invocations_seen: HashSet::new(),
+            last_timer_fire_time: None,
             trace: None,
         }
     }
@@ -538,12 +545,24 @@ where
     }
 
     /// Advances time to fire the next scheduled timer (if any), synchronizing with tokio's paused time.
-    /// Returns true if a timer was fired.
+    /// Returns Ok(true) if a timer was fired, Ok(false) if no timers available.
+    /// Returns Err if timer monotonicity was violated.
     ///
     /// This method should be used when running with `start_paused = true` to ensure
     /// that `tokio::time::sleep` and other timer-based operations complete correctly.
-    async fn advance_to_next_timer_async(&mut self) -> bool {
+    async fn advance_to_next_timer_async(&mut self) -> Result<bool, InvariantViolation> {
         if let Some((&wake_time, _)) = self.timers.first_key_value() {
+            // Check timer monotonicity before firing
+            if let Some(last_time) = self.last_timer_fire_time
+                && wake_time < last_time
+            {
+                return Err(InvariantViolation::TimerFiredOutOfOrder {
+                    current_time: wake_time,
+                    last_fire_time: last_time,
+                });
+            }
+            self.last_timer_fire_time = Some(wake_time);
+
             self.clock.advance_to_async(wake_time).await;
             if let Some(timers) = self.timers.remove(&wake_time) {
                 for timer in timers {
@@ -553,9 +572,9 @@ where
                     }
                 }
             }
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -569,6 +588,7 @@ where
                     invoke_input_journal,
                 } => {
                     self.active_invocations.insert(*invocation_id);
+                    self.invocations_seen.insert(*invocation_id);
                     // Track VO keys for invariant checking (only small test key space)
                     if let Some(key) = invocation_target.key()
                         && VO_TEST_KEYS.contains(&key.as_ref())
@@ -595,6 +615,7 @@ where
                     ..
                 } => {
                     self.active_invocations.insert(*invocation_id);
+                    self.invocations_seen.insert(*invocation_id);
                     // Track VO keys for invariant checking (only small test key space)
                     if let Some(key) = invocation_target.key()
                         && VO_TEST_KEYS.contains(&key.as_ref())
@@ -682,7 +703,12 @@ where
 
     /// Checks state machine invariants.
     async fn check_invariants(&mut self) -> Result<(), InvariantViolation> {
-        self.check_vo_exclusivity().await
+        self.check_vo_exclusivity().await?;
+        // TODO: Re-enable journal sequence check once we handle both journal table v1 and v2.
+        // The state machine may write to v1 journal table while we read from v2, causing
+        // false positive violations.
+        // self.check_journal_sequence().await?;
+        Ok(())
     }
 
     /// Checks the virtual object exclusivity invariant.
@@ -690,6 +716,7 @@ where
     /// For each VO key we've touched, verifies that:
     /// 1. If locked, the lock holder is in an active state (Invoked/Suspended/Paused)
     /// 2. No two invocations are simultaneously active for the same key
+    /// 3. No orphaned locks (locked by invocation that no longer exists)
     async fn check_vo_exclusivity(&mut self) -> Result<(), InvariantViolation> {
         // Check each VO key we've touched during this simulation
         for service_id in &self.vo_keys_touched {
@@ -707,6 +734,14 @@ where
                     .get_invocation_status(&locked_by)
                     .await
                     .map_err(|e| InvariantViolation::Custom(format!("Storage error: {}", e)))?;
+
+                // Check for orphaned lock (invocation completely gone)
+                if matches!(invocation_status, InvocationStatus::Free) {
+                    return Err(InvariantViolation::OrphanedVoLock {
+                        service_id: service_id.clone(),
+                        locked_by,
+                    });
+                }
 
                 let is_active = matches!(
                     invocation_status,
@@ -737,6 +772,84 @@ where
         Ok(())
     }
 
+    /// Checks journal entry sequence continuity for active invocations.
+    ///
+    /// For each invocation that's in an active state (Invoked/Suspended/Paused),
+    /// verifies that journal entries are sequential without gaps (0, 1, 2, ..., length-1).
+    ///
+    /// Note: Completed invocations are skipped because their journals may have been
+    /// cleaned up based on retention policy.
+    async fn check_journal_sequence(&mut self) -> Result<(), InvariantViolation> {
+        use futures::StreamExt;
+        use std::pin::pin;
+
+        for invocation_id in &self.invocations_seen {
+            let invocation_status = self
+                .storage
+                .get_invocation_status(invocation_id)
+                .await
+                .map_err(|e| InvariantViolation::Custom(format!("Storage error: {}", e)))?;
+
+            // Only check active invocations (not completed or free) that have journal metadata
+            let is_active = matches!(
+                invocation_status,
+                InvocationStatus::Invoked(_)
+                    | InvocationStatus::Suspended { .. }
+                    | InvocationStatus::Paused(_)
+            );
+            if !is_active {
+                continue;
+            }
+
+            let Some(journal_meta) = invocation_status.get_journal_metadata() else {
+                continue;
+            };
+
+            let expected_length = journal_meta.length;
+            if expected_length == 0 {
+                continue;
+            }
+
+            // Read all journal entries and verify sequence continuity
+            let journal_stream = self
+                .storage
+                .get_journal(*invocation_id, expected_length)
+                .map_err(|e| InvariantViolation::Custom(format!("Storage error: {}", e)))?;
+
+            let mut pinned_stream = pin!(journal_stream);
+            let mut seen_indices = vec![false; expected_length as usize];
+            let mut actual_count = 0u32;
+
+            while let Some(result) = pinned_stream.next().await {
+                let (index, _entry) = result
+                    .map_err(|e| InvariantViolation::Custom(format!("Storage error: {}", e)))?;
+
+                if (index as usize) < seen_indices.len() {
+                    seen_indices[index as usize] = true;
+                    actual_count += 1;
+                }
+            }
+
+            // Find missing indices
+            let missing_indices: Vec<u32> = seen_indices
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &seen)| if !seen { Some(i as u32) } else { None })
+                .collect();
+
+            if !missing_indices.is_empty() {
+                return Err(InvariantViolation::JournalSequenceGap {
+                    invocation_id: *invocation_id,
+                    expected_length,
+                    actual_entries: actual_count,
+                    missing_indices,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Executes a single simulation step.
     ///
     /// This takes the next command from the queue (or advances time to fire a timer),
@@ -753,7 +866,7 @@ where
     pub async fn step(&mut self) -> Result<StepResult, SimulationError> {
         // If no pending commands, try to advance to the next timer
         // Use async version to synchronize with tokio's paused time
-        if self.pending_commands.is_empty() && !self.advance_to_next_timer_async().await {
+        if self.pending_commands.is_empty() && !self.advance_to_next_timer_async().await? {
             return Err(SimulationError::NoPendingWork);
         }
 
@@ -882,6 +995,30 @@ pub enum InvariantViolation {
     MultipleActiveInvocationsForVoKey {
         service_id: ServiceId,
         invocations: Vec<InvocationId>,
+    },
+    #[error(
+        "Journal sequence gap: invocation={invocation_id}, expected_length={expected_length}, \
+         actual_entries={actual_entries}, missing_indices={missing_indices:?}"
+    )]
+    JournalSequenceGap {
+        invocation_id: InvocationId,
+        expected_length: u32,
+        actual_entries: u32,
+        missing_indices: Vec<u32>,
+    },
+    #[error(
+        "Timer fired out of order: current_time={current_time}, last_fire_time={last_fire_time}"
+    )]
+    TimerFiredOutOfOrder {
+        current_time: MillisSinceEpoch,
+        last_fire_time: MillisSinceEpoch,
+    },
+    #[error(
+        "Orphaned VO lock: service={service_id:?} locked by {locked_by} but invocation status is Free"
+    )]
+    OrphanedVoLock {
+        service_id: ServiceId,
+        locked_by: InvocationId,
     },
     #[error("Invariant check failed: {0}")]
     Custom(String),

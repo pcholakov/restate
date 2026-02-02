@@ -26,26 +26,21 @@
 //! cargo run -p restate-simulation --bin simulation-stress --features stress-bin -- --seed 12345
 //! ```
 //!
-//! # CPU Parallelism
-//!
-//! Due to RocksDB singleton constraints, this binary runs single-threaded. To utilize
-//! multiple CPU cores, run multiple processes in parallel:
-//!
+//! Run with multiple workers (uses separate partitions for each worker):
 //! ```bash
-//! # Run 4 parallel stress test processes
-//! for i in {1..4}; do
-//!   cargo run -p restate-simulation --bin simulation-stress --features stress-bin \
-//!     -- --duration 3600 &
-//! done
-//! wait
+//! cargo run -p restate-simulation --bin simulation-stress --features stress-bin -- --workers 4
 //! ```
 
 use std::num::NonZeroUsize;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
+use parking_lot::Mutex;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tracing::info;
@@ -57,9 +52,7 @@ use restate_simulation::{
     InvokerBehavior, PartitionSimulation, PartitionSimulationConfig, SimulationError,
     SimulationTrace,
 };
-use restate_types::config::{
-    Configuration, StorageOptions, reset_base_temp_dir, set_current_config,
-};
+use restate_types::config::{Configuration, StorageOptions, set_current_config};
 use restate_types::identifiers::{PartitionId, PartitionKey};
 use restate_types::partitions::Partition;
 
@@ -82,9 +75,28 @@ struct Args {
     /// Maximum steps per iteration
     #[arg(long, default_value = "2000")]
     max_steps: usize,
+
+    /// Number of parallel workers (default: number of CPUs, 1 for reproduction mode)
+    #[arg(long)]
+    workers: Option<usize>,
+}
+
+/// Shared state for coordinating workers
+struct SharedState {
+    /// Signal to stop all workers
+    stop: AtomicBool,
+    /// Total iterations completed across all workers
+    total_iterations: AtomicU64,
+    /// Total steps executed across all workers
+    total_steps: AtomicUsize,
+    /// First failure encountered (if any)
+    failure: Mutex<Option<FailureInfo>>,
+    /// The shared PartitionStoreManager
+    manager: Arc<PartitionStoreManager>,
 }
 
 struct FailureInfo {
+    worker_id: usize,
     iteration: u64,
     seed: u64,
     error: String,
@@ -101,6 +113,16 @@ fn main() -> Result<()> {
                 .add_directive("restate_simulation=info".parse().unwrap()),
         )
         .init();
+
+    // Determine number of workers
+    let num_workers = args.workers.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
+
+    // For reproduction with fixed seed, use single worker
+    let num_workers = if args.seed.is_some() { 1 } else { num_workers };
 
     // Generate master seed
     let master_seed = args.seed.unwrap_or_else(|| {
@@ -133,6 +155,10 @@ fn main() -> Result<()> {
         master_seed
     );
     println!(
+        "║ Workers:       {:>10}                                           ║",
+        num_workers
+    );
+    println!(
         "║ Invocations:   {:>10} per iteration                              ║",
         args.invocations
     );
@@ -141,78 +167,152 @@ fn main() -> Result<()> {
         args.max_steps
     );
     if is_reproduction {
-        println!("║ Mode:          REPRODUCTION (fixed seed)                            ║");
+        println!("║ Mode:          REPRODUCTION (fixed seed, single worker)             ║");
     } else {
-        println!("║ Mode:          EXPLORATION (random seeds)                           ║");
+        println!("║ Mode:          EXPLORATION (random seeds, parallel)                 ║");
     }
     println!("╚══════════════════════════════════════════════════════════════════════╝");
     println!();
 
-    // Create tokio runtime with paused time for deterministic simulation
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Initialize RocksDB and PartitionStoreManager on the main thread
+    // This needs a tokio runtime and TaskCenter for async operations
+    let init_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .start_paused(true)
         .build()?;
 
-    // Build TaskCenter with the paused-time runtime
-    let tc = TaskCenterBuilder::default()
-        .default_runtime_handle(rt.handle().clone())
-        .pause_time(true)
+    let init_tc = TaskCenterBuilder::default()
+        .default_runtime_handle(init_rt.handle().clone())
         .build()?;
 
-    let result = tc.block_on(async {
-        run_stress_test(
-            master_seed,
-            duration,
-            args.invocations,
-            args.max_steps,
-            is_reproduction,
-        )
-        .await
+    let manager = init_tc
+        .block_on(async {
+            // Configure RocksDB with a large memory budget
+            let mut config = Configuration::default();
+            config.common.rocksdb_total_memory_size =
+                NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+            let config = config.apply_cascading_values();
+            set_current_config(config);
+
+            RocksDbManager::init();
+            let storage_options = StorageOptions::default();
+            info!(
+                "Using RocksDB temp directory {}",
+                storage_options.data_dir("db").display()
+            );
+
+            PartitionStoreManager::create().await
+        })
+        .expect("TaskCenter panicked")
+        .unwrap();
+
+    let shared = Arc::new(SharedState {
+        stop: AtomicBool::new(false),
+        total_iterations: AtomicU64::new(0),
+        total_steps: AtomicUsize::new(0),
+        failure: Mutex::new(None),
+        manager,
     });
 
-    match result {
-        Err(e) => {
-            eprintln!("Stress test panicked: {:?}", e);
-            anyhow::bail!("Stress test panicked")
-        }
-        Ok(StressTestResult::SimulationFailure(failure)) => {
-            print_failure(&failure);
-            anyhow::bail!(
-                "Simulation failed at iteration {} with seed {}",
-                failure.iteration,
-                failure.seed
-            );
-        }
-        Ok(StressTestResult::Success(stats)) => {
-            println!();
-            println!("╔══════════════════════════════════════════════════════════════════════╗");
-            println!("║                    ✅ STRESS TEST COMPLETED                          ║");
-            println!("╠══════════════════════════════════════════════════════════════════════╣");
-            println!(
-                "║ Duration:      {:>10.1} seconds                                   ║",
-                stats.elapsed_secs
-            );
-            println!(
-                "║ Iterations:    {:>10}                                           ║",
-                stats.iterations
-            );
-            println!(
-                "║ Total steps:   {:>10}                                           ║",
-                stats.total_steps
-            );
-            println!(
-                "║ Steps/second:  {:>10.0}                                           ║",
-                stats.total_steps as f64 / stats.elapsed_secs
-            );
-            println!(
-                "║ Master seed:   {:>20}                             ║",
-                master_seed
-            );
-            println!("╚══════════════════════════════════════════════════════════════════════╝");
-            Ok(())
-        }
+    let start = Instant::now();
+
+    // Spawn worker threads
+    let handles: Vec<_> = (0..num_workers)
+        .map(|worker_id| {
+            let shared = Arc::clone(&shared);
+            let worker_seed = master_seed.wrapping_add(worker_id as u64);
+
+            thread::spawn(move || {
+                run_worker(
+                    worker_id,
+                    worker_seed,
+                    duration,
+                    args.invocations,
+                    args.max_steps,
+                    is_reproduction,
+                    shared,
+                )
+            })
+        })
+        .collect();
+
+    // Progress reporting on main thread
+    let progress_shared = Arc::clone(&shared);
+    while start.elapsed() < duration && !shared.stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_secs(1));
+        let elapsed = start.elapsed();
+        let remaining = duration.saturating_sub(elapsed);
+        let iterations = progress_shared.total_iterations.load(Ordering::Relaxed);
+        let steps = progress_shared.total_steps.load(Ordering::Relaxed);
+        println!(
+            "[{:>6.1}s] Iterations: {:>8} | Steps: {:>10} | Steps/s: {:>8.0} | Remaining: {:>6.1}s",
+            elapsed.as_secs_f64(),
+            iterations,
+            steps,
+            steps as f64 / elapsed.as_secs_f64(),
+            remaining.as_secs_f64()
+        );
     }
+
+    // Signal workers to stop
+    shared.stop.store(true, Ordering::Relaxed);
+
+    // Wait for all workers
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    // Shutdown RocksDB
+    let _ = init_tc.block_on(async {
+        if let Some(manager) = RocksDbManager::maybe_get() {
+            manager.shutdown().await;
+        }
+    });
+
+    let total_iterations = shared.total_iterations.load(Ordering::Relaxed);
+    let total_steps = shared.total_steps.load(Ordering::Relaxed);
+    let elapsed_secs = start.elapsed().as_secs_f64();
+
+    // Check for failures
+    if let Some(failure) = shared.failure.lock().take() {
+        print_failure(&failure);
+        anyhow::bail!(
+            "Simulation failed at iteration {} with seed {}",
+            failure.iteration,
+            failure.seed
+        );
+    }
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════════╗");
+    println!("║                    ✅ STRESS TEST COMPLETED                          ║");
+    println!("╠══════════════════════════════════════════════════════════════════════╣");
+    println!(
+        "║ Duration:      {:>10.1} seconds                                   ║",
+        elapsed_secs
+    );
+    println!(
+        "║ Workers:       {:>10}                                           ║",
+        num_workers
+    );
+    println!(
+        "║ Iterations:    {:>10}                                           ║",
+        total_iterations
+    );
+    println!(
+        "║ Total steps:   {:>10}                                           ║",
+        total_steps
+    );
+    println!(
+        "║ Steps/second:  {:>10.0}                                           ║",
+        total_steps as f64 / elapsed_secs
+    );
+    println!(
+        "║ Master seed:   {:>20}                             ║",
+        master_seed
+    );
+    println!("╚══════════════════════════════════════════════════════════════════════╝");
+
+    Ok(())
 }
 
 fn print_failure(failure: &FailureInfo) {
@@ -220,6 +320,10 @@ fn print_failure(failure: &FailureInfo) {
     println!("╔══════════════════════════════════════════════════════════════════════╗");
     println!("║                    ❌ SIMULATION FAILURE DETECTED                    ║");
     println!("╠══════════════════════════════════════════════════════════════════════╣");
+    println!(
+        "║ Worker:        {:>10}                                           ║",
+        failure.worker_id
+    );
     println!(
         "║ Iteration:     {:>10}                                           ║",
         failure.iteration
@@ -277,62 +381,82 @@ fn print_failure(failure: &FailureInfo) {
     }
 }
 
-struct StressTestStats {
-    iterations: u64,
-    total_steps: usize,
-    elapsed_secs: f64,
-}
-
-enum StressTestResult {
-    Success(StressTestStats),
-    SimulationFailure(FailureInfo),
-}
-
-async fn run_stress_test(
-    master_seed: u64,
+/// Worker function that runs on a separate OS thread with its own tokio runtime.
+fn run_worker(
+    worker_id: usize,
+    worker_seed: u64,
     duration: Duration,
     num_invocations: usize,
     max_steps: usize,
     is_reproduction: bool,
-) -> StressTestResult {
+    shared: Arc<SharedState>,
+) {
+    // Each worker gets its own single-threaded tokio runtime with paused time
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    let tc = TaskCenterBuilder::default()
+        .default_runtime_handle(rt.handle().clone())
+        .pause_time(true)
+        .build()
+        .expect("Failed to create TaskCenter");
+
+    let _ = tc.block_on(async {
+        run_worker_loop(
+            worker_id,
+            worker_seed,
+            duration,
+            num_invocations,
+            max_steps,
+            is_reproduction,
+            shared,
+        )
+        .await
+    });
+}
+
+async fn run_worker_loop(
+    worker_id: usize,
+    worker_seed: u64,
+    duration: Duration,
+    num_invocations: usize,
+    max_steps: usize,
+    is_reproduction: bool,
+    shared: Arc<SharedState>,
+) {
     let start = Instant::now();
 
-    // Create storage
-    let mut storage = create_test_storage().await;
+    // Each worker uses a different partition ID for isolation
+    let partition_id = PartitionId::from(worker_id as u16);
+    let partition = Partition::new(
+        partition_id,
+        RangeInclusive::new(PartitionKey::MIN, PartitionKey::MAX),
+    );
+
+    // Open partition store for this worker
+    let storage = shared
+        .manager
+        .open(&partition, None)
+        .await
+        .expect("Failed to open partition store");
 
     // Create RNG for iteration seeds
-    let mut rng = StdRng::seed_from_u64(master_seed);
+    let mut rng = StdRng::seed_from_u64(worker_seed);
 
     let mut iteration_counter = 0u64;
-    let mut total_steps = 0usize;
 
-    // Progress reporting interval
-    let mut last_progress = Instant::now();
-    const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
-
-    // Reset storage periodically to prevent resource exhaustion
-    const RESET_INTERVAL: u64 = 500;
-    let mut iterations_since_reset = 0u64;
-
-    while start.elapsed() < duration {
-        // Check if we need to reset storage
-        if iterations_since_reset >= RESET_INTERVAL {
-            drop(storage);
-            reset_test_env().await;
-            reset_base_temp_dir();
-            storage = create_test_storage().await;
-            iterations_since_reset = 0;
-        }
-
+    while start.elapsed() < duration && !shared.stop.load(Ordering::Relaxed) {
         // Generate seed for this iteration
         let iteration_seed = if is_reproduction {
-            master_seed
+            worker_seed
         } else {
             rng.random()
         };
 
         iteration_counter += 1;
-        iterations_since_reset += 1;
 
         // Run single iteration
         let result =
@@ -340,87 +464,29 @@ async fn run_stress_test(
 
         match result {
             Ok(steps) => {
-                total_steps += steps;
+                shared.total_iterations.fetch_add(1, Ordering::Relaxed);
+                shared.total_steps.fetch_add(steps, Ordering::Relaxed);
             }
             Err((error, trace)) => {
-                // Clean shutdown before returning
-                if let Some(manager) = RocksDbManager::maybe_get() {
-                    manager.shutdown().await;
+                let mut failure_guard = shared.failure.lock();
+                if failure_guard.is_none() {
+                    *failure_guard = Some(FailureInfo {
+                        worker_id,
+                        iteration: iteration_counter,
+                        seed: iteration_seed,
+                        error: format!("{}", error),
+                        trace,
+                    });
                 }
-
-                return StressTestResult::SimulationFailure(FailureInfo {
-                    iteration: iteration_counter,
-                    seed: iteration_seed,
-                    error: format!("{}", error),
-                    trace,
-                });
+                shared.stop.store(true, Ordering::Relaxed);
+                break;
             }
         }
 
-        // Progress reporting
-        if last_progress.elapsed() >= PROGRESS_INTERVAL {
-            let elapsed = start.elapsed();
-            let remaining = duration.saturating_sub(elapsed);
-            println!(
-                "[{:>6.1}s] Iterations: {:>8} | Steps: {:>10} | Steps/s: {:>8.0} | Remaining: {:>6.1}s",
-                elapsed.as_secs_f64(),
-                iteration_counter,
-                total_steps,
-                total_steps as f64 / elapsed.as_secs_f64(),
-                remaining.as_secs_f64()
-            );
-            last_progress = Instant::now();
-        }
-
-        // Break early if in reproduction mode (run only one iteration)
+        // Break early if in reproduction mode
         if is_reproduction {
             break;
         }
-    }
-
-    // Clean shutdown
-    if let Some(manager) = RocksDbManager::maybe_get() {
-        manager.shutdown().await;
-    }
-
-    StressTestResult::Success(StressTestStats {
-        iterations: iteration_counter,
-        total_steps,
-        elapsed_secs: start.elapsed().as_secs_f64(),
-    })
-}
-
-/// Creates a test storage setup with appropriate RocksDB configuration.
-async fn create_test_storage() -> PartitionStore {
-    // Configure RocksDB with a large memory budget to reduce SST file creation
-    let mut config = Configuration::default();
-    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
-    let config = config.apply_cascading_values();
-    set_current_config(config);
-
-    RocksDbManager::init();
-    let storage_options = StorageOptions::default();
-    info!(
-        "Using RocksDB temp directory {}",
-        storage_options.data_dir("db").display()
-    );
-    let manager = PartitionStoreManager::create().await.unwrap();
-    manager
-        .open(
-            &Partition::new(
-                PartitionId::MIN,
-                RangeInclusive::new(PartitionKey::MIN, PartitionKey::MAX),
-            ),
-            None,
-        )
-        .await
-        .unwrap()
-}
-
-/// Resets the RocksDB environment between test scenarios.
-async fn reset_test_env() {
-    if let Some(manager) = RocksDbManager::maybe_get() {
-        let _ = manager.reset().await;
     }
 }
 

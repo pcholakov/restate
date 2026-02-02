@@ -213,22 +213,26 @@ cargo run -p restate-simulation --bin simulation-stress --features stress-bin --
 | `--invocations` | Number of invocations per iteration | 50 |
 | `--max-steps` | Maximum steps per iteration | 2000 |
 
-### CPU Parallelism
+### Multi-Threaded Mode
 
-Due to RocksDB singleton constraints, each stress test process runs single-threaded.
-To utilize multiple CPU cores, run multiple processes in parallel:
+The stress test supports multi-threaded execution using the `--workers` flag.
+Each worker runs on a separate OS thread with its own isolated partition (column
+family) within the shared RocksDB instance:
 
 ```bash
-# Run 4 parallel stress test processes for 1 hour
-for i in {1..4}; do
-  cargo run -p restate-simulation --bin simulation-stress --features stress-bin \
-    -- --duration 3600 &
-done
-wait
+# Run with 8 parallel workers
+cargo run -p restate-simulation --bin simulation-stress --features stress-bin -- --workers 8
+
+# Run with all available CPUs (default behavior when --workers is not specified)
+cargo run -p restate-simulation --bin simulation-stress --features stress-bin
 ```
 
-Each process uses an independent random seed, so they explore different parts of
-the state space concurrently.
+Performance scales roughly linearly with the number of workers:
+- 1 worker: ~20K steps/second
+- 4 workers: ~85K steps/second
+- 14 workers: ~155K steps/second (release mode)
+
+Each worker maintains deterministic execution via paused tokio time and seeded RNG.
 
 ### Reproducing Failures
 

@@ -10,6 +10,7 @@
 
 //! Integration tests for the deterministic simulation framework.
 
+use std::num::NonZeroUsize;
 use std::ops::RangeInclusive;
 
 use googletest::prelude::*;
@@ -22,7 +23,9 @@ use restate_rocksdb::RocksDbManager;
 use restate_simulation::{
     InvokerBehavior, PartitionSimulation, PartitionSimulationConfig, SimulationTrace,
 };
-use restate_types::config::{reset_base_temp_dir, StorageOptions};
+use restate_types::config::{
+    Configuration, StorageOptions, reset_base_temp_dir, set_current_config,
+};
 use restate_types::identifiers::{InvocationId, InvocationUuid, PartitionId, PartitionKey};
 use restate_types::partitions::Partition;
 use restate_worker::state_machine::Action;
@@ -33,6 +36,14 @@ use restate_worker::state_machine::Action;
 /// After calling `shutdown()`, no new DBs can be opened. Use `reset()` instead if you
 /// need to run multiple independent test scenarios within the same process.
 async fn create_test_storage() -> restate_partition_store::PartitionStore {
+    // Configure RocksDB with a large memory budget (4GB) to reduce SST file creation
+    // and thus reduce file descriptor usage. This is important for long-running stress
+    // tests where FD accumulation can exceed system limits.
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+
     RocksDbManager::init();
     let storage_options = StorageOptions::default();
     info!(
@@ -684,19 +695,17 @@ async fn long_running_stress() -> googletest::Result<()> {
     };
 
     // Reset storage periodically to avoid "too many open files" from RocksDB SST accumulation.
-    // 250 iterations keeps FD usage well below typical ulimit (256 on macOS default).
-    const RESET_INTERVAL: u64 = 250;
+    // With a 4GB memory budget, SST file creation is minimized, but we still reset every
+    // 500 iterations as a safety measure for very long-running tests.
+    const RESET_INTERVAL: u64 = 500;
 
     while start.elapsed() < duration {
         // Periodically reset RocksDB to reclaim file descriptors
         if iteration > 0 && iteration.is_multiple_of(RESET_INTERVAL) {
             drop(storage);
             reset_test_env().await;
-            // Yield to let async cleanup tasks complete and FDs be released
-            tokio::task::yield_now().await;
             reset_base_temp_dir(); // Use fresh temp directory to avoid lock conflicts
             storage = create_test_storage().await;
-            info!("Reset RocksDB environment after {} iterations", iteration);
         }
         // Generate seed for this iteration
         let iteration_seed = if fixed_seed.is_some() {

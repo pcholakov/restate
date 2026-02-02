@@ -602,14 +602,15 @@ async fn run_simulation_with_trace(
 ///
 /// Run for 15 minutes with random seeds:
 /// ```bash
-/// SIM_DURATION_SECS=900 cargo nextest run -p restate-simulation long_running_stress --no-capture
+/// SIM_DURATION_SECS=900 cargo nextest run -p restate-simulation long_running_stress --run-ignored=only --no-capture
 /// ```
 ///
 /// Reproduce a specific failure:
 /// ```bash
-/// SIM_SEED=12345 cargo nextest run -p restate-simulation long_running_stress --no-capture
+/// SIM_SEED=12345 cargo nextest run -p restate-simulation long_running_stress --run-ignored=only --no-capture
 /// ```
 #[test(restate_core::test(start_paused = true))]
+#[ignore] // Long-running stress test - run with: cargo nextest run -p restate-simulation long_running_stress --run-ignored=only
 async fn long_running_stress() -> googletest::Result<()> {
     use std::time::{Duration, Instant};
 
@@ -1123,5 +1124,7 @@ async fn test_seed_reproduction() -> googletest::Result<()> {
 #[test(restate_core::test(start_paused = true))]
 async fn z_zz_cleanup() {
     TaskCenter::shutdown_node("test complete", 0).await;
-    RocksDbManager::get().shutdown().await;
+    if let Some(manager) = RocksDbManager::maybe_get() {
+        manager.shutdown().await;
+    }
 }

@@ -198,13 +198,13 @@ for 60 seconds by default. To run it, use the commands below.
 
 ```bash
 # Run for 60 seconds (default) with random seeds
-cargo nextest run -p restate-simulation long_running_stress --no-capture
+cargo nextest run -p restate-simulation long_running_stress --run-ignored=only --no-capture
 
 # Run for 15 minutes with random seeds
-SIM_DURATION_SECS=900 cargo nextest run -p restate-simulation long_running_stress --no-capture
+SIM_DURATION_SECS=900 cargo nextest run -p restate-simulation long_running_stress --run-ignored=only --no-capture
 
 # Run for 24 hours (useful for nightly CI)
-SIM_DURATION_SECS=86400 cargo nextest run -p restate-simulation long_running_stress --no-capture
+SIM_DURATION_SECS=86400 cargo nextest run -p restate-simulation long_running_stress --run-ignored=only --no-capture
 ```
 
 ### Configuration
@@ -230,7 +230,7 @@ When the stress test finds a failure, it prints reproduction instructions:
 ║ To reproduce this failure:                                           ║
 ║   SIM_SEED=12345678 \                                                ║
 ║   cargo nextest run -p restate-simulation long_running_stress \      ║
-║   --no-capture                                                       ║
+║   --run-ignored=only --no-capture                                    ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
 

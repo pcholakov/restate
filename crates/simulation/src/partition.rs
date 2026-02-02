@@ -35,6 +35,7 @@ use restate_types::deployment::PinnedDeployment;
 use restate_types::errors::InvocationError;
 use restate_types::identifiers::{
     DeploymentId, InvocationId, InvocationUuid, PartitionKey, ServiceId, WithPartitionKey,
+    partitioner::HashPartitioner,
 };
 use restate_types::invocation::{InvocationTarget, ServiceInvocation, Source};
 use restate_types::journal_v2::Entry;
@@ -484,11 +485,15 @@ where
 
     /// Creates an invocation with a deterministic ID based on the simulation's seeded RNG.
     ///
-    /// This avoids using `InvocationId::generate` which falls back to `Ulid::new()`
-    /// for non-workflow/non-idempotent targets, making it non-deterministic.
+    /// Uses deterministic partition key from the target's key when available (for virtual
+    /// objects and workflows), otherwise falls back to RNG. The invocation UUID is always
+    /// generated from RNG to ensure deterministic replay.
     fn create_invocation(&mut self, target: InvocationTarget) -> ServiceInvocation {
-        // Generate deterministic partition key from RNG
-        let partition_key: PartitionKey = self.rng.random();
+        // Use deterministic partition key from target's key if available, otherwise RNG
+        let partition_key = target
+            .key()
+            .map(|key| HashPartitioner::compute_partition_key(&**key))
+            .unwrap_or_else(|| self.rng.random());
 
         // Generate deterministic invocation UUID from RNG (as u128)
         let uuid_high: u64 = self.rng.random();
@@ -568,10 +573,8 @@ where
                     if let Some(key) = invocation_target.key()
                         && VO_TEST_KEYS.contains(&key.as_ref())
                     {
-                        let service_id = ServiceId::new(
-                            invocation_target.service_name().clone(),
-                            key.clone(),
-                        );
+                        let service_id =
+                            ServiceId::new(invocation_target.service_name().clone(), key.clone());
                         self.vo_keys_touched.insert(service_id);
                     }
                     let commands = self.invoker.on_invoke(
@@ -596,10 +599,8 @@ where
                     if let Some(key) = invocation_target.key()
                         && VO_TEST_KEYS.contains(&key.as_ref())
                     {
-                        let service_id = ServiceId::new(
-                            invocation_target.service_name().clone(),
-                            key.clone(),
-                        );
+                        let service_id =
+                            ServiceId::new(invocation_target.service_name().clone(), key.clone());
                         self.vo_keys_touched.insert(service_id);
                     }
                     let commands = self.invoker.on_invoke(

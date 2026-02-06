@@ -22,8 +22,9 @@ use restate_storage_api::Storage;
 use restate_storage_api::invocation_status_table::ReadInvocationStatusTable;
 use restate_storage_api::journal_table_v2::ReadJournalTable;
 use restate_storage_api::service_status_table::ReadVirtualObjectStatusTable;
-use restate_types::identifiers::{ClusterSnapshotId, PartitionId};
-use restate_types::partition_table::PartitionTable;
+use restate_types::identifiers::{ClusterSnapshotId, PartitionId, WithPartitionKey};
+use restate_types::invocation::ServiceInvocation;
+use restate_types::partition_table::{FindPartition, PartitionTable};
 use restate_wal_protocol::Command;
 
 use crate::partition::{
@@ -224,6 +225,19 @@ where
     /// Injects a command into a specific partition's mailbox.
     pub fn inject_command(&mut self, partition_idx: usize, command: Command) {
         self.mailboxes[partition_idx].messages.push_back(command);
+    }
+
+    /// Routes an invocation to the correct partition based on its partition key.
+    pub fn inject_invocation(&mut self, invocation: ServiceInvocation) {
+        let partition_key = invocation.partition_key();
+        let target_pid = self
+            .partition_table
+            .find_partition_id(partition_key)
+            .expect("partition key should map to a valid partition");
+        let target_idx = self.partition_index(target_pid);
+        self.mailboxes[target_idx]
+            .messages
+            .push_back(Command::Invoke(Box::new(invocation)));
     }
 
     /// Initiates a distributed snapshot by sending InitiateSnapshot to all partitions.

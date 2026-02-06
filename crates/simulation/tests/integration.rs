@@ -21,10 +21,15 @@ use restate_core::TaskCenter;
 use restate_partition_store::PartitionStoreManager;
 use restate_rocksdb::RocksDbManager;
 use restate_simulation::{
-    InvokerBehavior, PartitionSimulation, PartitionSimulationConfig, SimulationTrace,
+    ClusterSimulation, ClusterSimulationConfig, InvokerBehavior, PartitionSimulation,
+    PartitionSimulationConfig, SimulationTrace,
 };
+use restate_types::Version;
 use restate_types::config::{Configuration, StorageOptions, set_current_config};
-use restate_types::identifiers::{InvocationId, InvocationUuid, PartitionId, PartitionKey};
+use restate_types::identifiers::{
+    ClusterSnapshotId, InvocationId, InvocationUuid, PartitionId, PartitionKey,
+};
+use restate_types::partition_table::PartitionTable;
 use restate_types::partitions::Partition;
 use restate_worker::state_machine::Action;
 
@@ -788,6 +793,88 @@ async fn test_seed_reproduction() -> googletest::Result<()> {
 
     // Note: Don't shut down RocksDB here - tests share the singleton.
     // The z_zz_cleanup test handles final cleanup.
+    Ok(())
+}
+
+/// Multi-partition cluster simulation test.
+///
+/// Validates that cross-partition message routing works:
+/// 1. Creates a 3-partition cluster
+/// 2. Injects invocations into partition 0
+/// 3. Verifies the simulation runs to completion without errors
+/// 4. Initiates a distributed snapshot and verifies all partitions complete it
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn test_cluster_simulation() -> googletest::Result<()> {
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    // Initialize RocksDB (may already be initialized by other tests)
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size =
+        std::num::NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = PartitionStoreManager::create().await.unwrap();
+
+    // Open a partition store per partition
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 42,
+        max_steps: 10_000,
+        ..Default::default()
+    };
+
+    // Build a map from PartitionId -> PartitionStore for the factory closure
+    let store_map: std::collections::HashMap<PartitionId, _> = stores.into_iter().collect();
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::ImmediateSuccess,
+    );
+
+    // Inject invocations — routed to the correct partition by key
+    for _ in 0..10 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+
+    // Run the cluster
+    let outcome = cluster.run().await?;
+    info!(
+        "Cluster simulation completed: {} total steps",
+        outcome.total_steps
+    );
+    assert!(outcome.total_steps > 0, "Should have executed some steps");
+
+    // Now test distributed snapshots: inject an InitiateSnapshot
+    let snapshot_id = ClusterSnapshotId::new(1);
+    cluster.initiate_snapshot(snapshot_id);
+
+    // Run until quiescent — the snapshot protocol should complete
+    let outcome = cluster.run().await?;
+    info!("After snapshot: {} additional steps", outcome.total_steps);
+
+    // Verify all partitions completed the snapshot
+    let completions = cluster.completed_snapshots();
+    for (i, partition_completions) in completions.iter().enumerate() {
+        assert!(
+            partition_completions.contains(&snapshot_id),
+            "Partition {i} should have completed snapshot {snapshot_id}"
+        );
+    }
+
+    info!("Multi-partition cluster simulation with distributed snapshot passed!");
     Ok(())
 }
 

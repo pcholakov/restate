@@ -754,7 +754,10 @@ impl LeaderState {
             }
             Action::SnapshotComplete { snapshot_id } => {
                 info!(%snapshot_id, "Distributed snapshot complete for this partition");
-                // TODO(distributed-snapshots): report to coordinator (A4)
+                // TODO(distributed-snapshots): report completion to coordinator
+                // via metadata store or a dedicated log entry so the coordinator
+                // can track which partitions have finished and when the cluster-
+                // wide snapshot is fully consistent.
             }
         }
 

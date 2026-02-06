@@ -477,6 +477,11 @@ where
     /// For a completed snapshot, each partition should have:
     /// - Sent markers to every other partition
     /// - Received markers from every other partition
+    ///
+    /// **Assumes full-mesh topology**: all partitions are connected and exchange
+    /// markers directly. Self-markers are not expected (a partition does not
+    /// send a marker to itself; it records its local snapshot via
+    /// `LocalSnapshotTaken` instead).
     fn check_marker_delivery(&self, violations: &mut Vec<InvariantViolation>) {
         // Collect completed snapshot IDs (only those completed by ALL partitions)
         let mut globally_completed: HashMap<ClusterSnapshotId, usize> = HashMap::new();

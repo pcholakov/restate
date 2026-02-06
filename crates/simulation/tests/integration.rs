@@ -23,6 +23,7 @@ use restate_rocksdb::RocksDbManager;
 use restate_simulation::{
     ClusterSimulation, ClusterSimulationConfig, FaultInjection, InvariantViolation,
     InvokerBehavior, PartitionSimulation, PartitionSimulationConfig, SimulationTrace,
+    StepScheduler,
 };
 use restate_types::Version;
 use restate_types::config::{Configuration, StorageOptions, set_current_config};
@@ -1131,6 +1132,85 @@ async fn test_cluster_snapshot_with_probabilistic_invoker() -> googletest::Resul
     info!(
         "Probabilistic invoker snapshot test passed: {} total steps",
         outcome.total_steps
+    );
+    Ok(())
+}
+
+/// Tests snapshot with Random scheduling to expose ordering-dependent bugs.
+///
+/// Uses `StepScheduler::Random` which picks partitions non-deterministically
+/// (though reproducibly via seed), creating scheduling races that could
+/// expose ordering-dependent issues in the snapshot protocol.
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn test_cluster_snapshot_random_scheduling() -> googletest::Result<()> {
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = PartitionStoreManager::create().await.unwrap();
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, _> = stores.into_iter().collect();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 500,
+        max_steps: 20_000,
+        scheduler: StepScheduler::Random,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::Probabilistic {
+            success_rate: 0.6,
+            failure_rate: 0.3,
+        },
+    );
+
+    // Inject work across partitions
+    for _ in 0..20 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+
+    // Process some work, then snapshot, then more work, then another snapshot
+    cluster.initiate_snapshot(ClusterSnapshotId::new(1));
+    let outcome1 = cluster.run().await?;
+    assert!(outcome1.is_ok(), "Random-schedule violations: {:?}", outcome1.violations);
+
+    for _ in 0..10 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+    cluster.initiate_snapshot(ClusterSnapshotId::new(2));
+    let outcome2 = cluster.run().await?;
+    assert!(outcome2.is_ok(), "Random-schedule phase 2 violations: {:?}", outcome2.violations);
+
+    // Verify both snapshots completed
+    for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
+        assert!(
+            completions.contains(&ClusterSnapshotId::new(1))
+                && completions.contains(&ClusterSnapshotId::new(2)),
+            "Partition {i} missing snapshots with random scheduling: {:?}",
+            completions
+        );
+    }
+
+    info!(
+        "Random scheduling snapshot test passed: {}+{} steps",
+        outcome1.total_steps, outcome2.total_steps
     );
     Ok(())
 }

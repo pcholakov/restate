@@ -13,7 +13,7 @@ mod scheduler;
 mod scheduler_task;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, anyhow};
 use codederror::CodedError;
@@ -25,7 +25,7 @@ use tokio::time;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tracing::{debug, info};
 
-use restate_bifrost::{Bifrost, MaybeSealedSegment};
+use restate_bifrost::{Bifrost, ErrorRecoveryStrategy, MaybeSealedSegment};
 use restate_core::network::tonic_service_filter::{TonicServiceFilter, WaitForReady};
 use restate_core::network::{
     NetworkSender, NetworkServerBuilder, Networking, Swimlane, TransportConnect,
@@ -38,7 +38,7 @@ use restate_storage_query_datafusion::context::{ClusterTables, QueryContext};
 use restate_types::cluster::cluster_state::LegacyClusterState;
 use restate_types::config::{AdminOptions, Configuration};
 use restate_types::health::HealthStatus;
-use restate_types::identifiers::PartitionId;
+use restate_types::identifiers::{ClusterSnapshotId, PartitionId};
 use restate_types::live::Live;
 use restate_types::logs::metadata::{
     LogletParams, Logs, LogsConfiguration, ProviderConfiguration, ProviderKind,
@@ -57,6 +57,7 @@ use restate_types::protobuf::common::AdminStatus;
 use restate_types::replicated_loglet::ReplicatedLogletParams;
 use restate_types::replication::{NodeSet, NodeSetChecker, ReplicationProperty};
 use restate_types::{GenerationalNodeId, NodeId, Version};
+use restate_wal_protocol::{Command, Destination, Envelope, Header, Source};
 
 use crate::cluster_controller::cluster_state_refresher::ClusterStateRefresher;
 use crate::cluster_controller::grpc_svc_handler::ClusterCtrlSvcHandler;
@@ -202,6 +203,9 @@ enum ClusterControllerCommand {
         context: std::collections::HashMap<String, String>,
         response_tx: oneshot::Sender<anyhow::Result<Lsn>>,
     },
+    CreateDistributedSnapshot {
+        response_tx: oneshot::Sender<anyhow::Result<ClusterSnapshotId>>,
+    },
 }
 
 pub struct ClusterControllerHandle {
@@ -291,6 +295,19 @@ impl ClusterControllerHandle {
                 num_partitions,
                 response_tx,
             })
+            .await;
+
+        response_rx.await.map_err(|_| ShutdownError)
+    }
+
+    pub async fn create_distributed_snapshot(
+        &self,
+    ) -> Result<anyhow::Result<ClusterSnapshotId>, ShutdownError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let _ = self
+            .tx
+            .send(ClusterControllerCommand::CreateDistributedSnapshot { response_tx })
             .await;
 
         response_rx.await.map_err(|_| ShutdownError)
@@ -555,6 +572,19 @@ impl<T: TransportConnect> Service<T> {
                     Ok(())
                 });
             }
+            ClusterControllerCommand::CreateDistributedSnapshot { response_tx } => {
+                info!("Create distributed snapshot command received");
+                let bifrost = self.bifrost.clone();
+                let _ = TaskCenter::spawn(
+                    TaskKind::Disposable,
+                    "create-distributed-snapshot",
+                    async move {
+                        let _ = response_tx
+                            .send(initiate_distributed_snapshot(bifrost).await);
+                        Ok(())
+                    },
+                );
+            }
             ClusterControllerCommand::SealAndExtendChain {
                 log_id,
                 min_version,
@@ -591,6 +621,58 @@ impl<T: TransportConnect> Service<T> {
             }
         }
     }
+}
+
+/// Writes `InitiateSnapshot` commands to every partition's Bifrost log, starting
+/// a Chandy-Lamport distributed snapshot across the cluster.
+async fn initiate_distributed_snapshot(bifrost: Bifrost) -> anyhow::Result<ClusterSnapshotId> {
+    let partition_table = Metadata::with_current(|m| m.partition_table_ref());
+    let num_partitions = partition_table.num_partitions() as u32;
+
+    // Generate a snapshot ID from the current wall-clock time. Using millis
+    // since epoch gives reasonable uniqueness for coordinator-initiated snapshots
+    // and is monotonically increasing under normal clock behavior.
+    let snapshot_id = ClusterSnapshotId::new(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_millis() as u64,
+    );
+
+    info!(
+        %snapshot_id,
+        num_partitions,
+        "Initiating distributed snapshot across all partitions"
+    );
+
+    for (partition_id, partition) in partition_table.iter() {
+        let log_id = partition.log_id();
+        let partition_key = *partition.key_range.start();
+
+        let envelope = Envelope::new(
+            Header {
+                source: Source::ControlPlane {},
+                dest: Destination::Processor {
+                    partition_key,
+                    dedup: None,
+                },
+            },
+            Command::InitiateSnapshot {
+                snapshot_id,
+                num_partitions,
+            },
+        );
+
+        bifrost
+            .append(log_id, ErrorRecoveryStrategy::default(), Arc::new(envelope))
+            .await
+            .context(format!(
+                "Failed to append InitiateSnapshot to partition {partition_id}"
+            ))?;
+    }
+
+    info!(%snapshot_id, "Distributed snapshot initiated on all partitions");
+    Ok(snapshot_id)
 }
 
 async fn update_cluster_configuration(

@@ -1318,6 +1318,99 @@ async fn test_cluster_snapshot_random_scheduling() -> googletest::Result<()> {
     Ok(())
 }
 
+/// Chaos test: rapid-fire snapshots with high concurrent activity and random scheduling.
+///
+/// This test stresses the distributed snapshot protocol by combining:
+/// - 5 snapshots interleaved with bursts of invocations
+/// - Probabilistic invoker (60% success, 30% fail, 10% timeout)
+/// - Random partition scheduling (non-deterministic processing order)
+/// - High max_steps to let the protocol fully settle
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn test_cluster_snapshot_chaos() -> googletest::Result<()> {
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = PartitionStoreManager::create().await.unwrap();
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, _> = stores.into_iter().collect();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 777,
+        max_steps: 50_000,
+        scheduler: StepScheduler::Random,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::Probabilistic {
+            success_rate: 0.6,
+            failure_rate: 0.3,
+        },
+    );
+
+    let num_snapshots = 5u64;
+
+    for round in 1..=num_snapshots {
+        // Inject a burst of invocations before each snapshot
+        let invocations_per_round = 15;
+        for i in 0..invocations_per_round {
+            let partition_idx = i % num_partitions as usize;
+            let invocation = cluster.partition_mut(partition_idx).random_vo_invocation();
+            cluster.inject_invocation(invocation);
+        }
+
+        // Initiate snapshot while work is in-flight (no drain between rounds)
+        cluster.initiate_snapshot(ClusterSnapshotId::new(round));
+
+        let outcome = cluster.run().await?;
+        assert!(
+            outcome.is_ok(),
+            "Chaos round {round} violations: {:?}",
+            outcome.violations
+        );
+    }
+
+    // Verify all snapshots completed on all partitions
+    for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
+        for snap_id in 1..=num_snapshots {
+            assert!(
+                completions.contains(&ClusterSnapshotId::new(snap_id)),
+                "Partition {i} missing snapshot {snap_id}: {:?}",
+                completions
+            );
+        }
+    }
+
+    // Check channel stats: every inter-partition channel should have exchanged markers
+    let stats = cluster.channel_stats();
+    let total_markers: u64 = stats.values().map(|s| s.markers).sum();
+    // Each snapshot: each partition sends markers to (num_partitions - 1) others
+    // Total expected: num_snapshots * num_partitions * (num_partitions - 1)
+    let expected_markers = num_snapshots * num_partitions as u64 * (num_partitions as u64 - 1);
+    assert_eq!(
+        total_markers, expected_markers,
+        "Expected {expected_markers} markers across all channels, got {total_markers}"
+    );
+
+    info!("Chaos test passed: {num_snapshots} snapshots completed on all partitions");
+    Ok(())
+}
+
 /// Trip wire test: verifies that dropping snapshot markers causes invariant violations.
 ///
 /// Enables `DropSnapshotMarkers` fault injection, initiates a snapshot, and verifies

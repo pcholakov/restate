@@ -49,11 +49,13 @@ use restate_core::TaskCenterBuilder;
 use restate_partition_store::{PartitionStore, PartitionStoreManager};
 use restate_rocksdb::RocksDbManager;
 use restate_simulation::{
-    InvokerBehavior, PartitionSimulation, PartitionSimulationConfig, SimulationError,
-    SimulationTrace,
+    ClusterSimulation, ClusterSimulationConfig, InvokerBehavior, PartitionSimulation,
+    PartitionSimulationConfig, SimulationError, SimulationTrace,
 };
+use restate_types::Version;
 use restate_types::config::{Configuration, StorageOptions, set_current_config};
-use restate_types::identifiers::{PartitionId, PartitionKey};
+use restate_types::identifiers::{ClusterSnapshotId, PartitionId, PartitionKey};
+use restate_types::partition_table::PartitionTable;
 use restate_types::partitions::Partition;
 
 #[derive(Parser)]
@@ -79,6 +81,18 @@ struct Args {
     /// Number of parallel workers (default: number of CPUs, 1 for reproduction mode)
     #[arg(long)]
     workers: Option<usize>,
+
+    /// Run multi-partition cluster simulation with snapshot protocol
+    #[arg(long)]
+    cluster: bool,
+
+    /// Number of partitions in cluster mode (default: 3)
+    #[arg(long, default_value = "3")]
+    partitions: u16,
+
+    /// Number of snapshots to take per cluster iteration (default: 2)
+    #[arg(long, default_value = "2")]
+    snapshots: u32,
 }
 
 /// Shared state for coordinating workers
@@ -168,6 +182,16 @@ fn main() -> Result<()> {
     );
     if is_reproduction {
         println!("║ Mode:          REPRODUCTION (fixed seed, single worker)             ║");
+    } else if args.cluster {
+        println!("║ Mode:          CLUSTER (multi-partition with snapshots)             ║");
+        println!(
+            "║ Partitions:    {:>10}                                           ║",
+            args.partitions
+        );
+        println!(
+            "║ Snapshots/iter:{:>10}                                           ║",
+            args.snapshots
+        );
     } else {
         println!("║ Mode:          EXPLORATION (random seeds, parallel)                 ║");
     }
@@ -215,6 +239,10 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
 
+    let cluster_mode = args.cluster;
+    let num_partitions = args.partitions;
+    let num_snapshots = args.snapshots;
+
     // Spawn worker threads
     let handles: Vec<_> = (0..num_workers)
         .map(|worker_id| {
@@ -229,6 +257,9 @@ fn main() -> Result<()> {
                     args.invocations,
                     args.max_steps,
                     is_reproduction,
+                    cluster_mode,
+                    num_partitions,
+                    num_snapshots,
                     shared,
                 )
             })
@@ -382,6 +413,7 @@ fn print_failure(failure: &FailureInfo) {
 }
 
 /// Worker function that runs on a separate OS thread with its own tokio runtime.
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     worker_id: usize,
     worker_seed: u64,
@@ -389,6 +421,9 @@ fn run_worker(
     num_invocations: usize,
     max_steps: usize,
     is_reproduction: bool,
+    cluster_mode: bool,
+    num_partitions: u16,
+    num_snapshots: u32,
     shared: Arc<SharedState>,
 ) {
     // Each worker gets its own single-threaded tokio runtime with paused time
@@ -412,12 +447,16 @@ fn run_worker(
             num_invocations,
             max_steps,
             is_reproduction,
+            cluster_mode,
+            num_partitions,
+            num_snapshots,
             shared,
         )
         .await
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_worker_loop(
     worker_id: usize,
     worker_seed: u64,
@@ -425,67 +464,132 @@ async fn run_worker_loop(
     num_invocations: usize,
     max_steps: usize,
     is_reproduction: bool,
+    cluster_mode: bool,
+    num_partitions: u16,
+    num_snapshots: u32,
     shared: Arc<SharedState>,
 ) {
     let start = Instant::now();
 
-    // Each worker uses a different partition ID for isolation
-    let partition_id = PartitionId::from(worker_id as u16);
-    let partition = Partition::new(
-        partition_id,
-        RangeInclusive::new(PartitionKey::MIN, PartitionKey::MAX),
-    );
-
-    // Open partition store for this worker
-    let storage = shared
-        .manager
-        .open(&partition, None)
-        .await
-        .expect("Failed to open partition store");
-
     // Create RNG for iteration seeds
     let mut rng = StdRng::seed_from_u64(worker_seed);
 
-    let mut iteration_counter = 0u64;
+    if cluster_mode {
+        // Cluster mode: open N partition stores
+        let partition_table =
+            PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+        let mut store_map = std::collections::HashMap::new();
+        // Use worker_id * num_partitions offset to avoid partition ID collisions across workers
+        for (pid, partition) in partition_table.iter() {
+            let store = shared
+                .manager
+                .open(partition, None)
+                .await
+                .expect("Failed to open partition store");
+            store_map.insert(*pid, store);
+        }
+        let store_map = Arc::new(store_map);
 
-    while start.elapsed() < duration && !shared.stop.load(Ordering::Relaxed) {
-        // Generate seed for this iteration
-        let iteration_seed = if is_reproduction {
-            worker_seed
-        } else {
-            rng.random()
-        };
+        let mut iteration_counter = 0u64;
+        while start.elapsed() < duration && !shared.stop.load(Ordering::Relaxed) {
+            let iteration_seed = if is_reproduction {
+                worker_seed
+            } else {
+                rng.random()
+            };
+            iteration_counter += 1;
 
-        iteration_counter += 1;
+            let result = run_cluster_iteration(
+                iteration_seed,
+                num_invocations,
+                max_steps,
+                num_partitions,
+                num_snapshots,
+                partition_table.clone(),
+                Arc::clone(&store_map),
+            )
+            .await;
 
-        // Run single iteration
-        let result =
-            run_single_iteration(iteration_seed, num_invocations, max_steps, storage.clone()).await;
-
-        match result {
-            Ok(steps) => {
-                shared.total_iterations.fetch_add(1, Ordering::Relaxed);
-                shared.total_steps.fetch_add(steps, Ordering::Relaxed);
-            }
-            Err((error, trace)) => {
-                let mut failure_guard = shared.failure.lock();
-                if failure_guard.is_none() {
-                    *failure_guard = Some(FailureInfo {
-                        worker_id,
-                        iteration: iteration_counter,
-                        seed: iteration_seed,
-                        error: format!("{}", error),
-                        trace,
-                    });
+            match result {
+                Ok(steps) => {
+                    shared.total_iterations.fetch_add(1, Ordering::Relaxed);
+                    shared.total_steps.fetch_add(steps, Ordering::Relaxed);
                 }
-                shared.stop.store(true, Ordering::Relaxed);
+                Err(error) => {
+                    let mut failure_guard = shared.failure.lock();
+                    if failure_guard.is_none() {
+                        *failure_guard = Some(FailureInfo {
+                            worker_id,
+                            iteration: iteration_counter,
+                            seed: iteration_seed,
+                            error: error.to_string(),
+                            trace: None,
+                        });
+                    }
+                    shared.stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+
+            if is_reproduction {
                 break;
             }
         }
+    } else {
+        // Single-partition mode (original behavior)
+        let partition_id = PartitionId::from(worker_id as u16);
+        let partition = Partition::new(
+            partition_id,
+            RangeInclusive::new(PartitionKey::MIN, PartitionKey::MAX),
+        );
 
-        // Break early if in reproduction mode
-        if is_reproduction {
-            break;
+        let storage = shared
+            .manager
+            .open(&partition, None)
+            .await
+            .expect("Failed to open partition store");
+
+        let mut iteration_counter = 0u64;
+        while start.elapsed() < duration && !shared.stop.load(Ordering::Relaxed) {
+            let iteration_seed = if is_reproduction {
+                worker_seed
+            } else {
+                rng.random()
+            };
+            iteration_counter += 1;
+
+            let result = run_single_iteration(
+                iteration_seed,
+                num_invocations,
+                max_steps,
+                storage.clone(),
+            )
+            .await;
+
+            match result {
+                Ok(steps) => {
+                    shared.total_iterations.fetch_add(1, Ordering::Relaxed);
+                    shared.total_steps.fetch_add(steps, Ordering::Relaxed);
+                }
+                Err((error, trace)) => {
+                    let mut failure_guard = shared.failure.lock();
+                    if failure_guard.is_none() {
+                        *failure_guard = Some(FailureInfo {
+                            worker_id,
+                            iteration: iteration_counter,
+                            seed: iteration_seed,
+                            error: format!("{}", error),
+                            trace,
+                        });
+                    }
+                    shared.stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+
+            if is_reproduction {
+                break;
+            }
         }
     }
 }
@@ -543,4 +647,83 @@ async fn run_single_iteration(
             Err((e, trace))
         }
     }
+}
+
+/// Runs a single cluster simulation iteration with snapshots.
+///
+/// Creates a multi-partition cluster, injects invocations, runs to process them,
+/// then takes N snapshots and verifies invariants after each.
+async fn run_cluster_iteration(
+    seed: u64,
+    num_invocations: usize,
+    max_steps: usize,
+    num_partitions: u16,
+    num_snapshots: u32,
+    partition_table: PartitionTable,
+    store_map: Arc<std::collections::HashMap<PartitionId, PartitionStore>>,
+) -> std::result::Result<usize, String> {
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed,
+        max_steps,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table,
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::Probabilistic {
+            success_rate: 0.6,
+            failure_rate: 0.3,
+        },
+    );
+
+    // Inject invocations
+    for _ in 0..num_invocations {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+
+    // Run initial processing
+    let outcome = cluster.run().await.map_err(|e| format!("{e}"))?;
+    if !outcome.is_ok() {
+        return Err(format!(
+            "Pre-snapshot invariant violations: {:?}",
+            outcome.violations
+        ));
+    }
+    let mut total = outcome.total_steps;
+
+    // Take N snapshots with work in between
+    for snap_idx in 1..=num_snapshots {
+        // Inject more work between snapshots
+        for _ in 0..num_invocations / 2 {
+            let invocation = cluster.partition_mut(0).random_vo_invocation();
+            cluster.inject_invocation(invocation);
+        }
+
+        cluster.initiate_snapshot(ClusterSnapshotId::new(snap_idx as u64));
+        let outcome = cluster.run().await.map_err(|e| format!("{e}"))?;
+
+        if !outcome.is_ok() {
+            return Err(format!(
+                "Snapshot {snap_idx} invariant violations: {:?}",
+                outcome.violations
+            ));
+        }
+
+        // Verify all partitions completed this snapshot
+        for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
+            if !completions.contains(&ClusterSnapshotId::new(snap_idx as u64)) {
+                return Err(format!(
+                    "Partition {i} did not complete snapshot {snap_idx}"
+                ));
+            }
+        }
+
+        total += outcome.total_steps;
+    }
+
+    Ok(total)
 }

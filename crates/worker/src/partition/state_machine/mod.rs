@@ -688,11 +688,11 @@ impl<S> StateMachineApplyContext<'_, S> {
                 Ok(())
             }
             Command::OutboxProcessedAck {
-                from_partition,
+                from_partition: _,
                 seq,
             } => {
-                // A2: will delete specific outbox entry at `seq`
-                debug!("OutboxProcessedAck(from={from_partition}, seq={seq}) not yet implemented, ignoring");
+                self.do_truncate_outbox(RangeInclusive::new(seq, seq))
+                    .await?;
                 Ok(())
             }
         }

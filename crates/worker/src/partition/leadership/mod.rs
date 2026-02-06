@@ -26,7 +26,7 @@ use tracing::{debug, instrument, warn};
 
 use restate_bifrost::Bifrost;
 use restate_core::network::{Oneshot, Reciprocal, TransportConnect};
-use restate_core::{ShutdownError, TaskCenter, TaskKind, my_node_id};
+use restate_core::{Metadata, ShutdownError, TaskCenter, TaskKind, my_node_id};
 use restate_errors::NotRunningError;
 use restate_ingestion_client::IngestionClient;
 use restate_invoker_api::InvokeInputJournal;
@@ -65,7 +65,7 @@ use restate_types::{
 use restate_vqueues::{SchedulerService, VQueuesMeta, VQueuesMetaMut};
 use restate_wal_protocol::control::{AnnounceLeader, PartitionDurability, VersionBarrier};
 use restate_wal_protocol::timer::TimerKeyValue;
-use restate_wal_protocol::{Command, Envelope};
+use restate_wal_protocol::{Command, Destination, Envelope, Header, Source};
 
 use crate::partition::LeadershipInfo;
 use crate::partition::cleaner::{self, Cleaner};
@@ -608,6 +608,50 @@ where
         }
 
         Ok(())
+    }
+
+    /// Sends any outbox-processed acks buffered during handle_actions to the
+    /// source partitions via Bifrost. Acks are fire-and-forget: if delivery
+    /// fails (e.g., leadership change), the sender will resend the message
+    /// and we'll ack the duplicate.
+    pub fn send_pending_outbox_acks(&mut self) {
+        let leader_state = match &mut self.state {
+            State::Leader(leader_state) => leader_state,
+            _ => return,
+        };
+
+        let partition_table = Metadata::with_current(|m| m.partition_table_ref());
+
+        for ack in leader_state.pending_outbox_acks.drain(..) {
+            // Find a partition key in the target partition's range for routing.
+            let Some(target_partition) = partition_table.get(&ack.to_partition) else {
+                tracing::warn!(
+                    "Cannot send OutboxProcessedAck to partition {}: not in partition table",
+                    ack.to_partition,
+                );
+                continue;
+            };
+            let target_key = *target_partition.key_range.start();
+
+            let envelope = Envelope::new(
+                Header {
+                    source: Source::ControlPlane {},
+                    dest: Destination::Processor {
+                        partition_key: target_key,
+                        dedup: None,
+                    },
+                },
+                Command::OutboxProcessedAck {
+                    from_partition: ack.from_partition,
+                    seq: ack.seq,
+                },
+            );
+
+            // Fire-and-forget: we don't need to await the commit. If the ack
+            // is lost, the sender will resend the message on next leadership
+            // epoch or after restore, and we'll ack the duplicate.
+            let _ = self.ingestion_client.ingest(target_key, envelope);
+        }
     }
 
     /// Runs the leadership state tasks. This depends on the current state value:

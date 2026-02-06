@@ -31,6 +31,7 @@ use restate_storage_api::vqueue_table::EntryCard;
 use restate_types::identifiers::{
     LeaderEpoch, PartitionId, PartitionKey, PartitionProcessorRpcRequestId, WithPartitionKey,
 };
+use restate_types::message::MessageIndex;
 use restate_types::invocation::PurgeInvocationRequest;
 use restate_types::invocation::client::{InvocationOutput, SubmittedInvocationNotification};
 use restate_types::logs::Keys;
@@ -61,10 +62,17 @@ const BATCH_READY_UP_TO: usize = 10;
 type RpcReciprocal =
     Reciprocal<Oneshot<Result<PartitionProcessorRpcResponse, PartitionProcessorRpcError>>>;
 
+/// A pending outbox-processed ack to be sent to a source partition via Bifrost.
+#[derive(Debug)]
+pub(crate) struct PendingOutboxAck {
+    pub to_partition: PartitionId,
+    pub from_partition: PartitionId,
+    pub seq: MessageIndex,
+}
+
 pub struct LeaderState {
     pub(crate) partition_id: PartitionId,
     pub leader_epoch: LeaderEpoch,
-    // only needed for proposing TruncateOutbox to ourselves
     partition_key_range: RangeInclusive<PartitionKey>,
 
     pub shuffle_hint_tx: HintSender,
@@ -85,6 +93,9 @@ pub struct LeaderState {
     cleaner_handle: CleanerHandle,
     trimmer_task_id: TaskId,
     durability_tracker: DurabilityTracker,
+
+    /// Acks buffered during synchronous handle_action, drained asynchronously.
+    pub(crate) pending_outbox_acks: Vec<PendingOutboxAck>,
 }
 
 impl LeaderState {
@@ -123,6 +134,7 @@ impl LeaderState {
             invoker_stream: invoker_rx,
             shuffle_stream: ReceiverStream::new(shuffle_rx),
             durability_tracker,
+            pending_outbox_acks: Vec::new(),
         }
     }
 
@@ -348,8 +360,12 @@ impl LeaderState {
                         .await?;
                 }
                 ActionEffect::Shuffle(outbox_truncation) => {
-                    // todo: Until we support partition splits we need to get rid of outboxes or introduce partition
-                    //  specific destination messages that are identified by a partition_id
+                    // LEGACY: This truncation path fires on Bifrost ack, before the
+                    // receiver processes the message. It will be removed once
+                    // ack-based truncation (OutboxProcessedAck) is fully operational.
+                    // With the new protocol, truncation is driven by the receiver
+                    // sending an ack back through Bifrost to the sender's log.
+                    // TODO(distributed-snapshots): remove this path entirely
                     self.self_proposer
                         .propose(
                             *self.partition_key_range.start(),
@@ -688,6 +704,17 @@ impl LeaderState {
                         invoke_input_journal,
                     )
                     .map_err(Error::Invoker)?
+            }
+            Action::SendOutboxAck {
+                to_partition,
+                from_partition,
+                seq,
+            } => {
+                self.pending_outbox_acks.push(PendingOutboxAck {
+                    to_partition,
+                    from_partition,
+                    seq,
+                });
             }
         }
 

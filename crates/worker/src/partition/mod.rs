@@ -83,7 +83,7 @@ use crate::metric_definitions::{
 };
 use crate::partition::invoker_storage_reader::InvokerStorageReader;
 use crate::partition::leadership::LeadershipState;
-use crate::partition::state_machine::{ActionCollector, StateMachine};
+use crate::partition::state_machine::{Action, ActionCollector, StateMachine};
 
 /// Information needed to run as leader, including the epoch and partition configurations.
 #[derive(Clone, Debug)]
@@ -679,6 +679,7 @@ where
                         self.last_applied_log_lsn_watch.send_replace(*lsn);
                     }
                     self.leadership_state.handle_actions(action_collector.drain(..), vqueues.view())?;
+                    self.leadership_state.send_pending_outbox_acks();
                 },
                 result = self.leadership_state.run(&self.state_machine, vqueues.view()) => {
                     let action_effects = result?;
@@ -956,7 +957,16 @@ where
         if let Some(dedup_information) = self.is_targeted_to_me(&record.envelope.header) {
             // deduplicate if deduplication information has been provided
             if let Some(dedup_information) = dedup_information {
-                if Self::is_outdated_or_duplicate(dedup_information, transaction).await? {
+                let is_duplicate =
+                    Self::is_outdated_or_duplicate(dedup_information, transaction).await?;
+
+                // Send ack for cross-partition messages (both new AND duplicate).
+                // For duplicates this is critical: after restore, senders rescan
+                // their outbox and resend; without acking duplicates their outbox
+                // entries would never be cleaned up.
+                self.maybe_send_outbox_ack(dedup_information, action_collector);
+
+                if is_duplicate {
                     debug!(
                         "Ignoring outdated or duplicate message: {:?}",
                         record.envelope.header
@@ -1021,6 +1031,28 @@ where
         }
 
         Ok(None)
+    }
+
+    /// If the dedup information indicates a cross-partition message (ProducerId::Partition),
+    /// push a SendOutboxAck action so the sender can delete its outbox entry.
+    fn maybe_send_outbox_ack(
+        &self,
+        dedup_information: &DedupInformation,
+        action_collector: &mut ActionCollector,
+    ) {
+        if let (
+            ProducerId::Partition(source_partition_id),
+            DedupSequenceNumber::Sn(seq),
+        ) = (
+            &dedup_information.producer_id,
+            &dedup_information.sequence_number,
+        ) {
+            action_collector.push(Action::SendOutboxAck {
+                to_partition: *source_partition_id,
+                from_partition: self.partition_store.partition_id(),
+                seq: *seq,
+            });
+        }
     }
 
     fn is_targeted_to_me<'a>(&self, header: &'a Header) -> Option<&'a Option<DedupInformation>> {

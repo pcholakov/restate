@@ -8,11 +8,15 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Single-partition deterministic simulation.
+//! Per-partition deterministic simulation.
 //!
 //! This module provides a closed-loop simulation of a single partition processor,
 //! where actions emitted by the state machine (timer registrations, outbox messages)
 //! are fed back as commands.
+//!
+//! In multi-partition mode, cross-partition messages are collected as outbound
+//! messages instead of being dropped. A [`ClusterSimulation`](super::cluster::ClusterSimulation)
+//! routes them between partitions.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
@@ -35,13 +39,14 @@ use restate_storage_api::{Storage, Transaction};
 use restate_types::deployment::PinnedDeployment;
 use restate_types::errors::InvocationError;
 use restate_types::identifiers::{
-    DeploymentId, InvocationId, InvocationUuid, PartitionKey, ServiceId, WithPartitionKey,
-    partitioner::HashPartitioner,
+    ClusterSnapshotId, DeploymentId, InvocationId, InvocationUuid, PartitionId, PartitionKey,
+    ServiceId, WithPartitionKey, partitioner::HashPartitioner,
 };
 use restate_types::invocation::{InvocationTarget, ServiceInvocation, Source};
 use restate_types::journal_v2::Entry;
 use restate_types::journal_v2::command::{Command as JournalCommand, OutputCommand, OutputResult};
 use restate_types::logs::{Lsn, SequenceNumber};
+use restate_types::partition_table::{FindPartition, PartitionTable};
 use restate_types::service_protocol::ServiceProtocolVersion;
 use restate_types::storage::{StoredRawEntry, StoredRawEntryHeader};
 use restate_types::time::MillisSinceEpoch;
@@ -71,6 +76,8 @@ pub struct PartitionSimulationConfig {
     pub seed: u64,
     /// Maximum number of simulation steps before termination.
     pub max_steps: usize,
+    /// Partition ID for this partition.
+    pub partition_id: PartitionId,
     /// Partition key range for this partition.
     pub partition_key_range: RangeInclusive<PartitionKey>,
     /// Whether to check invariants after each step.
@@ -82,10 +89,19 @@ impl Default for PartitionSimulationConfig {
         Self {
             seed: 0,
             max_steps: 10_000,
+            partition_id: PartitionId::MIN,
             partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
             check_invariants: true,
         }
     }
+}
+
+/// A message destined for another partition, collected during action processing.
+/// The cluster simulation routes these to the appropriate target.
+#[derive(Debug)]
+pub struct OutboundMessage {
+    pub target_partition_id: PartitionId,
+    pub command: Command,
 }
 
 /// Behavior configuration for the invoker simulator.
@@ -317,10 +333,16 @@ pub struct PartitionSimulation<S> {
     state_machine: StateMachine,
     /// Storage backend.
     storage: S,
+    /// Partition table for routing cross-partition messages.
+    partition_table: PartitionTable,
     /// Invoker simulator for generating invoker effects.
     invoker: Box<dyn InvokerSimulator>,
     /// Queue of pending commands to apply.
     pending_commands: VecDeque<Command>,
+    /// Messages destined for other partitions, drained by the cluster simulation.
+    outbound_messages: Vec<OutboundMessage>,
+    /// Snapshot IDs that this partition has completed.
+    snapshot_completions: Vec<ClusterSnapshotId>,
     /// Registered timers, indexed by wake time.
     timers: BTreeMap<MillisSinceEpoch, Vec<TimerKeyValue>>,
     /// Set of timer keys that have been deleted (to handle races).
@@ -346,10 +368,28 @@ impl<S> PartitionSimulation<S>
 where
     S: Storage + ReadInvocationStatusTable + ReadVirtualObjectStatusTable + ReadJournalTable + Send,
 {
-    /// Creates a new partition simulation.
+    /// Creates a single-partition simulation (convenience constructor).
+    ///
+    /// Equivalent to calling `new` with a 1-partition table spanning the full
+    /// key range. This preserves backward compatibility with existing tests.
     pub fn new(
         config: PartitionSimulationConfig,
         storage: S,
+        invoker_behavior: InvokerBehavior,
+    ) -> Self {
+        let partition_table =
+            PartitionTable::with_equally_sized_partitions(restate_types::Version::MIN, 1);
+        Self::with_partition_table(config, storage, partition_table, invoker_behavior)
+    }
+
+    /// Creates a partition simulation with an explicit partition table.
+    ///
+    /// Used by `ClusterSimulation` to create multi-partition setups where
+    /// cross-partition messages are routed between partitions.
+    pub fn with_partition_table(
+        config: PartitionSimulationConfig,
+        storage: S,
+        partition_table: PartitionTable,
         invoker_behavior: InvokerBehavior,
     ) -> Self {
         let rng = StdRng::seed_from_u64(config.seed);
@@ -389,8 +429,11 @@ where
             clock,
             state_machine,
             storage,
+            partition_table,
             invoker,
             pending_commands: VecDeque::new(),
+            outbound_messages: Vec::new(),
+            snapshot_completions: Vec::new(),
             timers: BTreeMap::new(),
             deleted_timers: HashSet::new(),
             active_invocations: HashSet::new(),
@@ -435,6 +478,27 @@ where
     /// Takes the trace, leaving tracing disabled.
     pub fn take_trace(&mut self) -> Option<SimulationTrace> {
         self.trace.take()
+    }
+
+    /// Returns this partition's ID.
+    pub fn partition_id(&self) -> PartitionId {
+        self.config.partition_id
+    }
+
+    /// Drains outbound messages destined for other partitions.
+    /// Called by `ClusterSimulation` after each step to route messages.
+    pub fn drain_outbound(&mut self) -> Vec<OutboundMessage> {
+        std::mem::take(&mut self.outbound_messages)
+    }
+
+    /// Drains completed snapshot IDs.
+    pub fn drain_snapshot_completions(&mut self) -> Vec<ClusterSnapshotId> {
+        std::mem::take(&mut self.snapshot_completions)
+    }
+
+    /// Returns true if this partition has pending commands.
+    pub fn has_pending_commands(&self) -> bool {
+        !self.pending_commands.is_empty()
     }
 
     /// Enqueues an external command to be processed.
@@ -578,6 +642,12 @@ where
         }
     }
 
+    /// Public entry point for the cluster to advance timers.
+    /// Fires the next scheduled timer if available.
+    pub async fn advance_timers(&mut self) -> Result<bool, SimulationError> {
+        Ok(self.advance_to_next_timer_async().await?)
+    }
+
     /// Processes actions emitted by the state machine.
     fn process_actions(&mut self, actions: &[Action]) {
         for action in actions {
@@ -651,7 +721,29 @@ where
                 Action::AbortInvocation { invocation_id } => {
                     self.active_invocations.remove(invocation_id);
                 }
-                // These actions don't generate feedback commands in single-partition simulation
+                Action::BeginLocalSnapshot {
+                    snapshot_id,
+                    num_partitions,
+                } => {
+                    self.begin_local_snapshot(*snapshot_id, *num_partitions);
+                }
+                Action::SnapshotComplete { snapshot_id } => {
+                    self.snapshot_completions.push(*snapshot_id);
+                }
+                Action::SendOutboxAck {
+                    to_partition,
+                    from_partition,
+                    seq,
+                } => {
+                    self.outbound_messages.push(OutboundMessage {
+                        target_partition_id: *to_partition,
+                        command: Command::OutboxProcessedAck {
+                            from_partition: *from_partition,
+                            seq: *seq,
+                        },
+                    });
+                }
+                // These actions don't generate feedback commands in simulation
                 Action::VQEvent(_)
                 | Action::AckStoredCommand { .. }
                 | Action::ForwardCompletion { .. }
@@ -663,43 +755,91 @@ where
                 | Action::ForwardPurgeInvocationResponse { .. }
                 | Action::ForwardPurgeJournalResponse { .. }
                 | Action::ForwardResumeInvocationResponse { .. }
-                | Action::ForwardRestartAsNewInvocationResponse { .. }
-                | Action::BeginLocalSnapshot { .. }
-                | Action::SnapshotComplete { .. }
-                | Action::SendOutboxAck { .. } => {}
+                | Action::ForwardRestartAsNewInvocationResponse { .. } => {}
             }
         }
     }
 
-    /// Processes an outbox message, potentially converting it to a command.
+    /// Simulates the local snapshot sequence: take a checkpoint, send markers
+    /// to all other partitions, then self-enqueue `LocalSnapshotTaken`.
+    fn begin_local_snapshot(&mut self, snapshot_id: ClusterSnapshotId, num_partitions: u32) {
+        // In simulation, we skip the actual RocksDB checkpoint.
+        // Send SnapshotMarker to every other partition.
+        for (target_pid, _) in self.partition_table.iter() {
+            if *target_pid == self.config.partition_id {
+                continue;
+            }
+            self.outbound_messages.push(OutboundMessage {
+                target_partition_id: *target_pid,
+                command: Command::SnapshotMarker {
+                    snapshot_id,
+                    from_partition: self.config.partition_id,
+                    num_partitions,
+                },
+            });
+        }
+        // Self-enqueue LocalSnapshotTaken so the state machine records it.
+        self.pending_commands
+            .push_back(Command::LocalSnapshotTaken { snapshot_id });
+    }
+
+    /// Routes an outbox message: local messages are enqueued directly,
+    /// cross-partition messages are collected as outbound.
     fn process_outbox_message(&mut self, message: &OutboxMessage) {
         match message {
             OutboxMessage::ServiceInvocation(invocation) => {
-                // For single-partition simulation, we handle same-partition invocations
-                if self
-                    .config
-                    .partition_key_range
-                    .contains(&invocation.partition_key())
-                {
+                let target_key = invocation.partition_key();
+                if self.config.partition_key_range.contains(&target_key) {
                     self.pending_commands
                         .push_back(Command::Invoke(invocation.clone()));
+                } else {
+                    let target_pid = self
+                        .partition_table
+                        .find_partition_id(target_key)
+                        .expect("partition key must map to a valid partition");
+                    self.outbound_messages.push(OutboundMessage {
+                        target_partition_id: target_pid,
+                        command: Command::Invoke(invocation.clone()),
+                    });
                 }
             }
             OutboxMessage::ServiceResponse(response) => {
-                // Responses to invocations on this partition
-                if self
-                    .config
-                    .partition_key_range
-                    .contains(&response.partition_key())
-                {
+                let target_key = response.partition_key();
+                if self.config.partition_key_range.contains(&target_key) {
                     self.pending_commands
                         .push_back(Command::InvocationResponse(response.clone()));
+                } else {
+                    let target_pid = self
+                        .partition_table
+                        .find_partition_id(target_key)
+                        .expect("partition key must map to a valid partition");
+                    self.outbound_messages.push(OutboundMessage {
+                        target_partition_id: target_pid,
+                        command: Command::InvocationResponse(response.clone()),
+                    });
                 }
             }
-            OutboxMessage::AttachInvocation(_)
-            | OutboxMessage::NotifySignal(_)
-            | OutboxMessage::InvocationTermination(_) => {
-                // TODO: Handle these in multi-partition simulation
+            OutboxMessage::InvocationTermination(termination) => {
+                let target_key = termination.invocation_id.partition_key();
+                if self.config.partition_key_range.contains(&target_key) {
+                    self.pending_commands
+                        .push_back(Command::TerminateInvocation(termination.clone()));
+                } else {
+                    let target_pid = self
+                        .partition_table
+                        .find_partition_id(target_key)
+                        .expect("partition key must map to a valid partition");
+                    self.outbound_messages.push(OutboundMessage {
+                        target_partition_id: target_pid,
+                        command: Command::TerminateInvocation(termination.clone()),
+                    });
+                }
+            }
+            OutboxMessage::AttachInvocation(_) | OutboxMessage::NotifySignal(_) => {
+                // Not yet simulated — panic if encountered to surface missing support.
+                unimplemented!(
+                    "AttachInvocation and NotifySignal outbox messages not yet simulated"
+                );
             }
         }
     }

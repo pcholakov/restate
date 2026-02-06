@@ -89,6 +89,7 @@ async fn test_partition_simulation() -> googletest::Result<()> {
             max_steps: 100,
             partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
             check_invariants: true,
+            ..Default::default()
         };
 
         let mut sim =
@@ -138,6 +139,7 @@ async fn test_partition_simulation() -> googletest::Result<()> {
             max_steps: 500,
             partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
             check_invariants: true,
+            ..Default::default()
         };
 
         let mut sim = PartitionSimulation::new(
@@ -186,6 +188,7 @@ async fn test_partition_simulation() -> googletest::Result<()> {
             max_steps: 100,
             partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
             check_invariants: true,
+            ..Default::default()
         };
 
         let mut sim = PartitionSimulation::new(
@@ -218,6 +221,7 @@ async fn test_partition_simulation() -> googletest::Result<()> {
             max_steps: 100,
             partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
             check_invariants: true,
+            ..Default::default()
         };
 
         let mut sim =
@@ -271,6 +275,7 @@ async fn test_partition_simulation() -> googletest::Result<()> {
             max_steps: 2000,
             partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
             check_invariants: true,
+            ..Default::default()
         };
 
         let mut sim = PartitionSimulation::new(
@@ -321,6 +326,7 @@ async fn test_partition_simulation() -> googletest::Result<()> {
             max_steps: 10_000,
             partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
             check_invariants: false, // Disable for raw throughput
+            ..Default::default()
         };
 
         let mut sim =
@@ -360,6 +366,7 @@ async fn test_partition_simulation() -> googletest::Result<()> {
             max_steps: 10_000,
             partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
             check_invariants: true,
+            ..Default::default()
         };
 
         let mut sim2 = PartitionSimulation::new(
@@ -557,6 +564,7 @@ async fn run_simulation_with_trace(
         max_steps: 2000,
         partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
         check_invariants: true,
+        ..Default::default()
     };
 
     let mut sim = PartitionSimulation::new(
@@ -630,6 +638,7 @@ async fn z_test_trip_wire_detection() -> googletest::Result<()> {
             max_steps: 500,
             partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
             check_invariants: true,
+            ..Default::default()
         };
 
         let mut sim = PartitionSimulation::new(
@@ -719,6 +728,7 @@ async fn test_seed_reproduction() -> googletest::Result<()> {
         max_steps: 500,
         partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
         check_invariants: true,
+        ..Default::default()
     };
 
     let mut sim = PartitionSimulation::new(

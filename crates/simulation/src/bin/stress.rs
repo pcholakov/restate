@@ -505,6 +505,7 @@ async fn run_single_iteration(
         max_steps,
         partition_key_range: PartitionKey::MIN..=PartitionKey::MAX,
         check_invariants: true,
+        ..Default::default()
     };
 
     let mut sim = PartitionSimulation::new(

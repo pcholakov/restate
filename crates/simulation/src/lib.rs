@@ -43,12 +43,15 @@
 //! ```
 
 mod clock;
+pub mod cluster;
 mod partition;
 mod trace;
 
 pub use clock::{SimulationClock, TokioClock};
+pub use cluster::{ClusterSimulation, ClusterSimulationConfig, ClusterSimulationOutcome};
 pub use partition::{
-    InvokerBehavior, InvokerSimulator, PartitionSimulation, PartitionSimulationConfig,
-    SimulationError, SimulationOutcome, StepResult, VO_TEST_HANDLER, VO_TEST_KEYS, VO_TEST_SERVICE,
+    InvokerBehavior, InvokerSimulator, OutboundMessage, PartitionSimulation,
+    PartitionSimulationConfig, SimulationError, SimulationOutcome, StepResult, VO_TEST_HANDLER,
+    VO_TEST_KEYS, VO_TEST_SERVICE,
 };
 pub use trace::{ActionTrace, CommandTrace, SimulationTrace, TraceDiff, TraceEntry};

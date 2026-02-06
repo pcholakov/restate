@@ -21,8 +21,8 @@ use restate_core::TaskCenter;
 use restate_partition_store::PartitionStoreManager;
 use restate_rocksdb::RocksDbManager;
 use restate_simulation::{
-    ClusterSimulation, ClusterSimulationConfig, InvokerBehavior, PartitionSimulation,
-    PartitionSimulationConfig, SimulationTrace,
+    ClusterSimulation, ClusterSimulationConfig, FaultInjection, InvariantViolation,
+    InvokerBehavior, PartitionSimulation, PartitionSimulationConfig, SimulationTrace,
 };
 use restate_types::Version;
 use restate_types::config::{Configuration, StorageOptions, set_current_config};
@@ -882,6 +882,163 @@ async fn test_cluster_simulation() -> googletest::Result<()> {
     );
 
     info!("Multi-partition cluster simulation with distributed snapshot passed!");
+    Ok(())
+}
+
+/// Trip wire test: verifies that dropping snapshot markers causes invariant violations.
+///
+/// Enables `DropSnapshotMarkers` fault injection, initiates a snapshot, and verifies
+/// the cluster-level invariant checkers detect that markers weren't delivered and
+/// that not all partitions completed the snapshot.
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn z_test_snapshot_marker_drop_trip_wire() -> googletest::Result<()> {
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = PartitionStoreManager::create().await.unwrap();
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, _> = stores.into_iter().collect();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 99,
+        max_steps: 5_000,
+        fault_injection: FaultInjection::DropSnapshotMarkers,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::ImmediateSuccess,
+    );
+
+    // Inject a few invocations so there's some activity
+    for _ in 0..5 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+
+    // Initiate snapshot — markers will be dropped by fault injection
+    let snapshot_id = ClusterSnapshotId::new(1);
+    cluster.initiate_snapshot(snapshot_id);
+
+    let outcome = cluster.run().await?;
+
+    // The invariant checker should report violations because markers were dropped:
+    // - Message accounting mismatch (markers sent but not received)
+    // - Possibly marker delivery failures if some partitions still completed
+    assert!(
+        !outcome.is_ok(),
+        "Expected invariant violations when snapshot markers are dropped, \
+         but none were detected. Steps: {}",
+        outcome.total_steps
+    );
+
+    // Verify we got the right kind of violation
+    let has_message_loss = outcome
+        .violations
+        .iter()
+        .any(|v| matches!(v, InvariantViolation::CrossPartitionMessageLoss { .. }));
+    let has_marker_delivery = outcome
+        .violations
+        .iter()
+        .any(|v| matches!(v, InvariantViolation::SnapshotMarkerNotDelivered { .. }));
+    let has_completion_disagreement = outcome
+        .violations
+        .iter()
+        .any(|v| matches!(v, InvariantViolation::SnapshotCompletionDisagreement { .. }));
+
+    assert!(
+        has_message_loss || has_marker_delivery || has_completion_disagreement,
+        "Expected snapshot-related violations, got: {:?}",
+        outcome.violations
+    );
+
+    info!(
+        "Trip wire test passed: {} violations detected when markers dropped",
+        outcome.violations.len()
+    );
+    Ok(())
+}
+
+/// Trip wire test: verifies that dropping ALL cross-partition messages causes
+/// the message accounting invariant to fire.
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn z_test_message_drop_trip_wire() -> googletest::Result<()> {
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = PartitionStoreManager::create().await.unwrap();
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, _> = stores.into_iter().collect();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 100,
+        max_steps: 5_000,
+        fault_injection: FaultInjection::DropAllMessages,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::ImmediateSuccess,
+    );
+
+    // Inject invocations that will generate cross-partition outbox messages
+    for _ in 0..10 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+
+    // Initiate snapshot to generate marker messages too
+    cluster.initiate_snapshot(ClusterSnapshotId::new(1));
+
+    let outcome = cluster.run().await?;
+
+    // With all messages dropped, we should see message accounting violations
+    let has_message_loss = outcome
+        .violations
+        .iter()
+        .any(|v| matches!(v, InvariantViolation::CrossPartitionMessageLoss { .. }));
+
+    assert!(
+        has_message_loss,
+        "Expected CrossPartitionMessageLoss violation when all messages are dropped, \
+         got: {:?}",
+        outcome.violations
+    );
+
+    info!(
+        "Trip wire test passed: message loss detected ({} violations)",
+        outcome.violations.len()
+    );
     Ok(())
 }
 

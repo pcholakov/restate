@@ -32,6 +32,24 @@ use crate::partition::{
     SimulationError,
 };
 
+/// Fault injection mode for the cluster simulation.
+///
+/// Used by trip-wire tests to intentionally break the snapshot protocol
+/// and verify that invariant checkers detect the violation.
+#[derive(Debug, Clone, Default)]
+pub enum FaultInjection {
+    /// No faults — normal operation.
+    #[default]
+    None,
+    /// Drop all `SnapshotMarker` commands during routing.
+    /// This prevents partitions from receiving markers, so the snapshot
+    /// protocol can never complete. The completion-agreement checker should fire.
+    DropSnapshotMarkers,
+    /// Drop all cross-partition messages (markers, invocations, responses, etc).
+    /// The message accounting checker should fire.
+    DropAllMessages,
+}
+
 /// Scheduling strategy for picking which partition to step next.
 #[derive(Debug, Clone, Default)]
 pub enum StepScheduler {
@@ -53,6 +71,8 @@ pub struct ClusterSimulationConfig {
     pub max_steps: usize,
     /// Scheduling strategy.
     pub scheduler: StepScheduler,
+    /// Fault injection mode for testing invariant checkers.
+    pub fault_injection: FaultInjection,
 }
 
 impl Default for ClusterSimulationConfig {
@@ -62,6 +82,7 @@ impl Default for ClusterSimulationConfig {
             seed: 0,
             max_steps: 50_000,
             scheduler: StepScheduler::default(),
+            fault_injection: FaultInjection::default(),
         }
     }
 }
@@ -262,13 +283,28 @@ where
     }
 
     /// Routes outbound messages from all partitions into target mailboxes.
+    ///
+    /// Applies fault injection if configured — dropped messages are still
+    /// counted as "sent" by the source partition (via `drain_outbound`),
+    /// but never delivered, so invariant checkers can detect the loss.
     fn route_outbound(&mut self) {
         for idx in 0..self.partitions.len() {
             let outbound = self.partitions[idx].drain_outbound();
             for msg in outbound {
-                let target_idx = self.partition_index(msg.target_partition_id);
-                self.partitions[target_idx].record_inbound_message();
-                self.mailboxes[target_idx].messages.push_back(msg.command);
+                // Apply fault injection
+                let should_drop = match &self.config.fault_injection {
+                    FaultInjection::None => false,
+                    FaultInjection::DropSnapshotMarkers => {
+                        matches!(msg.command, Command::SnapshotMarker { .. })
+                    }
+                    FaultInjection::DropAllMessages => true,
+                };
+
+                if !should_drop {
+                    let target_idx = self.partition_index(msg.target_partition_id);
+                    self.partitions[target_idx].record_inbound_message();
+                    self.mailboxes[target_idx].messages.push_back(msg.command);
+                }
             }
 
             let completions = self.partitions[idx].drain_snapshot_completions();

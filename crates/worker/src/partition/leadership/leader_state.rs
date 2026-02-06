@@ -122,6 +122,9 @@ pub struct LeaderState {
 
     /// Active distributed snapshot sequence, if any.
     pub(crate) pending_snapshot: Option<PendingSnapshot>,
+
+    /// Controls the shuffle gate. `false` pauses shuffle (snapshot in progress).
+    pub(crate) shuffle_gate_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl LeaderState {
@@ -134,6 +137,7 @@ impl LeaderState {
         cleaner_handle: CleanerHandle,
         trimmer_task_id: TaskId,
         shuffle_hint_tx: HintSender,
+        shuffle_gate_tx: tokio::sync::watch::Sender<bool>,
         timer_service: TimerService,
         scheduler: SchedulerService<PartitionDb>,
         self_proposer: SelfProposer,
@@ -149,6 +153,7 @@ impl LeaderState {
             cleaner_handle,
             trimmer_task_id,
             shuffle_hint_tx,
+            shuffle_gate_tx,
             schema_stream: Metadata::with_current(|m| {
                 WatchStream::new(m.watch(MetadataKind::Schema))
             }),

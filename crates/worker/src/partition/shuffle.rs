@@ -181,6 +181,7 @@ where
         channel_size: usize,
         bifrost: &Bifrost,
         ingestion_client: IngestionClient<T, Envelope>,
+        gate_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         let batch_ingestion = Configuration::pinned()
             .common
@@ -194,6 +195,7 @@ where
                 truncation_tx,
                 channel_size,
                 ingestion_client,
+                gate_rx,
             ))
         } else {
             debug!("Using Shuffler legacy ingestion mechanism");
@@ -203,6 +205,7 @@ where
                 truncation_tx,
                 channel_size,
                 bifrost.clone(),
+                gate_rx,
             ))
         };
 
@@ -238,6 +241,7 @@ struct IngestionClientShuffleInner<T, OR> {
     hint_rx: async_channel::Receiver<NewOutboxMessage>,
     // used to create the senders into the shuffle
     hint_tx: async_channel::Sender<NewOutboxMessage>,
+    gate_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl<T, OR> IngestionClientShuffleInner<T, OR>
@@ -251,6 +255,7 @@ where
         truncation_tx: mpsc::Sender<OutboxTruncation>,
         channel_size: usize,
         ingestion_client: IngestionClient<T, Envelope>,
+        gate_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         let (hint_tx, hint_rx) = async_channel::bounded(channel_size);
 
@@ -261,6 +266,7 @@ where
             hint_rx,
             hint_tx,
             ingestion_client,
+            gate_rx,
         }
     }
 
@@ -289,6 +295,7 @@ where
             outbox_reader,
             truncation_tx,
             ingestion_client,
+            mut gate_rx,
             ..
         } = self;
 
@@ -312,8 +319,9 @@ where
         loop {
             inflight_count.record(inflight.len() as f64);
             let head = OptionFuture::from(inflight.front_mut());
+            let gate_open = *gate_rx.borrow();
             tokio::select! {
-                commit_token = state_machine.shuffle_next_message() => {
+                commit_token = state_machine.shuffle_next_message(), if gate_open => {
                     let commit_token = commit_token?;
                     inflight.push_back(commit_token);
                 }
@@ -322,6 +330,12 @@ where
                     _ = inflight.pop_front();
                     ingested_counter.increment(1);
                     let _ = truncation_tx.try_send(OutboxTruncation::new(message_index));
+                }
+                result = gate_rx.changed(), if !gate_open => {
+                    if result.is_err() {
+                        // Gate sender dropped (leadership teardown)
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -337,6 +351,7 @@ struct LegacyShuffleInner<OR> {
     hint_rx: async_channel::Receiver<NewOutboxMessage>,
     // used to create the senders into the shuffle
     hint_tx: async_channel::Sender<NewOutboxMessage>,
+    gate_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl<OR> LegacyShuffleInner<OR>
@@ -349,6 +364,7 @@ where
         truncation_tx: mpsc::Sender<OutboxTruncation>,
         channel_size: usize,
         bifrost: Bifrost,
+        gate_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         let (hint_tx, hint_rx) = async_channel::bounded(channel_size);
 
@@ -359,6 +375,7 @@ where
             hint_rx,
             hint_tx,
             bifrost,
+            gate_rx,
         }
     }
 
@@ -386,6 +403,7 @@ where
             outbox_reader,
             truncation_tx,
             bifrost,
+            mut gate_rx,
             ..
         } = self;
 
@@ -414,6 +432,13 @@ where
         tokio::pin!(state_machine);
 
         loop {
+            // Wait for shuffle gate to be open
+            while !*gate_rx.borrow() {
+                if gate_rx.changed().await.is_err() {
+                    return Ok(());
+                }
+            }
+
             let shuffled_message_index = state_machine.as_mut().shuffle_next_message().await?;
 
             // this is just a hint which we can drop
@@ -986,12 +1011,14 @@ mod ingestion_client_tests {
 
         let (truncation_tx, _truncation_rx) = mpsc::channel(1);
 
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
         let shuffle = IngestionClientShuffleInner::new(
             metadata,
             outbox_reader,
             truncation_tx,
             1,
             ingestion.clone(),
+            gate_rx,
         );
 
         ShuffleEnv {
@@ -1105,12 +1132,14 @@ mod ingestion_client_tests {
                         outbox_reader.fail_index += 10;
                     }
 
+                    let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
                     shuffle = IngestionClientShuffleInner::new(
                         metadata,
                         Arc::clone(&outbox_reader),
                         truncation_tx.clone(),
                         1,
                         shuffle_env.ingestion.clone(),
+                        gate_rx,
                     );
                 }
 
@@ -1347,8 +1376,15 @@ mod legacy_tests {
         let (truncation_tx, _truncation_rx) = mpsc::channel(1);
 
         let bifrost = Bifrost::init_in_memory(env.metadata_writer.clone()).await;
-        let shuffle =
-            LegacyShuffleInner::new(metadata, outbox_reader, truncation_tx, 1, bifrost.clone());
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let shuffle = LegacyShuffleInner::new(
+            metadata,
+            outbox_reader,
+            truncation_tx,
+            1,
+            bifrost.clone(),
+            gate_rx,
+        );
 
         ShuffleEnv {
             env,
@@ -1480,12 +1516,14 @@ mod legacy_tests {
                         outbox_reader.fail_index += 10;
                     }
 
+                    let (_gate_tx, gate_rx) = tokio::sync::watch::channel(true);
                     shuffle = LegacyShuffleInner::new(
                         metadata,
                         Arc::clone(&outbox_reader),
                         truncation_tx.clone(),
                         1,
                         shuffle_env.bifrost.clone(),
+                        gate_rx,
                     );
                 }
 

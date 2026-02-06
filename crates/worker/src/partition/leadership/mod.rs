@@ -427,6 +427,7 @@ where
             );
 
             let (shuffle_tx, shuffle_rx) = mpsc::channel(config.worker.internal_queue_length());
+            let (shuffle_gate_tx, shuffle_gate_rx) = tokio::sync::watch::channel(true);
 
             let shuffle = Shuffle::new(
                 ShuffleMetadata::new(self.partition.partition_id, *leader_epoch),
@@ -435,6 +436,7 @@ where
                 config.worker.internal_queue_length(),
                 &self.bifrost,
                 self.ingestion_client.clone(),
+                shuffle_gate_rx,
             );
 
             let shuffle_hint_tx = shuffle.create_hint_sender();
@@ -525,6 +527,7 @@ where
                 cleaner_handle,
                 trimmer_task_id,
                 shuffle_hint_tx,
+                shuffle_gate_tx,
                 timer_service,
                 scheduler_service,
                 self_proposer,
@@ -679,9 +682,12 @@ where
         match &pending.phase {
             SnapshotPhase::NeedFlush => {
                 let snapshot_id = pending.snapshot_id;
-                debug!(%snapshot_id, "Snapshot: flushing SelfProposer");
+                debug!(%snapshot_id, "Snapshot: gating shuffle and flushing SelfProposer");
 
-                // TODO(distributed-snapshots): gate shuffle before flushing
+                // Gate shuffle: prevent new outbox messages from being sent
+                // to Bifrost while the snapshot is in progress. In-flight
+                // messages complete naturally.
+                let _ = leader_state.shuffle_gate_tx.send(false);
 
                 // Flush: get a commit token that resolves when all previously
                 // enqueued self-proposals have been committed.
@@ -808,9 +814,10 @@ where
             .propose(pk, Command::LocalSnapshotTaken { snapshot_id })
             .await?;
 
-        // TODO(distributed-snapshots): release shuffle gate
+        // Release shuffle gate — outbox messages can flow again.
+        let _ = leader_state.shuffle_gate_tx.send(true);
 
-        debug!(%snapshot_id, "Snapshot: markers sent, LocalSnapshotTaken proposed");
+        debug!(%snapshot_id, "Snapshot: markers sent, shuffle gate released");
 
         // Transition to Done — will be cleaned up on next call.
         leader_state.pending_snapshot.as_mut().unwrap().phase = SnapshotPhase::Done;

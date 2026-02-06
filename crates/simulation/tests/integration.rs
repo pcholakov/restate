@@ -885,6 +885,256 @@ async fn test_cluster_simulation() -> googletest::Result<()> {
     Ok(())
 }
 
+/// Tests multiple sequential snapshots: take snapshot 1, wait, take snapshot 2.
+///
+/// Verifies that:
+/// - Both snapshots complete successfully across all partitions
+/// - The protocol state resets properly between snapshots
+/// - Cluster invariant checkers pass for both
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn test_cluster_sequential_snapshots() -> googletest::Result<()> {
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = PartitionStoreManager::create().await.unwrap();
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, _> = stores.into_iter().collect();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 200,
+        max_steps: 20_000,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::ImmediateSuccess,
+    );
+
+    // Phase 1: inject work and take first snapshot
+    for _ in 0..5 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+    cluster.initiate_snapshot(ClusterSnapshotId::new(1));
+    let outcome1 = cluster.run().await?;
+    assert!(outcome1.is_ok(), "Phase 1 violations: {:?}", outcome1.violations);
+
+    // Verify snapshot 1 completed on all partitions
+    for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
+        assert!(
+            completions.contains(&ClusterSnapshotId::new(1)),
+            "Partition {i} missing snapshot 1"
+        );
+    }
+
+    // Phase 2: inject more work and take second snapshot
+    for _ in 0..5 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+    cluster.initiate_snapshot(ClusterSnapshotId::new(2));
+    let outcome2 = cluster.run().await?;
+    assert!(outcome2.is_ok(), "Phase 2 violations: {:?}", outcome2.violations);
+
+    // Verify both snapshots completed on all partitions
+    for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
+        assert!(
+            completions.contains(&ClusterSnapshotId::new(1))
+                && completions.contains(&ClusterSnapshotId::new(2)),
+            "Partition {i} missing snapshots: {:?}",
+            completions
+        );
+    }
+
+    info!(
+        "Sequential snapshots test passed: {}+{} steps",
+        outcome1.total_steps, outcome2.total_steps
+    );
+    Ok(())
+}
+
+/// Tests snapshot during active cross-partition invocations.
+///
+/// Injects invocations that generate cross-partition outbox messages,
+/// then initiates a snapshot while those messages are still in flight.
+/// Verifies the snapshot protocol handles concurrent activity correctly.
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn test_cluster_snapshot_during_activity() -> googletest::Result<()> {
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = PartitionStoreManager::create().await.unwrap();
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, _> = stores.into_iter().collect();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 300,
+        max_steps: 20_000,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::ImmediateSuccess,
+    );
+
+    // Inject many invocations that will generate cross-partition messages
+    for _ in 0..20 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+
+    // Process a few steps to get cross-partition messages flowing
+    for _ in 0..10 {
+        if cluster.step().await?.is_none() {
+            break;
+        }
+    }
+
+    // Now initiate snapshot while cross-partition messages are potentially in flight
+    cluster.initiate_snapshot(ClusterSnapshotId::new(1));
+
+    // Continue injecting more work concurrently with the snapshot
+    for _ in 0..10 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+
+    // Run to completion
+    let outcome = cluster.run().await?;
+
+    assert!(
+        outcome.is_ok(),
+        "Snapshot during activity produced violations: {:?}",
+        outcome.violations
+    );
+
+    // Verify snapshot completed on all partitions
+    for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
+        assert!(
+            completions.contains(&ClusterSnapshotId::new(1)),
+            "Partition {i} failed to complete snapshot during activity"
+        );
+    }
+
+    info!(
+        "Snapshot during activity test passed: {} steps, all {} partitions completed",
+        outcome.total_steps, num_partitions
+    );
+    Ok(())
+}
+
+/// Tests snapshot with probabilistic invoker (mixed success/failure/timeout).
+///
+/// Uses a probabilistic invoker to create a more realistic workload where
+/// some invocations fail and some timeout, increasing the chance of edge
+/// cases in the snapshot protocol.
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn test_cluster_snapshot_with_probabilistic_invoker() -> googletest::Result<()> {
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = PartitionStoreManager::create().await.unwrap();
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, _> = stores.into_iter().collect();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 400,
+        max_steps: 20_000,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::Probabilistic {
+            success_rate: 0.6,
+            failure_rate: 0.3,
+            // Remaining 10% = timeout (no invoker response)
+        },
+    );
+
+    // Inject many invocations across different partitions
+    for _ in 0..30 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+
+    // Run to drain initial work
+    let outcome_before = cluster.run().await?;
+    assert!(
+        outcome_before.is_ok(),
+        "Pre-snapshot violations: {:?}",
+        outcome_before.violations
+    );
+
+    // Now take a snapshot — some invocations may be timed out (stuck in active state)
+    cluster.initiate_snapshot(ClusterSnapshotId::new(1));
+    let outcome = cluster.run().await?;
+
+    assert!(
+        outcome.is_ok(),
+        "Snapshot with probabilistic invoker produced violations: {:?}",
+        outcome.violations
+    );
+
+    // Verify snapshot completed
+    for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
+        assert!(
+            completions.contains(&ClusterSnapshotId::new(1)),
+            "Partition {i} failed to complete snapshot with probabilistic invoker"
+        );
+    }
+
+    info!(
+        "Probabilistic invoker snapshot test passed: {} total steps",
+        outcome.total_steps
+    );
+    Ok(())
+}
+
 /// Trip wire test: verifies that dropping snapshot markers causes invariant violations.
 ///
 /// Enables `DropSnapshotMarkers` fault injection, initiates a snapshot, and verifies

@@ -673,6 +673,28 @@ impl<S> StateMachineApplyContext<'_, S> {
 
                 Ok(())
             }
+            // -- Distributed snapshot protocol (Chandy-Lamport)
+            // Full handling implemented in A2 (OutboxProcessedAck) and A3
+            // (InitiateSnapshot, SnapshotMarker).
+            Command::InitiateSnapshot { snapshot_id } => {
+                warn!("InitiateSnapshot({snapshot_id}) not yet implemented, ignoring");
+                Ok(())
+            }
+            Command::SnapshotMarker {
+                snapshot_id,
+                from_partition,
+            } => {
+                warn!("SnapshotMarker({snapshot_id}, from={from_partition}) not yet implemented, ignoring");
+                Ok(())
+            }
+            Command::OutboxProcessedAck {
+                from_partition,
+                seq,
+            } => {
+                // A2: will delete specific outbox entry at `seq`
+                debug!("OutboxProcessedAck(from={from_partition}, seq={seq}) not yet implemented, ignoring");
+                Ok(())
+            }
         }
     }
 

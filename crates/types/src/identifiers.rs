@@ -1083,6 +1083,33 @@ impl SnapshotId {
     pub const INVALID: Self = Self::from_parts(0, 0);
 }
 
+/// Identifies a cluster-wide distributed snapshot instance. Assigned by the
+/// snapshot coordinator; all partitions participating in the same Chandy-Lamport
+/// round share this identifier.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    derive_more::Display,
+    derive_more::From,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[display("{_0}")]
+#[serde(transparent)]
+pub struct ClusterSnapshotId(u64);
+
+impl ClusterSnapshotId {
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 #[derive(
     Debug, Clone, PartialEq, Eq, serde_with::SerializeDisplay, serde_with::DeserializeFromStr,
 )]

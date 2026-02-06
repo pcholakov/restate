@@ -11,7 +11,9 @@
 use bytes::Bytes;
 
 use restate_storage_api::deduplication_table::DedupInformation;
-use restate_types::identifiers::{LeaderEpoch, PartitionId, PartitionKey, WithPartitionKey};
+use restate_types::identifiers::{
+    ClusterSnapshotId, LeaderEpoch, PartitionId, PartitionKey, WithPartitionKey,
+};
 use restate_types::invocation::{
     AttachInvocationRequest, GetInvocationOutputResponse, InvocationResponse,
     InvocationTermination, NotifySignalRequest, PurgeInvocationRequest,
@@ -201,6 +203,32 @@ pub enum Command {
     VQWaitingToRunning(Bytes),
     /// payload is vqueues::VQYieldRunning (bilrost encoded)
     VQYieldRunning(Bytes),
+
+    // -- Distributed snapshot protocol (Chandy-Lamport)
+    // These are CONTROL messages: not part of any channel state, not recorded in
+    // dedup tables. They flow through Bifrost for FIFO ordering guarantees.
+
+    /// Coordinator initiates a cluster-wide snapshot on the target partition.
+    /// The first partition to process this becomes the CL initiator.
+    InitiateSnapshot {
+        snapshot_id: ClusterSnapshotId,
+    },
+    /// Snapshot marker sent from one partition to another through Bifrost,
+    /// analogous to CL marker messages. First marker triggers snapshot at
+    /// the receiver; subsequent markers mark per-sender channels as complete.
+    SnapshotMarker {
+        snapshot_id: ClusterSnapshotId,
+        from_partition: PartitionId,
+    },
+    /// Acknowledges processing of a specific outbox message. The receiver
+    /// sends this back to the sender's log after processing (or dedup-rejecting)
+    /// the message, enabling the sender to delete that outbox entry.
+    /// Uses exact-seq (not range) because outbox sequences are per-partition
+    /// with messages to different targets interleaved.
+    OutboxProcessedAck {
+        from_partition: PartitionId,
+        seq: MessageIndex,
+    },
 }
 
 impl Command {
@@ -254,6 +282,10 @@ impl HasRecordKeys for Envelope {
             Command::UpsertSchema(schema) => schema.partition_key_range.clone(),
             Command::VQWaitingToRunning(_) => Keys::Single(self.partition_key()),
             Command::VQYieldRunning(_) => Keys::Single(self.partition_key()),
+            // Snapshot protocol control messages target the partition by its key.
+            Command::InitiateSnapshot { .. } => Keys::Single(self.partition_key()),
+            Command::SnapshotMarker { .. } => Keys::Single(self.partition_key()),
+            Command::OutboxProcessedAck { .. } => Keys::Single(self.partition_key()),
         }
     }
 }

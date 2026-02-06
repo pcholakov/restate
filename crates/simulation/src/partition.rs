@@ -18,7 +18,7 @@
 //! messages instead of being dropped. A [`ClusterSimulation`](super::cluster::ClusterSimulation)
 //! routes them between partitions.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 
 use bytes::Bytes;
@@ -361,6 +361,14 @@ pub struct PartitionSimulation<S> {
     last_timer_fire_time: Option<MillisSinceEpoch>,
     /// Optional trace recorder for determinism verification.
     trace: Option<SimulationTrace>,
+    /// Per-snapshot-id tracking of markers sent by this partition.
+    markers_sent: HashMap<ClusterSnapshotId, HashSet<PartitionId>>,
+    /// Per-snapshot-id tracking of markers received by this partition.
+    markers_received: HashMap<ClusterSnapshotId, HashSet<PartitionId>>,
+    /// Number of cross-partition messages sent (outbound to other partitions).
+    cross_partition_messages_sent: u64,
+    /// Number of cross-partition messages received (inbound from other partitions).
+    cross_partition_messages_received: u64,
 }
 
 #[allow(dead_code)]
@@ -442,6 +450,10 @@ where
             invocations_seen: HashSet::new(),
             last_timer_fire_time: None,
             trace: None,
+            markers_sent: HashMap::new(),
+            markers_received: HashMap::new(),
+            cross_partition_messages_sent: 0,
+            cross_partition_messages_received: 0,
         }
     }
 
@@ -488,12 +500,32 @@ where
     /// Drains outbound messages destined for other partitions.
     /// Called by `ClusterSimulation` after each step to route messages.
     pub fn drain_outbound(&mut self) -> Vec<OutboundMessage> {
-        std::mem::take(&mut self.outbound_messages)
+        let msgs = std::mem::take(&mut self.outbound_messages);
+        self.cross_partition_messages_sent += msgs.len() as u64;
+        msgs
     }
 
     /// Drains completed snapshot IDs.
     pub fn drain_snapshot_completions(&mut self) -> Vec<ClusterSnapshotId> {
         std::mem::take(&mut self.snapshot_completions)
+    }
+
+    /// Returns markers sent per snapshot ID (snapshot_id → set of target partition IDs).
+    pub fn markers_sent(&self) -> &HashMap<ClusterSnapshotId, HashSet<PartitionId>> {
+        &self.markers_sent
+    }
+
+    /// Returns markers received per snapshot ID (snapshot_id → set of source partition IDs).
+    pub fn markers_received(&self) -> &HashMap<ClusterSnapshotId, HashSet<PartitionId>> {
+        &self.markers_received
+    }
+
+    /// Returns cross-partition message counts (sent, received).
+    pub fn cross_partition_message_counts(&self) -> (u64, u64) {
+        (
+            self.cross_partition_messages_sent,
+            self.cross_partition_messages_received,
+        )
     }
 
     /// Returns true if this partition has pending commands.
@@ -503,7 +535,25 @@ where
 
     /// Enqueues an external command to be processed.
     pub fn enqueue_command(&mut self, command: Command) {
+        // Track snapshot markers received and cross-partition message counts
+        if let Command::SnapshotMarker {
+            snapshot_id,
+            from_partition,
+            ..
+        } = &command
+        {
+            self.markers_received
+                .entry(*snapshot_id)
+                .or_default()
+                .insert(*from_partition);
+        }
         self.pending_commands.push_back(command);
+    }
+
+    /// Increments the cross-partition message received counter.
+    /// Called by ClusterSimulation when delivering routed messages.
+    pub fn record_inbound_message(&mut self) {
+        self.cross_partition_messages_received += 1;
     }
 
     /// Enqueues a new invocation.
@@ -765,10 +815,12 @@ where
     fn begin_local_snapshot(&mut self, snapshot_id: ClusterSnapshotId, num_partitions: u32) {
         // In simulation, we skip the actual RocksDB checkpoint.
         // Send SnapshotMarker to every other partition.
+        let sent_to = self.markers_sent.entry(snapshot_id).or_default();
         for (target_pid, _) in self.partition_table.iter() {
             if *target_pid == self.config.partition_id {
                 continue;
             }
+            sent_to.insert(*target_pid);
             self.outbound_messages.push(OutboundMessage {
                 target_partition_id: *target_pid,
                 command: Command::SnapshotMarker {
@@ -1162,6 +1214,32 @@ pub enum InvariantViolation {
     OrphanedVoLock {
         service_id: ServiceId,
         locked_by: InvocationId,
+    },
+    #[error(
+        "Snapshot completion disagreement: snapshot {snapshot_id}, \
+         completed_by={completed_by:?}, missing={missing:?}"
+    )]
+    SnapshotCompletionDisagreement {
+        snapshot_id: ClusterSnapshotId,
+        completed_by: Vec<PartitionId>,
+        missing: Vec<PartitionId>,
+    },
+    #[error(
+        "Snapshot marker not delivered: snapshot {snapshot_id}, \
+         sender={sender}, expected_recipient={expected_recipient}"
+    )]
+    SnapshotMarkerNotDelivered {
+        snapshot_id: ClusterSnapshotId,
+        sender: PartitionId,
+        expected_recipient: PartitionId,
+    },
+    #[error(
+        "Cross-partition message accounting mismatch: total_sent={total_sent}, \
+         total_received={total_received}"
+    )]
+    CrossPartitionMessageLoss {
+        total_sent: u64,
+        total_received: u64,
     },
     #[error("Invariant check failed: {0}")]
     Custom(String),

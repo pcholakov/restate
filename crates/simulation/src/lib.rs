@@ -50,7 +50,7 @@ mod trace;
 pub use clock::{SimulationClock, TokioClock};
 pub use cluster::{ClusterSimulation, ClusterSimulationConfig, ClusterSimulationOutcome};
 pub use partition::{
-    InvokerBehavior, InvokerSimulator, OutboundMessage, PartitionSimulation,
+    InvariantViolation, InvokerBehavior, InvokerSimulator, OutboundMessage, PartitionSimulation,
     PartitionSimulationConfig, SimulationError, SimulationOutcome, StepResult, VO_TEST_HANDLER,
     VO_TEST_KEYS, VO_TEST_SERVICE,
 };

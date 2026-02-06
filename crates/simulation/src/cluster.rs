@@ -13,7 +13,7 @@
 //! Orchestrates N [`PartitionSimulation`] instances with cross-partition
 //! message routing and snapshot protocol coordination.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -28,7 +28,8 @@ use restate_types::partition_table::{FindPartition, PartitionTable};
 use restate_wal_protocol::Command;
 
 use crate::partition::{
-    InvokerBehavior, PartitionSimulation, PartitionSimulationConfig, SimulationError,
+    InvariantViolation, InvokerBehavior, PartitionSimulation, PartitionSimulationConfig,
+    SimulationError,
 };
 
 /// Scheduling strategy for picking which partition to step next.
@@ -266,6 +267,7 @@ where
             let outbound = self.partitions[idx].drain_outbound();
             for msg in outbound {
                 let target_idx = self.partition_index(msg.target_partition_id);
+                self.partitions[target_idx].record_inbound_message();
                 self.mailboxes[target_idx].messages.push_back(msg.command);
             }
 
@@ -374,10 +376,140 @@ where
             self.route_outbound();
         }
 
+        // Run cluster-level invariant checks on the final state.
+        let violations = self.check_cluster_invariants();
+
         Ok(ClusterSimulationOutcome {
             total_steps: self.total_steps,
             completed_snapshots: self.completed_snapshots.clone(),
+            violations,
         })
+    }
+
+    /// Checks cluster-level invariants after the simulation quiesces.
+    ///
+    /// Verifies:
+    /// 1. **Snapshot completion agreement** — all partitions completed the same set of snapshot IDs
+    /// 2. **Marker delivery** — for each completed snapshot, every partition received markers from all others
+    /// 3. **Message accounting** — total cross-partition messages sent equals total received
+    pub fn check_cluster_invariants(&self) -> Vec<InvariantViolation> {
+        let mut violations = Vec::new();
+
+        self.check_snapshot_completion_agreement(&mut violations);
+        self.check_marker_delivery(&mut violations);
+        self.check_message_accounting(&mut violations);
+
+        violations
+    }
+
+    /// Verifies that all partitions agree on which snapshots completed.
+    fn check_snapshot_completion_agreement(&self, violations: &mut Vec<InvariantViolation>) {
+        // Collect all snapshot IDs seen across any partition
+        let mut all_snapshot_ids: HashSet<ClusterSnapshotId> = HashSet::new();
+        for partition_snapshots in &self.completed_snapshots {
+            for sid in partition_snapshots {
+                all_snapshot_ids.insert(*sid);
+            }
+        }
+
+        // For each snapshot ID, verify all partitions completed it
+        for &sid in &all_snapshot_ids {
+            let mut completed_by = Vec::new();
+            let mut missing = Vec::new();
+
+            for (idx, partition_snapshots) in self.completed_snapshots.iter().enumerate() {
+                let pid = self.partitions[idx].partition_id();
+                if partition_snapshots.contains(&sid) {
+                    completed_by.push(pid);
+                } else {
+                    missing.push(pid);
+                }
+            }
+
+            if !missing.is_empty() {
+                violations.push(InvariantViolation::SnapshotCompletionDisagreement {
+                    snapshot_id: sid,
+                    completed_by,
+                    missing,
+                });
+            }
+        }
+    }
+
+    /// Verifies that for each completed snapshot, markers were properly exchanged.
+    ///
+    /// For a completed snapshot, each partition should have:
+    /// - Sent markers to every other partition
+    /// - Received markers from every other partition
+    fn check_marker_delivery(&self, violations: &mut Vec<InvariantViolation>) {
+        // Collect completed snapshot IDs (only those completed by ALL partitions)
+        let mut globally_completed: HashMap<ClusterSnapshotId, usize> = HashMap::new();
+        for partition_snapshots in &self.completed_snapshots {
+            for sid in partition_snapshots {
+                *globally_completed.entry(*sid).or_default() += 1;
+            }
+        }
+
+        let n = self.partitions.len();
+        for (&sid, &count) in &globally_completed {
+            if count != n {
+                continue; // Already reported by completion agreement check
+            }
+
+            // For each partition, verify it received markers from all other partitions
+            for (idx, partition) in self.partitions.iter().enumerate() {
+                let pid = partition.partition_id();
+                let received = partition.markers_received();
+
+                if let Some(received_from) = received.get(&sid) {
+                    // Check each other partition sent a marker to this one
+                    for (other_idx, other_partition) in self.partitions.iter().enumerate() {
+                        if other_idx == idx {
+                            continue;
+                        }
+                        let other_pid = other_partition.partition_id();
+                        if !received_from.contains(&other_pid) {
+                            violations.push(InvariantViolation::SnapshotMarkerNotDelivered {
+                                snapshot_id: sid,
+                                sender: other_pid,
+                                expected_recipient: pid,
+                            });
+                        }
+                    }
+                } else {
+                    // No markers received at all for this snapshot — report each missing sender
+                    for (other_idx, other_partition) in self.partitions.iter().enumerate() {
+                        if other_idx == idx {
+                            continue;
+                        }
+                        violations.push(InvariantViolation::SnapshotMarkerNotDelivered {
+                            snapshot_id: sid,
+                            sender: other_partition.partition_id(),
+                            expected_recipient: pid,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Verifies that total cross-partition messages sent equals total received.
+    fn check_message_accounting(&self, violations: &mut Vec<InvariantViolation>) {
+        let mut total_sent = 0u64;
+        let mut total_received = 0u64;
+
+        for partition in &self.partitions {
+            let (sent, received) = partition.cross_partition_message_counts();
+            total_sent += sent;
+            total_received += received;
+        }
+
+        if total_sent != total_received {
+            violations.push(InvariantViolation::CrossPartitionMessageLoss {
+                total_sent,
+                total_received,
+            });
+        }
     }
 }
 
@@ -386,4 +518,12 @@ where
 pub struct ClusterSimulationOutcome {
     pub total_steps: usize,
     pub completed_snapshots: Vec<Vec<ClusterSnapshotId>>,
+    pub violations: Vec<InvariantViolation>,
+}
+
+impl ClusterSimulationOutcome {
+    /// Returns true if no invariant violations were detected.
+    pub fn is_ok(&self) -> bool {
+        self.violations.is_empty()
+    }
 }

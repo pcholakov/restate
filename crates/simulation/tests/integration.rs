@@ -874,6 +874,13 @@ async fn test_cluster_simulation() -> googletest::Result<()> {
         );
     }
 
+    // Verify cluster-level invariants (snapshot agreement, marker delivery, message accounting)
+    assert!(
+        outcome.is_ok(),
+        "Cluster invariant violations detected: {:?}",
+        outcome.violations
+    );
+
     info!("Multi-partition cluster simulation with distributed snapshot passed!");
     Ok(())
 }

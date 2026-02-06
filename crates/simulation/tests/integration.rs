@@ -933,7 +933,11 @@ async fn test_cluster_sequential_snapshots() -> googletest::Result<()> {
     }
     cluster.initiate_snapshot(ClusterSnapshotId::new(1));
     let outcome1 = cluster.run().await?;
-    assert!(outcome1.is_ok(), "Phase 1 violations: {:?}", outcome1.violations);
+    assert!(
+        outcome1.is_ok(),
+        "Phase 1 violations: {:?}",
+        outcome1.violations
+    );
 
     // Verify snapshot 1 completed on all partitions
     for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
@@ -950,7 +954,11 @@ async fn test_cluster_sequential_snapshots() -> googletest::Result<()> {
     }
     cluster.initiate_snapshot(ClusterSnapshotId::new(2));
     let outcome2 = cluster.run().await?;
-    assert!(outcome2.is_ok(), "Phase 2 violations: {:?}", outcome2.violations);
+    assert!(
+        outcome2.is_ok(),
+        "Phase 2 violations: {:?}",
+        outcome2.violations
+    );
 
     // Verify both snapshots completed on all partitions
     for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
@@ -1188,7 +1196,11 @@ async fn test_cluster_snapshot_random_scheduling() -> googletest::Result<()> {
     // Process some work, then snapshot, then more work, then another snapshot
     cluster.initiate_snapshot(ClusterSnapshotId::new(1));
     let outcome1 = cluster.run().await?;
-    assert!(outcome1.is_ok(), "Random-schedule violations: {:?}", outcome1.violations);
+    assert!(
+        outcome1.is_ok(),
+        "Random-schedule violations: {:?}",
+        outcome1.violations
+    );
 
     for _ in 0..10 {
         let invocation = cluster.partition_mut(0).random_vo_invocation();
@@ -1196,7 +1208,11 @@ async fn test_cluster_snapshot_random_scheduling() -> googletest::Result<()> {
     }
     cluster.initiate_snapshot(ClusterSnapshotId::new(2));
     let outcome2 = cluster.run().await?;
-    assert!(outcome2.is_ok(), "Random-schedule phase 2 violations: {:?}", outcome2.violations);
+    assert!(
+        outcome2.is_ok(),
+        "Random-schedule phase 2 violations: {:?}",
+        outcome2.violations
+    );
 
     // Verify both snapshots completed
     for (i, completions) in cluster.completed_snapshots().iter().enumerate() {

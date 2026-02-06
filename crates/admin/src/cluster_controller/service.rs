@@ -579,8 +579,7 @@ impl<T: TransportConnect> Service<T> {
                     TaskKind::Disposable,
                     "create-distributed-snapshot",
                     async move {
-                        let _ = response_tx
-                            .send(initiate_distributed_snapshot(bifrost).await);
+                        let _ = response_tx.send(initiate_distributed_snapshot(bifrost).await);
                         Ok(())
                     },
                 );

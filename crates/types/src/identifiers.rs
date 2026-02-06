@@ -1108,6 +1108,10 @@ impl ClusterSnapshotId {
     pub const fn new(id: u64) -> Self {
         Self(id)
     }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(

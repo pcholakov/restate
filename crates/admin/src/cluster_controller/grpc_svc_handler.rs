@@ -21,7 +21,8 @@ use tracing::info;
 use restate_bifrost::loglet::FindTailOptions;
 use restate_bifrost::{Bifrost, Error as BiforstError};
 use restate_core::protobuf::cluster_ctrl_svc::{
-    ClusterStateRequest, ClusterStateResponse, CreatePartitionSnapshotRequest,
+    ClusterStateRequest, ClusterStateResponse, CreateDistributedSnapshotRequest,
+    CreateDistributedSnapshotResponse, CreatePartitionSnapshotRequest,
     CreatePartitionSnapshotResponse, DescribeLogRequest, DescribeLogResponse, FindTailRequest,
     FindTailResponse, GetClusterConfigurationRequest, GetClusterConfigurationResponse,
     ListLogsRequest, ListLogsResponse, MigrateMetadataRequest, MigrateMetadataResponse,
@@ -222,6 +223,26 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
                 snapshot_id: snapshot_id.to_string(),
                 log_id: log_id.into(),
                 min_applied_lsn: min_applied_lsn.as_u64(),
+            })),
+        }
+    }
+
+    async fn create_distributed_snapshot(
+        &self,
+        _request: Request<CreateDistributedSnapshotRequest>,
+    ) -> Result<Response<CreateDistributedSnapshotResponse>, Status> {
+        match self
+            .controller_handle
+            .create_distributed_snapshot()
+            .await
+            .map_err(|_| Status::aborted("Node is shutting down"))?
+        {
+            Err(err) => {
+                info!("Failed to initiate distributed snapshot: {err}");
+                Err(Status::internal(err.to_string()))
+            }
+            Ok(snapshot_id) => Ok(Response::new(CreateDistributedSnapshotResponse {
+                snapshot_id: snapshot_id.as_u64(),
             })),
         }
     }

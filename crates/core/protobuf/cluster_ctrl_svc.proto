@@ -43,6 +43,9 @@ service ClusterCtrlSvc {
   rpc Query(QueryRequest) returns (stream QueryResponse);
 
   rpc MigrateMetadata(MigrateMetadataRequest) returns (MigrateMetadataResponse);
+
+  rpc CreateDistributedSnapshot(CreateDistributedSnapshotRequest)
+      returns (CreateDistributedSnapshotResponse);
 }
 
 message SetClusterConfigurationResponse {}
@@ -184,6 +187,12 @@ message QueryRequest {
 message QueryResponse {
   // arrow encoded record batch
   bytes encoded = 1;
+}
+
+message CreateDistributedSnapshotRequest {}
+
+message CreateDistributedSnapshotResponse {
+  uint64 snapshot_id = 1;
 }
 
 message MigrateMetadataRequest {

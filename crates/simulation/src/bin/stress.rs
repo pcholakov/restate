@@ -558,13 +558,9 @@ async fn run_worker_loop(
             };
             iteration_counter += 1;
 
-            let result = run_single_iteration(
-                iteration_seed,
-                num_invocations,
-                max_steps,
-                storage.clone(),
-            )
-            .await;
+            let result =
+                run_single_iteration(iteration_seed, num_invocations, max_steps, storage.clone())
+                    .await;
 
             match result {
                 Ok(steps) => {

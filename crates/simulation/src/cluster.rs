@@ -100,6 +100,24 @@ impl PartitionMailbox {
     }
 }
 
+/// Per-channel (source → target) message statistics.
+///
+/// Models the Bifrost-backed FIFO channels between partitions. In production,
+/// the shuffle reads from the source's outbox, wraps messages in envelopes
+/// with dedup info, and appends them to the target's Bifrost log. This struct
+/// tracks the equivalent message flow in the simulation.
+#[derive(Debug, Default)]
+pub struct ChannelStats {
+    /// Number of application messages routed through this channel.
+    pub app_messages: u64,
+    /// Number of snapshot markers routed through this channel.
+    pub markers: u64,
+    /// Number of outbox acks routed through this channel.
+    pub acks: u64,
+    /// Number of messages dropped by fault injection.
+    pub dropped: u64,
+}
+
 /// Multi-partition cluster simulation.
 ///
 /// Drives N partition simulations with cross-partition message routing.
@@ -116,6 +134,8 @@ pub struct ClusterSimulation<S> {
     total_steps: usize,
     /// Snapshot IDs completed by each partition (partition index → snapshot IDs).
     completed_snapshots: Vec<Vec<ClusterSnapshotId>>,
+    /// Per-channel (source → target) message statistics. Key: (source_idx, target_idx).
+    channel_stats: HashMap<(usize, usize), ChannelStats>,
     /// Round-robin cursor.
     rr_cursor: usize,
 }
@@ -220,6 +240,7 @@ where
             mailboxes,
             total_steps: 0,
             completed_snapshots: vec![Vec::new(); num],
+            channel_stats: HashMap::new(),
             rr_cursor: 0,
         }
     }
@@ -232,6 +253,11 @@ where
     /// Returns total steps executed across all partitions.
     pub fn total_steps(&self) -> usize {
         self.total_steps
+    }
+
+    /// Returns per-channel (source_idx → target_idx) message statistics.
+    pub fn channel_stats(&self) -> &HashMap<(usize, usize), ChannelStats> {
+        &self.channel_stats
     }
 
     /// Returns completed snapshot IDs per partition.
@@ -291,6 +317,9 @@ where
         for idx in 0..self.partitions.len() {
             let outbound = self.partitions[idx].drain_outbound();
             for msg in outbound {
+                let target_idx = self.partition_index(msg.target_partition_id);
+                let stats = self.channel_stats.entry((idx, target_idx)).or_default();
+
                 // Apply fault injection
                 let should_drop = match &self.config.fault_injection {
                     FaultInjection::None => false,
@@ -300,8 +329,16 @@ where
                     FaultInjection::DropAllMessages => true,
                 };
 
-                if !should_drop {
-                    let target_idx = self.partition_index(msg.target_partition_id);
+                // Classify message for per-channel tracking
+                match &msg.command {
+                    Command::SnapshotMarker { .. } => stats.markers += 1,
+                    Command::OutboxProcessedAck { .. } => stats.acks += 1,
+                    _ => stats.app_messages += 1,
+                }
+
+                if should_drop {
+                    stats.dropped += 1;
+                } else {
                     self.partitions[target_idx].record_inbound_message();
                     self.mailboxes[target_idx].messages.push_back(msg.command);
                 }
@@ -535,6 +572,10 @@ where
     }
 
     /// Verifies that total cross-partition messages sent equals total received.
+    ///
+    /// This detects any message loss, including loss caused by fault injection.
+    /// Trip wire tests rely on this to verify that the invariant checker fires
+    /// when messages are intentionally dropped.
     fn check_message_accounting(&self, violations: &mut Vec<InvariantViolation>) {
         let mut total_sent = 0u64;
         let mut total_received = 0u64;

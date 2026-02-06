@@ -46,16 +46,15 @@ impl NewOutboxMessage {
     }
 }
 
+// The shuffle still produces truncation hints on Bifrost ack, but the
+// leadership layer intentionally drops them — truncation is now driven
+// exclusively by OutboxProcessedAck from the receiver.
 #[derive(Debug)]
-pub(crate) struct OutboxTruncation(MessageIndex);
+pub(crate) struct OutboxTruncation(#[allow(dead_code)] MessageIndex);
 
 impl OutboxTruncation {
     fn new(truncation_index: MessageIndex) -> Self {
         Self(truncation_index)
-    }
-
-    pub(crate) fn index(&self) -> MessageIndex {
-        self.0
     }
 }
 

@@ -13,7 +13,7 @@ mod scheduler;
 mod scheduler_task;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use codederror::CodedError;
@@ -35,6 +35,7 @@ use restate_core::{cancellation_token, my_node_id};
 use restate_metadata_store::ReadModifyWriteError;
 use restate_storage_query_datafusion::BuildError;
 use restate_storage_query_datafusion::context::{ClusterTables, QueryContext};
+use restate_types::clock::WallClock;
 use restate_types::cluster::cluster_state::LegacyClusterState;
 use restate_types::config::{AdminOptions, Configuration};
 use restate_types::health::HealthStatus;
@@ -628,15 +629,7 @@ async fn initiate_distributed_snapshot(bifrost: Bifrost) -> anyhow::Result<Clust
     let partition_table = Metadata::with_current(|m| m.partition_table_ref());
     let num_partitions = partition_table.num_partitions() as u32;
 
-    // Generate a snapshot ID from the current wall-clock time. Using millis
-    // since epoch gives reasonable uniqueness for coordinator-initiated snapshots
-    // and is monotonically increasing under normal clock behavior.
-    let snapshot_id = ClusterSnapshotId::new(
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("clock is after epoch")
-            .as_millis() as u64,
-    );
+    let snapshot_id = ClusterSnapshotId::new(WallClock::now_ms().as_u64());
 
     info!(
         %snapshot_id,

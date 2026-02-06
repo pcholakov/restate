@@ -386,19 +386,11 @@ impl LeaderState {
                         )
                         .await?;
                 }
-                ActionEffect::Shuffle(outbox_truncation) => {
-                    // LEGACY: This truncation path fires on Bifrost ack, before the
-                    // receiver processes the message. It will be removed once
-                    // ack-based truncation (OutboxProcessedAck) is fully operational.
-                    // With the new protocol, truncation is driven by the receiver
-                    // sending an ack back through Bifrost to the sender's log.
-                    // TODO(distributed-snapshots): remove this path entirely
-                    self.self_proposer
-                        .propose(
-                            *self.partition_key_range.start(),
-                            Command::TruncateOutbox(outbox_truncation.index()),
-                        )
-                        .await?;
+                ActionEffect::Shuffle(_outbox_truncation) => {
+                    // Shuffle-driven truncation is intentionally dropped. Outbox
+                    // truncation is now driven exclusively by OutboxProcessedAck
+                    // from the receiver, which is safe for distributed snapshots
+                    // (only truncate after the receiver has applied the message).
                 }
                 ActionEffect::Timer(timer) => {
                     self.self_proposer

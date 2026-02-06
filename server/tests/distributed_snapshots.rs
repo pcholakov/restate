@@ -111,9 +111,7 @@ async fn distributed_snapshot_multi_partition() -> googletest::Result<()> {
     let PeerNetAddress::Uds(admin_uds) = admin_uds else {
         panic!("admin address must be a unix domain socket");
     };
-    let admin_client = reqwest::Client::builder()
-        .unix_socket(admin_uds)
-        .build()?;
+    let admin_client = reqwest::Client::builder().unix_socket(admin_uds).build()?;
 
     let registration_response = admin_client
         .post("http://localhost/deployments")
@@ -222,6 +220,7 @@ async fn distributed_snapshot_multi_partition() -> googletest::Result<()> {
 async fn wait_for_partition_leader(
     client: &mut ClusterCtrlSvcClient<tonic::transport::Channel>,
 ) -> googletest::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let cluster_state = client
             .get_cluster_state(ClusterStateRequest {})
@@ -240,6 +239,10 @@ async fn wait_for_partition_leader(
         }) {
             break;
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for a partition leader"
+        );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     Ok(())
@@ -265,4 +268,3 @@ async fn start_mock_service() -> googletest::Result<u16> {
     running_rx.await?;
     Ok(port)
 }
-

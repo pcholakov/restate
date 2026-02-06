@@ -716,11 +716,21 @@ impl<S> StateMachineApplyContext<'_, S> {
 
     fn on_initiate_snapshot(&mut self, snapshot_id: ClusterSnapshotId, num_partitions: u32) {
         if let Some(existing) = &self.snapshot_protocol {
-            debug!(
-                "Ignoring InitiateSnapshot({snapshot_id}): already in snapshot {}",
+            if snapshot_id <= existing.snapshot_id {
+                debug!(
+                    "Ignoring InitiateSnapshot({snapshot_id}): \
+                     already in snapshot {} (same or newer)",
+                    existing.snapshot_id
+                );
+                return;
+            }
+            // A newer snapshot supersedes the stuck older one. This handles the
+            // case where a partial coordinator write left some partitions in an
+            // incomplete snapshot that can never finish.
+            info!(
+                "Superseding stuck snapshot {} with newer {snapshot_id}",
                 existing.snapshot_id
             );
-            return;
         }
         info!("Starting distributed snapshot {snapshot_id}");
         *self.snapshot_protocol = Some(snapshot_protocol::SnapshotProtocol::new(
@@ -758,6 +768,22 @@ impl<S> StateMachineApplyContext<'_, S> {
                 debug!("SnapshotMarker({snapshot_id}, from={from_partition})");
                 protocol.record_marker(from_partition);
                 self.maybe_complete_snapshot();
+            }
+            Some(protocol) if snapshot_id > protocol.snapshot_id => {
+                // Newer snapshot supersedes the stuck older one.
+                info!(
+                    "SnapshotMarker({snapshot_id}, from={from_partition}) \
+                     supersedes stuck snapshot {}",
+                    protocol.snapshot_id
+                );
+                let mut new_protocol =
+                    snapshot_protocol::SnapshotProtocol::new(snapshot_id, num_partitions);
+                new_protocol.record_marker(from_partition);
+                *self.snapshot_protocol = Some(new_protocol);
+                self.action_collector.push(Action::BeginLocalSnapshot {
+                    snapshot_id,
+                    num_partitions,
+                });
             }
             Some(protocol) => {
                 debug!(

@@ -32,6 +32,7 @@ use restate_types::identifiers::{
 };
 use restate_types::partition_table::PartitionTable;
 use restate_types::partitions::Partition;
+use restate_wal_protocol::Command;
 use restate_worker::state_machine::Action;
 
 /// Creates a test storage setup.
@@ -1059,6 +1060,92 @@ async fn test_cluster_snapshot_during_activity() -> googletest::Result<()> {
         "Snapshot during activity test passed: {} steps, all {} partitions completed",
         outcome.total_steps, num_partitions
     );
+    Ok(())
+}
+
+/// Tests that a newer snapshot supersedes an older active one.
+///
+/// Sends InitiateSnapshot(1) to only one partition (simulating partial
+/// coordinator write), then InitiateSnapshot(2) to all. The supersede logic
+/// should allow snapshot 2 to complete even though partition 0 was stuck in
+/// snapshot 1.
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn test_cluster_snapshot_supersede() -> googletest::Result<()> {
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = PartitionStoreManager::create().await.unwrap();
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, _> = stores.into_iter().collect();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 500,
+        max_steps: 20_000,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::ImmediateSuccess,
+    );
+
+    // Inject some work
+    for _ in 0..5 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+    let _ = cluster.run().await?;
+
+    // Simulate partial coordinator write: only partition 0 gets snapshot 1
+    cluster.inject_command(
+        0,
+        Command::InitiateSnapshot {
+            snapshot_id: ClusterSnapshotId::new(1),
+            num_partitions: num_partitions as u32,
+        },
+    );
+
+    // Process a few steps so partition 0 starts snapshot 1 and sends markers
+    for _ in 0..20 {
+        if cluster.step().await?.is_none() {
+            break;
+        }
+    }
+
+    // Now initiate snapshot 2 on ALL partitions — should supersede snapshot 1
+    // on partition 0 and start fresh on partitions 1 and 2
+    cluster.initiate_snapshot(ClusterSnapshotId::new(2));
+    let outcome = cluster.run().await?;
+
+    assert!(
+        outcome.is_ok(),
+        "Snapshot supersede produced violations: {:?}",
+        outcome.violations
+    );
+
+    // Verify snapshot 2 completed on all partitions
+    for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
+        assert!(
+            completions.contains(&ClusterSnapshotId::new(2)),
+            "Partition {i} should have completed snapshot 2 (superseding 1)"
+        );
+    }
+
+    info!("Snapshot supersede test passed: all partitions completed snapshot 2");
     Ok(())
 }
 

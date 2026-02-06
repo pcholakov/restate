@@ -25,6 +25,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, instrument, warn};
 
 use restate_bifrost::Bifrost;
+use restate_bifrost::loglet::FindTailOptions;
 use restate_core::network::{Oneshot, Reciprocal, TransportConnect};
 use restate_core::{Metadata, ShutdownError, TaskCenter, TaskKind, my_node_id};
 use restate_errors::NotRunningError;
@@ -48,7 +49,7 @@ use restate_types::config::Configuration;
 use restate_types::errors::GenericError;
 use restate_types::identifiers::{LeaderEpoch, PartitionLeaderEpoch};
 use restate_types::identifiers::{PartitionKey, PartitionProcessorRpcRequestId};
-use restate_types::logs::Keys;
+use restate_types::logs::{Keys, Lsn, SequenceNumber};
 use restate_types::message::MessageIndex;
 use restate_types::net::ingest::IngestRecord;
 use restate_types::net::partition_processor::{
@@ -614,7 +615,7 @@ where
     /// source partitions via Bifrost. Acks are fire-and-forget: if delivery
     /// fails (e.g., leadership change), the sender will resend the message
     /// and we'll ack the duplicate.
-    pub fn send_pending_outbox_acks(&mut self) {
+    pub async fn send_pending_outbox_acks(&mut self) {
         let leader_state = match &mut self.state {
             State::Leader(leader_state) => leader_state,
             _ => return,
@@ -647,11 +648,151 @@ where
                 },
             );
 
-            // Fire-and-forget: we don't need to await the commit. If the ack
-            // is lost, the sender will resend the message on next leadership
-            // epoch or after restore, and we'll ack the duplicate.
-            let _ = self.ingestion_client.ingest(target_key, envelope);
+            // Fire-and-forget: we don't track the commit. If the ack is lost,
+            // the sender will resend the message on next leadership epoch or
+            // after restore, and we'll ack the duplicate.
+            let _ = self.ingestion_client.ingest(target_key, envelope).await;
         }
+    }
+
+    /// Drives the async snapshot protocol forward.
+    ///
+    /// Called after each batch commit. Progresses through phases:
+    /// NeedFlush → DrainingSelfLoop → checkpoint → send markers → Done.
+    pub async fn drive_snapshot_protocol(&mut self, applied_lsn: Lsn) -> Result<(), Error> {
+        use leader_state::SnapshotPhase;
+
+        let leader_state = match &mut self.state {
+            State::Leader(leader_state) => leader_state,
+            _ => return Ok(()),
+        };
+
+        let pending = match &mut leader_state.pending_snapshot {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        match &pending.phase {
+            SnapshotPhase::NeedFlush => {
+                let snapshot_id = pending.snapshot_id;
+                debug!(%snapshot_id, "Snapshot: flushing SelfProposer");
+
+                // TODO(distributed-snapshots): gate shuffle before flushing
+
+                // Flush: get a commit token that resolves when all previously
+                // enqueued self-proposals have been committed.
+                let commit_token = leader_state.self_proposer.notify_committed().await?;
+
+                // Wait for the flush to complete. This is typically sub-ms.
+                let _ = commit_token.await;
+
+                // After flush, all self-proposed records are committed. Get the
+                // current tail of the log — we need to process up to this point.
+                let log_id = self.partition.log_id();
+                let tail = self
+                    .bifrost
+                    .find_tail(log_id, FindTailOptions::default())
+                    .await?;
+                // target_lsn = last committed record (tail is exclusive)
+                let target_lsn = tail.offset().prev();
+
+                debug!(%snapshot_id, %target_lsn, "Snapshot: draining self-loop to target LSN");
+
+                // Update phase — re-borrow through leader_state
+                leader_state.pending_snapshot.as_mut().unwrap().phase =
+                    SnapshotPhase::DrainingSelfLoop { target_lsn };
+
+                // Fall through to check if we're already at target
+                self.try_take_snapshot(applied_lsn).await?;
+            }
+            SnapshotPhase::DrainingSelfLoop { .. } => {
+                self.try_take_snapshot(applied_lsn).await?;
+            }
+            SnapshotPhase::Done => {
+                // Cleanup
+                leader_state.pending_snapshot = None;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Checks if the self-loop drain is complete, and if so, takes the
+    /// RocksDB checkpoint, sends markers, and self-proposes LocalSnapshotTaken.
+    async fn try_take_snapshot(&mut self, applied_lsn: Lsn) -> Result<(), Error> {
+        use leader_state::SnapshotPhase;
+
+        let leader_state = match &mut self.state {
+            State::Leader(leader_state) => leader_state,
+            _ => return Ok(()),
+        };
+
+        let pending = match &leader_state.pending_snapshot {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let target_lsn = match &pending.phase {
+            SnapshotPhase::DrainingSelfLoop { target_lsn } => *target_lsn,
+            _ => return Ok(()),
+        };
+
+        if applied_lsn < target_lsn {
+            return Ok(());
+        }
+
+        let snapshot_id = pending.snapshot_id;
+        let num_partitions = pending.num_partitions;
+        let partition_id = self.partition.partition_id;
+
+        debug!(
+            %snapshot_id, %applied_lsn, %target_lsn,
+            "Snapshot: self-loop drained, taking local snapshot"
+        );
+
+        // TODO(distributed-snapshots): take RocksDB checkpoint here
+        // partition_store.create_checkpoint(...)?;
+
+        // Send SnapshotMarker to all other partitions.
+        let partition_table = Metadata::with_current(|m| m.partition_table_ref());
+        for (target_pid, target_partition) in partition_table.iter() {
+            if *target_pid == partition_id {
+                continue; // Don't send marker to ourselves
+            }
+            let target_key = *target_partition.key_range.start();
+            let envelope = Envelope::new(
+                Header {
+                    source: Source::ControlPlane {},
+                    dest: Destination::Processor {
+                        partition_key: target_key,
+                        dedup: None,
+                    },
+                },
+                Command::SnapshotMarker {
+                    snapshot_id,
+                    from_partition: partition_id,
+                    num_partitions,
+                },
+            );
+            let _ = self.ingestion_client.ingest(target_key, envelope).await;
+        }
+
+        // Self-propose LocalSnapshotTaken so the state machine transitions
+        // from WaitingForLocalSnapshot to WaitingForMarkers.
+        let pk = *self.partition.key_range.start();
+        leader_state
+            .self_proposer
+            .propose(pk, Command::LocalSnapshotTaken { snapshot_id })
+            .await?;
+
+        // TODO(distributed-snapshots): release shuffle gate
+
+        debug!(%snapshot_id, "Snapshot: markers sent, LocalSnapshotTaken proposed");
+
+        // Transition to Done — will be cleaned up on next call.
+        leader_state.pending_snapshot.as_mut().unwrap().phase = SnapshotPhase::Done;
+
+        Ok(())
     }
 
     /// Runs the leadership state tasks. This depends on the current state value:

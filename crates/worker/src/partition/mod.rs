@@ -679,7 +679,11 @@ where
                         self.last_applied_log_lsn_watch.send_replace(*lsn);
                     }
                     self.leadership_state.handle_actions(action_collector.drain(..), vqueues.view())?;
-                    self.leadership_state.send_pending_outbox_acks();
+                    self.leadership_state.send_pending_outbox_acks().await;
+                    // Drive async snapshot protocol forward.
+                    if let Some(lsn) = self.status.last_applied_log_lsn {
+                        self.leadership_state.drive_snapshot_protocol(lsn).await?;
+                    }
                 },
                 result = self.leadership_state.run(&self.state_machine, vqueues.view()) => {
                     let action_effects = result?;
@@ -1040,10 +1044,7 @@ where
         dedup_information: &DedupInformation,
         action_collector: &mut ActionCollector,
     ) {
-        if let (
-            ProducerId::Partition(source_partition_id),
-            DedupSequenceNumber::Sn(seq),
-        ) = (
+        if let (ProducerId::Partition(source_partition_id), DedupSequenceNumber::Sn(seq)) = (
             &dedup_information.producer_id,
             &dedup_information.sequence_number,
         ) {

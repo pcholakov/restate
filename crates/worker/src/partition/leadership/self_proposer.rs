@@ -210,6 +210,17 @@ impl SelfProposer {
         }
     }
 
+    /// Returns a [`CommitToken`] that resolves when all previously enqueued
+    /// records have been committed to Bifrost. Used for self-loop drain
+    /// during the distributed snapshot protocol.
+    pub async fn notify_committed(&mut self) -> Result<CommitToken, Error> {
+        self.bifrost_appender
+            .sender()
+            .notify_committed()
+            .await
+            .map_err(|e| Error::SelfProposer(e.to_string()))
+    }
+
     /// Waits for self proposer to fail. This method will only complete with an error if the self
     /// proposer has failed. There is no guarantee up to which point the self proposer has finished
     /// processing the proposed commands.

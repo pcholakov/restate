@@ -20,7 +20,7 @@ use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt, stream};
 use metrics::counter;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use restate_bifrost::CommitToken;
 use restate_core::network::{Oneshot, Reciprocal};
@@ -31,10 +31,10 @@ use restate_storage_api::vqueue_table::EntryCard;
 use restate_types::identifiers::{
     LeaderEpoch, PartitionId, PartitionKey, PartitionProcessorRpcRequestId, WithPartitionKey,
 };
-use restate_types::message::MessageIndex;
 use restate_types::invocation::PurgeInvocationRequest;
 use restate_types::invocation::client::{InvocationOutput, SubmittedInvocationNotification};
 use restate_types::logs::Keys;
+use restate_types::message::MessageIndex;
 use restate_types::net::ingest::IngestRecord;
 use restate_types::net::partition_processor::{
     PartitionProcessorRpcError, PartitionProcessorRpcResponse,
@@ -62,12 +62,35 @@ const BATCH_READY_UP_TO: usize = 10;
 type RpcReciprocal =
     Reciprocal<Oneshot<Result<PartitionProcessorRpcResponse, PartitionProcessorRpcError>>>;
 
+use restate_types::identifiers::ClusterSnapshotId;
+use restate_types::logs::Lsn;
+
 /// A pending outbox-processed ack to be sent to a source partition via Bifrost.
 #[derive(Debug)]
 pub(crate) struct PendingOutboxAck {
     pub to_partition: PartitionId,
     pub from_partition: PartitionId,
     pub seq: MessageIndex,
+}
+
+/// Tracks the async snapshot sequence in the leadership layer.
+#[derive(Debug)]
+pub(crate) struct PendingSnapshot {
+    pub snapshot_id: ClusterSnapshotId,
+    pub num_partitions: u32,
+    pub phase: SnapshotPhase,
+}
+
+/// Phases of the async local snapshot sequence.
+#[derive(Debug)]
+pub(crate) enum SnapshotPhase {
+    /// Need to gate shuffle and flush SelfProposer.
+    NeedFlush,
+    /// SelfProposer flushed; waiting for applied_lsn >= target_lsn.
+    DrainingSelfLoop { target_lsn: Lsn },
+    /// RocksDB checkpoint taken, markers sent, LocalSnapshotTaken self-proposed.
+    /// Waiting for the gate to be released (or already released).
+    Done,
 }
 
 pub struct LeaderState {
@@ -82,7 +105,7 @@ pub struct LeaderState {
     shuffle_task_handle: Option<TaskHandle<anyhow::Result<()>>>,
     pub timer_service: Pin<Box<TimerService>>,
     scheduler: SchedulerService<PartitionDb>,
-    self_proposer: SelfProposer,
+    pub(crate) self_proposer: SelfProposer,
 
     awaiting_rpc_actions: HashMap<PartitionProcessorRpcRequestId, RpcReciprocal>,
     awaiting_rpc_self_propose: FuturesUnordered<SelfAppendFuture>,
@@ -96,6 +119,9 @@ pub struct LeaderState {
 
     /// Acks buffered during synchronous handle_action, drained asynchronously.
     pub(crate) pending_outbox_acks: Vec<PendingOutboxAck>,
+
+    /// Active distributed snapshot sequence, if any.
+    pub(crate) pending_snapshot: Option<PendingSnapshot>,
 }
 
 impl LeaderState {
@@ -135,6 +161,7 @@ impl LeaderState {
             shuffle_stream: ReceiverStream::new(shuffle_rx),
             durability_tracker,
             pending_outbox_acks: Vec::new(),
+            pending_snapshot: None,
         }
     }
 
@@ -715,6 +742,22 @@ impl LeaderState {
                     from_partition,
                     seq,
                 });
+            }
+            Action::BeginLocalSnapshot {
+                snapshot_id,
+                num_partitions,
+            } => {
+                debug!(%snapshot_id, "BeginLocalSnapshot action received, \
+                    snapshot orchestration will be handled by the PP main loop");
+                self.pending_snapshot = Some(PendingSnapshot {
+                    snapshot_id,
+                    num_partitions,
+                    phase: SnapshotPhase::NeedFlush,
+                });
+            }
+            Action::SnapshotComplete { snapshot_id } => {
+                info!(%snapshot_id, "Distributed snapshot complete for this partition");
+                // TODO(distributed-snapshots): report to coordinator (A4)
             }
         }
 

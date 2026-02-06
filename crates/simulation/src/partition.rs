@@ -663,7 +663,10 @@ where
                 | Action::ForwardPurgeInvocationResponse { .. }
                 | Action::ForwardPurgeJournalResponse { .. }
                 | Action::ForwardResumeInvocationResponse { .. }
-                | Action::ForwardRestartAsNewInvocationResponse { .. } => {}
+                | Action::ForwardRestartAsNewInvocationResponse { .. }
+                | Action::BeginLocalSnapshot { .. }
+                | Action::SnapshotComplete { .. }
+                | Action::SendOutboxAck { .. } => {}
             }
         }
     }

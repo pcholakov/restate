@@ -207,11 +207,11 @@ pub enum Command {
     // -- Distributed snapshot protocol (Chandy-Lamport)
     // These are CONTROL messages: not part of any channel state, not recorded in
     // dedup tables. They flow through Bifrost for FIFO ordering guarantees.
-
     /// Coordinator initiates a cluster-wide snapshot on the target partition.
     /// The first partition to process this becomes the CL initiator.
     InitiateSnapshot {
         snapshot_id: ClusterSnapshotId,
+        num_partitions: u32,
     },
     /// Snapshot marker sent from one partition to another through Bifrost,
     /// analogous to CL marker messages. First marker triggers snapshot at
@@ -219,6 +219,13 @@ pub enum Command {
     SnapshotMarker {
         snapshot_id: ClusterSnapshotId,
         from_partition: PartitionId,
+        num_partitions: u32,
+    },
+    /// Self-proposed by the leadership layer after taking the RocksDB checkpoint
+    /// and sending markers. Transitions the protocol from WaitingForLocalSnapshot
+    /// to WaitingForMarkers.
+    LocalSnapshotTaken {
+        snapshot_id: ClusterSnapshotId,
     },
     /// Acknowledges processing of a specific outbox message. The receiver
     /// sends this back to the sender's log after processing (or dedup-rejecting)
@@ -285,6 +292,7 @@ impl HasRecordKeys for Envelope {
             // Snapshot protocol control messages target the partition by its key.
             Command::InitiateSnapshot { .. } => Keys::Single(self.partition_key()),
             Command::SnapshotMarker { .. } => Keys::Single(self.partition_key()),
+            Command::LocalSnapshotTaken { .. } => Keys::Single(self.partition_key()),
             Command::OutboxProcessedAck { .. } => Keys::Single(self.partition_key()),
         }
     }

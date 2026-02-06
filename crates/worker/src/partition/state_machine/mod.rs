@@ -11,6 +11,7 @@
 mod actions;
 mod entries;
 mod lifecycle;
+mod snapshot_protocol;
 #[cfg(feature = "test-util")]
 pub mod trip_wire;
 mod utils;
@@ -73,8 +74,8 @@ use restate_types::errors::{
     NOT_READY_INVOCATION_ERROR, WORKFLOW_ALREADY_INVOKED_INVOCATION_ERROR,
 };
 use restate_types::identifiers::{
-    AwakeableIdentifier, EntryIndex, ExternalSignalIdentifier, InvocationId, InvocationUuid,
-    PartitionKey, PartitionProcessorRpcRequestId, ServiceId,
+    AwakeableIdentifier, ClusterSnapshotId, EntryIndex, ExternalSignalIdentifier, InvocationId,
+    InvocationUuid, PartitionId, PartitionKey, PartitionProcessorRpcRequestId, ServiceId,
 };
 use restate_types::identifiers::{IdempotencyId, WithPartitionKey};
 use restate_types::invocation::client::{
@@ -153,6 +154,10 @@ pub struct StateMachine {
     pub(crate) schema: Option<Schema>,
 
     pub(crate) partition_key_range: RangeInclusive<PartitionKey>,
+
+    /// Active distributed snapshot protocol (Chandy-Lamport). At most one
+    /// snapshot is in progress at a time. Ephemeral — not persisted.
+    snapshot_protocol: Option<snapshot_protocol::SnapshotProtocol>,
 }
 
 impl Debug for StateMachine {
@@ -246,6 +251,7 @@ impl StateMachine {
             partition_key_range,
             min_restate_version,
             schema,
+            snapshot_protocol: None,
         }
     }
 }
@@ -263,6 +269,7 @@ pub(crate) struct StateMachineApplyContext<'a, S> {
     schema: &'a mut Option<Schema>,
     partition_key_range: RangeInclusive<PartitionKey>,
     is_leader: bool,
+    snapshot_protocol: &'a mut Option<snapshot_protocol::SnapshotProtocol>,
 }
 
 trait CommandHandler<CTX> {
@@ -303,6 +310,7 @@ impl StateMachine {
                 schema: &mut self.schema,
                 partition_key_range: self.partition_key_range.clone(),
                 is_leader,
+                snapshot_protocol: &mut self.snapshot_protocol,
             }
             .on_apply(command)
             .await;
@@ -674,17 +682,23 @@ impl<S> StateMachineApplyContext<'_, S> {
                 Ok(())
             }
             // -- Distributed snapshot protocol (Chandy-Lamport)
-            // Full handling implemented in A2 (OutboxProcessedAck) and A3
-            // (InitiateSnapshot, SnapshotMarker).
-            Command::InitiateSnapshot { snapshot_id } => {
-                warn!("InitiateSnapshot({snapshot_id}) not yet implemented, ignoring");
+            Command::InitiateSnapshot {
+                snapshot_id,
+                num_partitions,
+            } => {
+                self.on_initiate_snapshot(snapshot_id, num_partitions);
                 Ok(())
             }
             Command::SnapshotMarker {
                 snapshot_id,
                 from_partition,
+                num_partitions,
             } => {
-                warn!("SnapshotMarker({snapshot_id}, from={from_partition}) not yet implemented, ignoring");
+                self.on_snapshot_marker(snapshot_id, from_partition, num_partitions);
+                Ok(())
+            }
+            Command::LocalSnapshotTaken { snapshot_id } => {
+                self.on_local_snapshot_taken(snapshot_id);
                 Ok(())
             }
             Command::OutboxProcessedAck {
@@ -695,6 +709,90 @@ impl<S> StateMachineApplyContext<'_, S> {
                     .await?;
                 Ok(())
             }
+        }
+    }
+
+    // -- Distributed snapshot protocol handlers --
+
+    fn on_initiate_snapshot(&mut self, snapshot_id: ClusterSnapshotId, num_partitions: u32) {
+        if let Some(existing) = &self.snapshot_protocol {
+            debug!(
+                "Ignoring InitiateSnapshot({snapshot_id}): already in snapshot {}",
+                existing.snapshot_id
+            );
+            return;
+        }
+        info!("Starting distributed snapshot {snapshot_id}");
+        *self.snapshot_protocol = Some(snapshot_protocol::SnapshotProtocol::new(
+            snapshot_id,
+            num_partitions,
+        ));
+        self.action_collector.push(Action::BeginLocalSnapshot {
+            snapshot_id,
+            num_partitions,
+        });
+    }
+
+    fn on_snapshot_marker(
+        &mut self,
+        snapshot_id: ClusterSnapshotId,
+        from_partition: PartitionId,
+        num_partitions: u32,
+    ) {
+        match &mut *self.snapshot_protocol {
+            None => {
+                // First marker for this snapshot — treat as initiation trigger.
+                info!(
+                    "First SnapshotMarker({snapshot_id}, from={from_partition}), starting snapshot"
+                );
+                let mut protocol =
+                    snapshot_protocol::SnapshotProtocol::new(snapshot_id, num_partitions);
+                protocol.record_marker(from_partition);
+                *self.snapshot_protocol = Some(protocol);
+                self.action_collector.push(Action::BeginLocalSnapshot {
+                    snapshot_id,
+                    num_partitions,
+                });
+            }
+            Some(protocol) if protocol.snapshot_id == snapshot_id => {
+                debug!("SnapshotMarker({snapshot_id}, from={from_partition})");
+                protocol.record_marker(from_partition);
+                self.maybe_complete_snapshot();
+            }
+            Some(protocol) => {
+                debug!(
+                    "Ignoring SnapshotMarker({snapshot_id}, from={from_partition}): \
+                     active snapshot is {}",
+                    protocol.snapshot_id
+                );
+            }
+        }
+    }
+
+    fn on_local_snapshot_taken(&mut self, snapshot_id: ClusterSnapshotId) {
+        match &mut *self.snapshot_protocol {
+            Some(protocol) if protocol.snapshot_id == snapshot_id => {
+                debug!("Local snapshot taken for {snapshot_id}");
+                protocol.mark_local_snapshot_taken();
+                self.maybe_complete_snapshot();
+            }
+            _ => {
+                debug!("Ignoring LocalSnapshotTaken({snapshot_id}): no matching active snapshot");
+            }
+        }
+    }
+
+    fn maybe_complete_snapshot(&mut self) {
+        let is_complete = self
+            .snapshot_protocol
+            .as_ref()
+            .is_some_and(|p| p.is_complete());
+        if is_complete {
+            let snapshot_id = self.snapshot_protocol.as_ref().unwrap().snapshot_id;
+            info!("Distributed snapshot {snapshot_id} complete for this partition");
+            self.action_collector
+                .push(Action::SnapshotComplete { snapshot_id });
+            *self.snapshot_protocol = None;
         }
     }
 

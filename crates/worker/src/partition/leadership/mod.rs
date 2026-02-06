@@ -47,7 +47,7 @@ use restate_timer::TokioClock;
 use restate_types::cluster::cluster_state::RunMode;
 use restate_types::config::Configuration;
 use restate_types::errors::GenericError;
-use restate_types::identifiers::{LeaderEpoch, PartitionLeaderEpoch};
+use restate_types::identifiers::{LeaderEpoch, PartitionLeaderEpoch, SnapshotId};
 use restate_types::identifiers::{PartitionKey, PartitionProcessorRpcRequestId};
 use restate_types::logs::{Keys, Lsn, SequenceNumber};
 use restate_types::message::MessageIndex;
@@ -659,7 +659,11 @@ where
     ///
     /// Called after each batch commit. Progresses through phases:
     /// NeedFlush → DrainingSelfLoop → checkpoint → send markers → Done.
-    pub async fn drive_snapshot_protocol(&mut self, applied_lsn: Lsn) -> Result<(), Error> {
+    pub async fn drive_snapshot_protocol(
+        &mut self,
+        applied_lsn: Lsn,
+        partition_store: &mut PartitionStore,
+    ) -> Result<(), Error> {
         use leader_state::SnapshotPhase;
 
         let leader_state = match &mut self.state {
@@ -703,10 +707,10 @@ where
                     SnapshotPhase::DrainingSelfLoop { target_lsn };
 
                 // Fall through to check if we're already at target
-                self.try_take_snapshot(applied_lsn).await?;
+                self.try_take_snapshot(applied_lsn, partition_store).await?;
             }
             SnapshotPhase::DrainingSelfLoop { .. } => {
-                self.try_take_snapshot(applied_lsn).await?;
+                self.try_take_snapshot(applied_lsn, partition_store).await?;
             }
             SnapshotPhase::Done => {
                 // Cleanup
@@ -719,7 +723,11 @@ where
 
     /// Checks if the self-loop drain is complete, and if so, takes the
     /// RocksDB checkpoint, sends markers, and self-proposes LocalSnapshotTaken.
-    async fn try_take_snapshot(&mut self, applied_lsn: Lsn) -> Result<(), Error> {
+    async fn try_take_snapshot(
+        &mut self,
+        applied_lsn: Lsn,
+        partition_store: &mut PartitionStore,
+    ) -> Result<(), Error> {
         use leader_state::SnapshotPhase;
 
         let leader_state = match &mut self.state {
@@ -750,8 +758,23 @@ where
             "Snapshot: self-loop drained, taking local snapshot"
         );
 
-        // TODO(distributed-snapshots): take RocksDB checkpoint here
-        // partition_store.create_checkpoint(...)?;
+        // Take a RocksDB checkpoint of the partition store at this point.
+        // Note: if this fails, the error propagates up to the partition processor main loop,
+        // which will step down leadership. Dropping LeaderState closes the shuffle_gate_tx,
+        // causing the shuffle to observe Err on gate_rx.changed() and exit cleanly.
+        let snapshot_base_path = Configuration::pinned()
+            .worker
+            .storage
+            .snapshots_staging_dir();
+        let local_snapshot_id = SnapshotId::new();
+        let _local_snapshot = partition_store
+            .create_local_snapshot(&snapshot_base_path, Some(target_lsn), local_snapshot_id)
+            .await?;
+
+        debug!(
+            %snapshot_id, %local_snapshot_id, %applied_lsn,
+            "Snapshot: RocksDB checkpoint created"
+        );
 
         // Send SnapshotMarker to all other partitions.
         let partition_table = Metadata::with_current(|m| m.partition_table_ref());

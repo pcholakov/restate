@@ -682,7 +682,7 @@ where
                     self.leadership_state.send_pending_outbox_acks().await;
                     // Drive async snapshot protocol forward.
                     if let Some(lsn) = self.status.last_applied_log_lsn {
-                        self.leadership_state.drive_snapshot_protocol(lsn).await?;
+                        self.leadership_state.drive_snapshot_protocol(lsn, &mut self.partition_store).await?;
                     }
                 },
                 result = self.leadership_state.run(&self.state_machine, vqueues.view()) => {

@@ -47,6 +47,17 @@ Meta-tests in `tests/integration.rs` that inject faults to verify invariant chec
 - `z_test_snapshot_marker_drop_trip_wire`: drop snapshot markers → detects incomplete snapshots
 - `z_test_message_drop_trip_wire`: drop outbox messages → detects message loss
 
+### Snapshot Restore Validation
+
+End-to-end wipe-and-restore testing for distributed snapshots:
+- **`applied_lsn` tracking**: `PartitionSimulation` writes monotonically increasing `applied_lsn` per transaction (required for `create_local_snapshot`)
+- **Deferred checkpoint**: `take_pending_checkpoint()` creates RocksDB column-family export after snapshot drain
+- **`run_with_continuous_traffic()`**: Injects invocations during snapshot protocol execution, collects checkpoints
+- **`verify_consistent_cut()`**: Post-restore VO exclusivity + invocation state verification
+- **Spectroscope set model**: `test_snapshot_linearizability_set_model` models invocations as set elements, uses `SetFullChecker::linearizable()` to verify no phantom invocations in restored state
+- **Post-restore resume**: Constructs new `ClusterSimulation` from restored stores, injects fresh work, verifies no violations — proves snapshot is operationally viable
+- **History tracker**: `HistoryTracker` records injection/routing/checkpoint events with global step numbers
+
 ### Changes to Existing Crates
 
 - `restate-clock`: `WallClock::set_recent()` for simulation time
@@ -88,6 +99,7 @@ cargo run -p restate-simulation --bin simulation-stress --features stress-bin --
 
 ## Immediate Next Steps
 
+- Strengthen spectroscope model: track invocation completion events to use `add_ok` (committed) instead of `add_info` (indeterminate) for invocations that completed before checkpoint — enables detecting lost committed writes
 - Report snapshot completion to coordinator (currently TODO — needs metadata store or dedicated log entry)
 - Implement SDK service execution in simulator (richer invoker that models real SDK behavior)
 - Re-enable journal sequence invariant once v1/v2 table alignment is resolved

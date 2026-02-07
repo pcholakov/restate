@@ -66,6 +66,7 @@ restate-test-util = { workspace = true }
 restate-types = { workspace = true, features = ["test-util"] }
 
 googletest = { workspace = true }
+spectroscope = "0.1.0"
 tempfile = { workspace = true }
 test-log = { workspace = true }
 tracing-subscriber = { workspace = true }

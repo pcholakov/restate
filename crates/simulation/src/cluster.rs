@@ -833,6 +833,12 @@ impl ClusterSimulation<PartitionStore> {
                 if any_timer_fired {
                     continue;
                 }
+                // If the snapshot hasn't completed and we have more invocations,
+                // force-inject to keep the cluster busy rather than quiescing early.
+                if !snapshot_initiated || snapshots.len() < self.partitions.len() {
+                    steps_since_inject = inject_interval;
+                    continue;
+                }
                 break;
             };
 

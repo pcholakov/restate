@@ -8088,6 +8088,7 @@ dependencies = [
  "restate-workspace-hack",
  "serde",
  "serde_json",
+ "spectroscope",
  "tempfile",
  "test-log",
  "thiserror 2.0.17",
@@ -9472,6 +9473,15 @@ checksum = "233504af464074f9d066d7b5416c5f9b894a5862a6506e306f7b816cdd6f1807"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "spectroscope"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bffc0a17fcd309e3315d2b305eb83b125df54969eeaa8a44a97af158c485ce5"
+dependencies = [
+ "ahash",
 ]
 
 [[package]]

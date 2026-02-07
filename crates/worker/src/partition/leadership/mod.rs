@@ -789,12 +789,14 @@ where
         // Hand off the checkpoint to the PPM for upload immediately — before
         // markers — so that even if leadership is lost before SnapshotComplete,
         // the upload still happens.
-        let _ = self.distributed_snapshot_tx.send(super::DistributedSnapshotEvent {
-            cluster_snapshot_id: snapshot_id,
-            partition_id,
-            snapshot_id: local_snapshot_id,
-            local_snapshot,
-        });
+        let _ = self
+            .distributed_snapshot_tx
+            .send(super::DistributedSnapshotEvent {
+                cluster_snapshot_id: snapshot_id,
+                partition_id,
+                snapshot_id: local_snapshot_id,
+                local_snapshot,
+            });
 
         // Send SnapshotMarker to all other partitions.
         let partition_table = Metadata::with_current(|m| m.partition_table_ref());

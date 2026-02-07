@@ -22,7 +22,6 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use bytestring::ByteString;
@@ -40,6 +39,7 @@ use restate_storage_api::outbox_table::OutboxMessage;
 use restate_storage_api::service_status_table::{
     ReadVirtualObjectStatusTable, VirtualObjectStatus,
 };
+use restate_storage_api::state_table::ReadStateTable;
 use restate_storage_api::timer_table::TimerKey;
 use restate_storage_api::{Storage, Transaction};
 use restate_types::deployment::PinnedDeployment;
@@ -51,8 +51,9 @@ use restate_types::identifiers::{
 use restate_types::invocation::{InvocationTarget, ServiceInvocation, Source};
 use restate_types::journal_v2::Entry;
 use restate_types::journal_v2::command::{
-    Command as JournalCommand, OutputCommand, OutputResult, SetStateCommand,
+    Command as JournalCommand, GetEagerStateCommand, OutputCommand, OutputResult, SetStateCommand,
 };
+use restate_types::journal_v2::notification::GetStateResult;
 use restate_types::logs::{Lsn, SequenceNumber};
 use restate_types::partition_table::{FindPartition, PartitionTable};
 use restate_types::service_protocol::ServiceProtocolVersion;
@@ -147,11 +148,16 @@ pub enum InvokerBehavior {
 pub trait InvokerSimulator: std::fmt::Debug + Send + Sync {
     /// Called when an invocation should be started.
     /// Returns the sequence of commands to apply for this invocation.
+    ///
+    /// `eager_state` contains all user state for the target service ID, loaded
+    /// from the partition store before the invocation starts (mirroring how the
+    /// real invoker sends eager state in the StartMessage).
     fn on_invoke(
         &mut self,
         invocation_id: InvocationId,
         invocation_target: &InvocationTarget,
         journal: &InvokeInputJournal,
+        eager_state: &[(Bytes, Bytes)],
         rng: &mut StdRng,
         clock: &SimulationClock,
     ) -> Vec<Command>;
@@ -220,6 +226,7 @@ impl InvokerSimulator for ImmediateSuccessInvoker {
         invocation_id: InvocationId,
         _invocation_target: &InvocationTarget,
         _journal: &InvokeInputJournal,
+        _eager_state: &[(Bytes, Bytes)],
         _rng: &mut StdRng,
         _clock: &SimulationClock,
     ) -> Vec<Command> {
@@ -249,6 +256,7 @@ impl InvokerSimulator for ImmediateFailInvoker {
         invocation_id: InvocationId,
         _invocation_target: &InvocationTarget,
         _journal: &InvokeInputJournal,
+        _eager_state: &[(Bytes, Bytes)],
         _rng: &mut StdRng,
         _clock: &SimulationClock,
     ) -> Vec<Command> {
@@ -283,6 +291,7 @@ impl InvokerSimulator for ProbabilisticInvoker {
         invocation_id: InvocationId,
         _invocation_target: &InvocationTarget,
         _journal: &InvokeInputJournal,
+        _eager_state: &[(Bytes, Bytes)],
         rng: &mut StdRng,
         _clock: &SimulationClock,
     ) -> Vec<Command> {
@@ -305,17 +314,14 @@ impl InvokerSimulator for ProbabilisticInvoker {
 
 /// Shared state for [`SetServiceInvoker`] instances across partitions.
 ///
-/// The counter provides globally unique element IDs; the map records which
-/// invocation produced which element for post-restore verification.
+/// Records which invocation produced which element for post-restore verification.
 pub struct SetServiceState {
-    counter: Arc<AtomicU64>,
     elements: Arc<parking_lot::Mutex<HashMap<InvocationId, u64>>>,
 }
 
 impl Default for SetServiceState {
     fn default() -> Self {
         Self {
-            counter: Arc::new(AtomicU64::new(0)),
             elements: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
@@ -334,24 +340,59 @@ impl SetServiceState {
     /// Creates a new invoker sharing this state.
     pub fn invoker(&self) -> SetServiceInvoker {
         SetServiceInvoker {
-            counter: self.counter.clone(),
             elements: self.elements.clone(),
         }
     }
 }
 
+/// State key used by the set service to store the element array.
+const SET_STATE_KEY: &str = "value";
+
 /// Invoker simulator that models a "Set" virtual object service.
 ///
-/// Each invocation writes a unique element as a state key (`e_{element}` → element
-/// as le bytes). This avoids read-modify-write: the set of elements is the set of
-/// state keys present. After snapshot restore, reading all state keys for a ServiceId
-/// reconstructs the set.
+/// Each invocation performs a read-modify-write on a single "value" state key
+/// that contains a serialized `Vec<u64>`. The handler reads current state via
+/// eager state (passed by the simulation like the real invoker's StartMessage),
+/// appends a unique element derived from the invocation ID if not already
+/// present, and writes the updated array back.
 ///
-/// Multiple instances share state via [`SetServiceState`] for globally unique elements.
+/// This mirrors the real Restate SDK pattern:
+/// ```js
+/// let stored = (await ctx.get("value") ?? []) as number[];
+/// let set = new Set(stored);
+/// if (!set.has(value)) { stored.push(value); ctx.set("value", stored); }
+/// ```
 #[derive(Debug)]
 pub struct SetServiceInvoker {
-    counter: Arc<AtomicU64>,
     elements: Arc<parking_lot::Mutex<HashMap<InvocationId, u64>>>,
+}
+
+impl SetServiceInvoker {
+    /// Derives a stable, unique element value from an invocation ID.
+    fn element_for(invocation_id: &InvocationId) -> u64 {
+        // Use the lower 64 bits of the invocation UUID. These are generated
+        // from a seeded RNG in the simulation, so they are unique and stable
+        // across snapshot restore.
+        let bytes = invocation_id.invocation_uuid().to_bytes();
+        u64::from_le_bytes(bytes[8..16].try_into().unwrap())
+    }
+
+    /// Deserialize the "value" state key into a Vec<u64>.
+    fn deserialize_set(data: &[u8]) -> Vec<u64> {
+        // Stored as consecutive little-endian u64s.
+        data.chunks_exact(8)
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    /// Serialize a Vec<u64> into bytes for the "value" state key.
+    fn serialize_set(elements: &[u64]) -> Bytes {
+        let mut buf = Vec::with_capacity(elements.len() * 8);
+        for &e in elements {
+            buf.extend_from_slice(&e.to_le_bytes());
+        }
+        Bytes::from(buf)
+    }
 }
 
 impl InvokerSimulator for SetServiceInvoker {
@@ -360,16 +401,39 @@ impl InvokerSimulator for SetServiceInvoker {
         invocation_id: InvocationId,
         _invocation_target: &InvocationTarget,
         _journal: &InvokeInputJournal,
+        eager_state: &[(Bytes, Bytes)],
         _rng: &mut StdRng,
         _clock: &SimulationClock,
     ) -> Vec<Command> {
-        let element = self.counter.fetch_add(1, Ordering::Relaxed);
+        let element = Self::element_for(&invocation_id);
         self.elements.lock().insert(invocation_id, element);
 
-        let state_key = format!("e_{element}");
-        let state_value = element.to_le_bytes().to_vec();
+        // Read current state from eager state (like StartMessage.state_map)
+        let current_value = eager_state
+            .iter()
+            .find(|(k, _)| k.as_ref() == SET_STATE_KEY.as_bytes())
+            .map(|(_, v)| v.clone());
 
-        vec![
+        let mut stored = match current_value {
+            Some(ref data) => Self::deserialize_set(data),
+            None => Vec::new(),
+        };
+
+        // Build GetEagerState result matching what the real invoker would send
+        let get_result = match &current_value {
+            Some(data) => GetStateResult::Success(data.clone()),
+            None => GetStateResult::Void,
+        };
+
+        // Append element if not already present (set semantics)
+        let already_present = stored.contains(&element);
+        if !already_present {
+            stored.push(element);
+        }
+
+        let new_value = Self::serialize_set(&stored);
+
+        let mut commands = vec![
             // Pin deployment
             Command::InvokerEffect(Box::new(Effect {
                 invocation_id,
@@ -378,45 +442,66 @@ impl InvokerSimulator for SetServiceInvoker {
                     service_protocol_version: ServiceProtocolVersion::V5,
                 }),
             })),
-            // SetState: write element as individual state key
+            // GetEagerState: record the read (no completion needed, result is inline)
             Command::InvokerEffect(Box::new(Effect {
+                invocation_id,
+                kind: EffectKind::JournalEntryV2 {
+                    entry: StoredRawEntry::new(
+                        StoredRawEntryHeader::new(MillisSinceEpoch::UNIX_EPOCH),
+                        Entry::Command(JournalCommand::GetEagerState(GetEagerStateCommand {
+                            key: ByteString::from(SET_STATE_KEY),
+                            result: get_result,
+                            name: ByteString::new(),
+                        }))
+                        .encode::<ServiceProtocolV4Codec>(),
+                    ),
+                    command_index_to_ack: None,
+                },
+            })),
+        ];
+
+        // SetState: write the updated array (only if we actually modified it)
+        if !already_present {
+            commands.push(Command::InvokerEffect(Box::new(Effect {
                 invocation_id,
                 kind: EffectKind::JournalEntryV2 {
                     entry: StoredRawEntry::new(
                         StoredRawEntryHeader::new(MillisSinceEpoch::UNIX_EPOCH),
                         Entry::Command(JournalCommand::SetState(SetStateCommand {
-                            key: ByteString::from(state_key),
-                            value: Bytes::from(state_value),
+                            key: ByteString::from(SET_STATE_KEY),
+                            value: new_value.clone(),
                             name: ByteString::new(),
                         }))
                         .encode::<ServiceProtocolV4Codec>(),
                     ),
                     command_index_to_ack: None,
                 },
-            })),
-            // Output
-            Command::InvokerEffect(Box::new(Effect {
-                invocation_id,
-                kind: EffectKind::JournalEntryV2 {
-                    entry: StoredRawEntry::new(
-                        StoredRawEntryHeader::new(MillisSinceEpoch::UNIX_EPOCH),
-                        Entry::Command(JournalCommand::Output(OutputCommand {
-                            result: OutputResult::Success(Bytes::from(
-                                element.to_le_bytes().to_vec(),
-                            )),
-                            name: ByteString::new(),
-                        }))
-                        .encode::<ServiceProtocolV4Codec>(),
-                    ),
-                    command_index_to_ack: None,
-                },
-            })),
-            // End
-            Command::InvokerEffect(Box::new(Effect {
-                invocation_id,
-                kind: EffectKind::End,
-            })),
-        ]
+            })));
+        }
+
+        // Output
+        commands.push(Command::InvokerEffect(Box::new(Effect {
+            invocation_id,
+            kind: EffectKind::JournalEntryV2 {
+                entry: StoredRawEntry::new(
+                    StoredRawEntryHeader::new(MillisSinceEpoch::UNIX_EPOCH),
+                    Entry::Command(JournalCommand::Output(OutputCommand {
+                        result: OutputResult::Success(Bytes::from(element.to_le_bytes().to_vec())),
+                        name: ByteString::new(),
+                    }))
+                    .encode::<ServiceProtocolV4Codec>(),
+                ),
+                command_index_to_ack: None,
+            },
+        })));
+
+        // End
+        commands.push(Command::InvokerEffect(Box::new(Effect {
+            invocation_id,
+            kind: EffectKind::End,
+        })));
+
+        commands
     }
 }
 
@@ -513,7 +598,12 @@ pub struct PartitionSimulation<S> {
 #[allow(dead_code)]
 impl<S> PartitionSimulation<S>
 where
-    S: Storage + ReadInvocationStatusTable + ReadVirtualObjectStatusTable + ReadJournalTable + Send,
+    S: Storage
+        + ReadInvocationStatusTable
+        + ReadVirtualObjectStatusTable
+        + ReadJournalTable
+        + ReadStateTable
+        + Send,
 {
     /// Creates a single-partition simulation (convenience constructor).
     ///
@@ -858,8 +948,30 @@ where
         Ok(self.advance_to_next_timer_async().await?)
     }
 
+    /// Loads eager state for a virtual object invocation target.
+    async fn load_eager_state(
+        &mut self,
+        invocation_target: &InvocationTarget,
+    ) -> Vec<(Bytes, Bytes)> {
+        if let Some(key) = invocation_target.key() {
+            let service_id = ServiceId::new(invocation_target.service_name().clone(), key.clone());
+            match self.storage.get_all_user_states_for_service(&service_id) {
+                Ok(stream) => {
+                    use futures::StreamExt;
+                    stream
+                        .filter_map(|r| async { r.ok() })
+                        .collect::<Vec<_>>()
+                        .await
+                }
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Processes actions emitted by the state machine.
-    fn process_actions(&mut self, actions: &[Action]) {
+    async fn process_actions(&mut self, actions: &[Action]) {
         for action in actions {
             match action {
                 Action::Invoke {
@@ -877,10 +989,12 @@ where
                             ServiceId::new(invocation_target.service_name().clone(), key.clone());
                         self.vo_keys_touched.insert(service_id);
                     }
+                    let eager_state = self.load_eager_state(invocation_target).await;
                     let commands = self.invoker.on_invoke(
                         *invocation_id,
                         invocation_target,
                         invoke_input_journal,
+                        &eager_state,
                         &mut self.rng,
                         &self.clock,
                     );
@@ -904,10 +1018,12 @@ where
                             ServiceId::new(invocation_target.service_name().clone(), key.clone());
                         self.vo_keys_touched.insert(service_id);
                     }
+                    let eager_state = self.load_eager_state(invocation_target).await;
                     let commands = self.invoker.on_invoke(
                         *invocation_id,
                         invocation_target,
                         invoke_input_journal,
+                        &eager_state,
                         &mut self.rng,
                         &self.clock,
                     );
@@ -1264,7 +1380,7 @@ where
         transaction.commit().await?;
 
         // Process actions to generate feedback commands
-        self.process_actions(&action_collector);
+        self.process_actions(&action_collector).await;
 
         // Check invariants if enabled
         if self.config.check_invariants {

@@ -39,10 +39,7 @@ pub mod keys {
     }
 
     /// Per-partition completion key within a cluster snapshot.
-    pub fn cluster_snapshot_partition_key(
-        id: ClusterSnapshotId,
-        pid: PartitionId,
-    ) -> ByteString {
+    pub fn cluster_snapshot_partition_key(id: ClusterSnapshotId, pid: PartitionId) -> ByteString {
         ByteString::from(format!(
             "{}_{}_{}",
             CLUSTER_SNAPSHOT_PARTITION_PREFIX,

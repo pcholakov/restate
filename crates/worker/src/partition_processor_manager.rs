@@ -698,25 +698,23 @@ where
             EventKind::DistributedSnapshotUploaded {
                 cluster_snapshot_id,
                 result,
-            } => {
-                match result {
-                    Ok(()) => {
-                        debug!(
-                            %partition_id,
-                            %cluster_snapshot_id,
-                            "Distributed snapshot checkpoint uploaded and reported"
-                        );
-                    }
-                    Err(err) => {
-                        warn!(
-                            %partition_id,
-                            %cluster_snapshot_id,
-                            %err,
-                            "Failed to complete distributed snapshot checkpoint upload"
-                        );
-                    }
+            } => match result {
+                Ok(()) => {
+                    debug!(
+                        %partition_id,
+                        %cluster_snapshot_id,
+                        "Distributed snapshot checkpoint uploaded and reported"
+                    );
                 }
-            }
+                Err(err) => {
+                    warn!(
+                        %partition_id,
+                        %cluster_snapshot_id,
+                        %err,
+                        "Failed to complete distributed snapshot checkpoint upload"
+                    );
+                }
+            },
         }
     }
 
@@ -979,10 +977,7 @@ where
             .await?;
 
         // Notify partition store of the archived LSN
-        if let Some(db) = partition_store_manager
-            .get_partition_db(partition_id)
-            .await
-        {
+        if let Some(db) = partition_store_manager.get_partition_db(partition_id).await {
             db.note_archived_lsn(status.archived_lsn);
         }
 

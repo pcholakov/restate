@@ -2528,7 +2528,7 @@ async fn test_snapshot_state_linearizability() -> googletest::Result<()> {
     }
 
     // Read: scan all user state from restored stores.
-    // Filter on service name AND `e_` key prefix to avoid false positives.
+    // The SetServiceInvoker stores elements in a "value" key as consecutive le u64s.
     let read_ts: spectroscope::Timestamp = std::time::Duration::from_micros(
         concurrent_base + concurrent_elements.len() as u64 * 2 + 1000,
     )
@@ -2544,11 +2544,13 @@ async fn test_snapshot_state_linearizability() -> googletest::Result<()> {
                 key_range.clone(),
                 move |(service_id, state_key, state_value)| {
                     if *service_id.service_name == *SET_SERVICE_NAME
-                        && state_key.starts_with(b"e_")
-                        && state_value.len() == 8
+                        && state_key.as_ref() == b"value"
                     {
-                        let element = u64::from_le_bytes(state_value.try_into().unwrap());
-                        sink.lock().push(element);
+                        // Deserialize: consecutive little-endian u64s
+                        for chunk in state_value.chunks_exact(8) {
+                            let element = u64::from_le_bytes(chunk.try_into().unwrap());
+                            sink.lock().push(element);
+                        }
                     }
                     ControlFlow::Continue(())
                 },

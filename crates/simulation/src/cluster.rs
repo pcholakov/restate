@@ -204,6 +204,8 @@ pub struct ClusterSimulation<S> {
     partition_table: PartitionTable,
     partitions: Vec<PartitionSimulation<S>>,
     mailboxes: Vec<PartitionMailbox>,
+    /// Maps PartitionId → Vec index for non-zero-based partition tables.
+    pid_to_idx: HashMap<PartitionId, usize>,
     /// Total steps executed across all partitions.
     total_steps: usize,
     /// Snapshot IDs completed by each partition (partition index → snapshot IDs).
@@ -288,8 +290,10 @@ where
 
         let mut partitions = Vec::with_capacity(config.num_partitions as usize);
         let mut mailboxes = Vec::with_capacity(config.num_partitions as usize);
+        let mut pid_to_idx = HashMap::new();
 
-        for (pid, partition) in partition_table.iter() {
+        for (idx, (pid, partition)) in partition_table.iter().enumerate() {
+            pid_to_idx.insert(*pid, idx);
             let partition_config = PartitionSimulationConfig {
                 seed: config.seed.wrapping_add(u64::from(*pid)),
                 max_steps: config.max_steps,
@@ -316,6 +320,7 @@ where
             partition_table,
             partitions,
             mailboxes,
+            pid_to_idx,
             total_steps: 0,
             completed_snapshots: vec![Vec::new(); num],
             channel_stats: HashMap::new(),
@@ -462,13 +467,12 @@ where
 
     /// Maps a PartitionId to its index in the partitions vec.
     fn partition_index(&self, pid: PartitionId) -> usize {
-        let idx = u64::from(pid) as usize;
-        debug_assert!(
-            idx < self.partitions.len(),
-            "PartitionId {pid} out of range for {}-partition cluster",
-            self.partitions.len()
-        );
-        idx
+        *self.pid_to_idx.get(&pid).unwrap_or_else(|| {
+            panic!(
+                "PartitionId {pid} not found in {}-partition cluster",
+                self.partitions.len()
+            )
+        })
     }
 
     /// Picks the next partition to step based on the scheduling strategy.

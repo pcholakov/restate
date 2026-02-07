@@ -52,10 +52,9 @@ use restate_simulation::{
     ClusterSimulation, ClusterSimulationConfig, InvokerBehavior, PartitionSimulation,
     PartitionSimulationConfig, SimulationError, SimulationTrace,
 };
-use restate_types::Version;
 use restate_types::config::{Configuration, StorageOptions, set_current_config};
 use restate_types::identifiers::{ClusterSnapshotId, PartitionId, PartitionKey};
-use restate_types::partition_table::PartitionTable;
+use restate_types::partition_table::{PartitionTable, PartitionTableBuilder};
 use restate_types::partitions::Partition;
 
 #[derive(Parser)]
@@ -475,11 +474,10 @@ async fn run_worker_loop(
     let mut rng = StdRng::seed_from_u64(worker_seed);
 
     if cluster_mode {
-        // Cluster mode: open N partition stores
-        let partition_table =
-            PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+        // Cluster mode: each worker gets isolated partition IDs to avoid RocksDB collisions
+        let pid_offset = (worker_id as u16) * num_partitions;
+        let partition_table = build_offset_partition_table(num_partitions, pid_offset);
         let mut store_map = std::collections::HashMap::new();
-        // Use worker_id * num_partitions offset to avoid partition ID collisions across workers
         for (pid, partition) in partition_table.iter() {
             let store = shared
                 .manager
@@ -588,6 +586,29 @@ async fn run_worker_loop(
             }
         }
     }
+}
+
+/// Builds a partition table with IDs starting at `pid_offset` instead of 0.
+///
+/// Each worker in cluster mode needs isolated partition IDs to avoid RocksDB
+/// data corruption. The key ranges are identical to `with_equally_sized_partitions`.
+fn build_offset_partition_table(num_partitions: u16, pid_offset: u16) -> PartitionTable {
+    const KEY_RANGE_END: u128 = 1u128 << 64;
+    let num = num_partitions as u128;
+
+    let mut builder: PartitionTableBuilder = PartitionTable::default().into();
+    for idx in 0u16..num_partitions {
+        let idx128 = idx as u128;
+        let start = (idx128 * KEY_RANGE_END).div_ceil(num) as u64;
+        let end = ((idx128 + 1) * KEY_RANGE_END)
+            .div_ceil(num)
+            .saturating_sub(1) as u64;
+        let pid = PartitionId::from(idx + pid_offset);
+        builder
+            .add_partition(Partition::new(pid, start..=end))
+            .expect("partitions should not overlap");
+    }
+    builder.build()
 }
 
 /// Result type for single iteration.

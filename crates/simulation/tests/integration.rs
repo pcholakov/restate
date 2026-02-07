@@ -30,7 +30,7 @@ use restate_types::config::{Configuration, StorageOptions, set_current_config};
 use restate_types::identifiers::{
     ClusterSnapshotId, InvocationId, InvocationUuid, PartitionId, PartitionKey,
 };
-use restate_types::partition_table::PartitionTable;
+use restate_types::partition_table::{PartitionTable, PartitionTableBuilder};
 use restate_types::partitions::Partition;
 use restate_wal_protocol::Command;
 use restate_worker::state_machine::Action;
@@ -1408,6 +1408,111 @@ async fn test_cluster_snapshot_chaos() -> googletest::Result<()> {
     );
 
     info!("Chaos test passed: {num_snapshots} snapshots completed on all partitions");
+    Ok(())
+}
+
+/// Smoke test for cluster mode with offset partition IDs.
+///
+/// Verifies that a cluster simulation with non-zero-based partition IDs (like
+/// the stress binary uses for multi-worker isolation) works correctly, including
+/// cross-partition routing and snapshot protocol.
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn test_cluster_offset_partition_ids() -> googletest::Result<()> {
+    let num_partitions = 3u16;
+    let pid_offset = 6u16; // Simulates worker_id=2 in stress binary
+
+    // Build partition table with offset IDs (same key ranges as standard table)
+    const KEY_RANGE_END: u128 = 1u128 << 64;
+    let num = num_partitions as u128;
+    let mut builder: PartitionTableBuilder = PartitionTable::default().into();
+    for idx in 0u16..num_partitions {
+        let idx128 = idx as u128;
+        let start = (idx128 * KEY_RANGE_END).div_ceil(num) as u64;
+        let end = ((idx128 + 1) * KEY_RANGE_END)
+            .div_ceil(num)
+            .saturating_sub(1) as u64;
+        let pid = PartitionId::from(idx + pid_offset);
+        builder
+            .add_partition(Partition::new(pid, start..=end))
+            .unwrap();
+    }
+    let partition_table = builder.build();
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = PartitionStoreManager::create().await.unwrap();
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, _> = stores.into_iter().collect();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 4242,
+        max_steps: 5_000,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::Probabilistic {
+            success_rate: 0.6,
+            failure_rate: 0.3,
+        },
+    );
+
+    // Inject invocations and run
+    for _ in 0..30 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+
+    let outcome = cluster.run().await?;
+    assert!(
+        outcome.is_ok(),
+        "Offset-PID cluster had violations: {:?}",
+        outcome.violations
+    );
+    assert!(
+        outcome.total_steps > 0,
+        "Cluster should have executed steps"
+    );
+
+    // Take a snapshot and verify
+    cluster.initiate_snapshot(ClusterSnapshotId::new(1));
+
+    for _ in 0..15 {
+        let invocation = cluster.partition_mut(0).random_vo_invocation();
+        cluster.inject_invocation(invocation);
+    }
+
+    let outcome = cluster.run().await?;
+    assert!(
+        outcome.is_ok(),
+        "Snapshot with offset PIDs had violations: {:?}",
+        outcome.violations
+    );
+
+    // All partitions should complete the snapshot
+    for (i, completions) in cluster.completed_snapshots().iter().enumerate() {
+        assert!(
+            completions.contains(&ClusterSnapshotId::new(1)),
+            "Partition {i} (pid_offset={pid_offset}) missing snapshot"
+        );
+    }
+
+    info!(
+        "Offset partition ID test passed: {} steps, snapshot completed on all partitions",
+        outcome.total_steps
+    );
     Ok(())
 }
 

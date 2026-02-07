@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
+use std::path::Path;
 
 use bytes::Bytes;
 use bytestring::ByteString;
@@ -27,7 +28,10 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use restate_invoker_api::{Effect, EffectKind, InvokeInputJournal};
+use restate_partition_store::PartitionStore;
+use restate_partition_store::snapshots::LocalPartitionSnapshot;
 use restate_service_protocol_v4::entry_codec::ServiceProtocolV4Codec;
+use restate_storage_api::fsm_table::WriteFsmTable;
 use restate_storage_api::invocation_status_table::{InvocationStatus, ReadInvocationStatusTable};
 use restate_storage_api::journal_table_v2::ReadJournalTable;
 use restate_storage_api::outbox_table::OutboxMessage;
@@ -40,7 +44,7 @@ use restate_types::deployment::PinnedDeployment;
 use restate_types::errors::InvocationError;
 use restate_types::identifiers::{
     ClusterSnapshotId, DeploymentId, InvocationId, InvocationUuid, PartitionId, PartitionKey,
-    ServiceId, WithPartitionKey, partitioner::HashPartitioner,
+    ServiceId, SnapshotId, WithPartitionKey, partitioner::HashPartitioner,
 };
 use restate_types::invocation::{InvocationTarget, ServiceInvocation, Source};
 use restate_types::journal_v2::Entry;
@@ -369,6 +373,14 @@ pub struct PartitionSimulation<S> {
     cross_partition_messages_sent: u64,
     /// Number of cross-partition messages received (inbound from other partitions).
     cross_partition_messages_received: u64,
+    /// Monotonically increasing applied LSN, written to storage on each step.
+    /// Required for `PartitionStore::create_local_snapshot()` which fails if
+    /// no applied LSN is present.
+    applied_lsn: Lsn,
+    /// Snapshot ID awaiting a RocksDB checkpoint. Set by `begin_local_snapshot()`
+    /// when the `BeginLocalSnapshot` action fires. Consumed by
+    /// `take_pending_checkpoint()` on `PartitionStore`-backed simulations.
+    pending_snapshot_checkpoint: Option<ClusterSnapshotId>,
 }
 
 #[allow(dead_code)]
@@ -454,6 +466,8 @@ where
             markers_received: HashMap::new(),
             cross_partition_messages_sent: 0,
             cross_partition_messages_received: 0,
+            applied_lsn: Lsn::OLDEST,
+            pending_snapshot_checkpoint: None,
         }
     }
 
@@ -495,6 +509,11 @@ where
     /// Returns this partition's ID.
     pub fn partition_id(&self) -> PartitionId {
         self.config.partition_id
+    }
+
+    /// Returns the current applied LSN.
+    pub fn applied_lsn(&self) -> Lsn {
+        self.applied_lsn
     }
 
     /// Drains outbound messages destined for other partitions.
@@ -813,7 +832,11 @@ where
     /// Simulates the local snapshot sequence: take a checkpoint, send markers
     /// to all other partitions, then self-enqueue `LocalSnapshotTaken`.
     fn begin_local_snapshot(&mut self, snapshot_id: ClusterSnapshotId, num_partitions: u32) {
-        // In simulation, we skip the actual RocksDB checkpoint.
+        // Record that a checkpoint should be taken. The cluster simulation
+        // calls `take_pending_checkpoint()` after each step to create the
+        // actual RocksDB checkpoint when running with PartitionStore.
+        self.pending_snapshot_checkpoint = Some(snapshot_id);
+
         // Send SnapshotMarker to every other partition.
         let sent_to = self.markers_sent.entry(snapshot_id).or_default();
         for (target_pid, _) in self.partition_table.iter() {
@@ -1078,17 +1101,23 @@ where
         let mut action_collector = ActionCollector::default();
         let mut vqueues = VQueuesMetaMut::default();
 
+        // Advance applied LSN before applying the command (mirrors real PP behavior)
+        self.applied_lsn = self.applied_lsn.next();
+
         self.state_machine
             .apply(
                 command.clone(),
                 time,
-                Lsn::OLDEST,
+                self.applied_lsn,
                 &mut transaction,
                 &mut action_collector,
                 &mut vqueues,
                 true, // is_leader
             )
             .await?;
+
+        // Write applied LSN so create_local_snapshot() can find it
+        transaction.put_applied_lsn(self.applied_lsn)?;
 
         // Commit the transaction
         transaction.commit().await?;
@@ -1144,6 +1173,35 @@ where
             success: violations.is_empty(),
             violations,
         })
+    }
+}
+
+/// Specialized methods for `PartitionStore`-backed simulations that support
+/// actual RocksDB checkpoints.
+impl PartitionSimulation<PartitionStore> {
+    /// If a snapshot checkpoint is pending, creates an actual RocksDB checkpoint
+    /// in `snapshot_base_path` and returns the snapshot metadata. Returns `None`
+    /// if no checkpoint is pending.
+    pub async fn take_pending_checkpoint(
+        &mut self,
+        snapshot_base_path: &Path,
+    ) -> Result<Option<(ClusterSnapshotId, LocalPartitionSnapshot)>, SimulationError> {
+        let snapshot_id = match self.pending_snapshot_checkpoint.take() {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        let local_snapshot_id = SnapshotId::new();
+        let local_snapshot = self
+            .storage
+            .create_local_snapshot(
+                snapshot_base_path,
+                Some(self.applied_lsn),
+                local_snapshot_id,
+            )
+            .await?;
+
+        Ok(Some((snapshot_id, local_snapshot)))
     }
 }
 

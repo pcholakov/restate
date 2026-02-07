@@ -73,7 +73,7 @@ impl PartitionDb {
         &self.rocksdb
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn into_rocksdb(self) -> Arc<RocksDb> {
         self.rocksdb
     }
@@ -362,7 +362,7 @@ impl PartitionCell {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn reset_to_unknown(&self, guard: &mut tokio::sync::RwLockWriteGuard<'_, State>) {
         let mut durable_lsn_guard = self.durable_lsn.write();
         **guard = State::Unknown;

@@ -682,12 +682,7 @@ where
         match &pending.phase {
             SnapshotPhase::NeedFlush => {
                 let snapshot_id = pending.snapshot_id;
-                debug!(%snapshot_id, "Snapshot: gating shuffle and flushing SelfProposer");
-
-                // Gate shuffle: prevent new outbox messages from being sent
-                // to Bifrost while the snapshot is in progress. In-flight
-                // messages complete naturally.
-                let _ = leader_state.shuffle_gate_tx.send(false);
+                debug!(%snapshot_id, "Snapshot: flushing SelfProposer");
 
                 // Flush: get a commit token that resolves when all previously
                 // enqueued self-proposals have been committed.
@@ -763,6 +758,12 @@ where
             %snapshot_id, %applied_lsn, %target_lsn,
             "Snapshot: self-loop drained, taking local snapshot"
         );
+
+        // Gate shuffle just before the checkpoint. The partition processor's
+        // main loop is sequential, so no records are processed between gate
+        // close and checkpoint creation. This minimizes gate duration to just
+        // "checkpoint + markers" (sub-5ms) instead of "drain + checkpoint + markers".
+        let _ = leader_state.shuffle_gate_tx.send(false);
 
         // Take a RocksDB checkpoint of the partition store at this point.
         // Note: if this fails, the error propagates up to the partition processor main loop,

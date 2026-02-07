@@ -108,7 +108,7 @@ impl SharedState {
         };
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn drop_partition(
         &self,
         partition_id: PartitionId,
@@ -376,7 +376,7 @@ impl PartitionStoreManager {
             .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn drop_partition(
         &self,
         partition_id: PartitionId,
@@ -384,7 +384,7 @@ impl PartitionStoreManager {
         self.state.drop_partition(partition_id).await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn open_from_snapshot(
         &self,
         partition: &Partition,
@@ -397,7 +397,7 @@ impl PartitionStoreManager {
         Ok(PartitionStore::from(db))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn close_partition_store(&self, partition_id: PartitionId) {
         use crate::partition_db::State;
         let Some(cell) = self.state.partitions.read().get(&partition_id).cloned() else {

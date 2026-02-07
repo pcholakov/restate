@@ -14,15 +14,18 @@
 //! message routing and snapshot protocol coordination.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use restate_partition_store::PartitionStore;
+use restate_partition_store::snapshots::LocalPartitionSnapshot;
 use restate_storage_api::Storage;
 use restate_storage_api::invocation_status_table::ReadInvocationStatusTable;
 use restate_storage_api::journal_table_v2::ReadJournalTable;
 use restate_storage_api::service_status_table::ReadVirtualObjectStatusTable;
-use restate_types::identifiers::{ClusterSnapshotId, PartitionId, WithPartitionKey};
+use restate_types::identifiers::{ClusterSnapshotId, InvocationId, PartitionId, WithPartitionKey};
 use restate_types::invocation::ServiceInvocation;
 use restate_types::partition_table::{FindPartition, PartitionTable};
 use restate_wal_protocol::Command;
@@ -138,6 +141,8 @@ pub struct ClusterSimulation<S> {
     channel_stats: HashMap<(usize, usize), ChannelStats>,
     /// Round-robin cursor.
     rr_cursor: usize,
+    /// Invocations injected via `inject_invocation`, with their target partition.
+    injected_invocations: Vec<(InvocationId, PartitionId)>,
 }
 
 impl<S> ClusterSimulation<S>
@@ -242,6 +247,7 @@ where
             completed_snapshots: vec![Vec::new(); num],
             channel_stats: HashMap::new(),
             rr_cursor: 0,
+            injected_invocations: Vec::new(),
         }
     }
 
@@ -276,16 +282,28 @@ where
     }
 
     /// Routes an invocation to the correct partition based on its partition key.
-    pub fn inject_invocation(&mut self, invocation: ServiceInvocation) {
+    /// Returns the invocation ID and target partition for tracking.
+    pub fn inject_invocation(
+        &mut self,
+        invocation: ServiceInvocation,
+    ) -> (InvocationId, PartitionId) {
+        let invocation_id = invocation.invocation_id;
         let partition_key = invocation.partition_key();
         let target_pid = self
             .partition_table
             .find_partition_id(partition_key)
             .expect("partition key should map to a valid partition");
         let target_idx = self.partition_index(target_pid);
+        self.injected_invocations.push((invocation_id, target_pid));
         self.mailboxes[target_idx]
             .messages
             .push_back(Command::Invoke(Box::new(invocation)));
+        (invocation_id, target_pid)
+    }
+
+    /// Returns all injected invocations with their target partitions.
+    pub fn injected_invocations(&self) -> &[(InvocationId, PartitionId)] {
+        &self.injected_invocations
     }
 
     /// Initiates a distributed snapshot by sending InitiateSnapshot to all partitions.
@@ -592,6 +610,72 @@ where
                 total_received,
             });
         }
+    }
+}
+
+/// Specialized methods for `PartitionStore`-backed cluster simulations that
+/// support RocksDB checkpoint collection during snapshot runs.
+impl ClusterSimulation<PartitionStore> {
+    /// Runs the cluster simulation like [`run()`](ClusterSimulation::run), but
+    /// also collects RocksDB checkpoints for every partition that participates
+    /// in a distributed snapshot. Returns both the simulation outcome and a
+    /// map from `PartitionId` to `LocalPartitionSnapshot`.
+    pub async fn run_with_checkpoints(
+        &mut self,
+        snapshot_base_path: &Path,
+    ) -> Result<
+        (
+            ClusterSimulationOutcome,
+            HashMap<PartitionId, LocalPartitionSnapshot>,
+        ),
+        SimulationError,
+    > {
+        let mut snapshots: HashMap<PartitionId, LocalPartitionSnapshot> = HashMap::new();
+
+        loop {
+            self.deliver_mailboxes();
+
+            let mut any_timer_fired = false;
+            for partition in &mut self.partitions {
+                if !partition.has_pending_commands() && partition.advance_timers().await? {
+                    any_timer_fired = true;
+                }
+            }
+
+            if self.total_steps >= self.config.max_steps {
+                break;
+            }
+
+            let Some(idx) = self.pick_partition() else {
+                if any_timer_fired {
+                    continue;
+                }
+                break;
+            };
+
+            self.partitions[idx].step().await?;
+            self.total_steps += 1;
+
+            // Collect checkpoint if this partition has a pending one
+            if let Some((_, local_snapshot)) = self.partitions[idx]
+                .take_pending_checkpoint(snapshot_base_path)
+                .await?
+            {
+                let pid = self.partitions[idx].partition_id();
+                snapshots.insert(pid, local_snapshot);
+            }
+
+            self.route_outbound();
+        }
+
+        let violations = self.check_cluster_invariants();
+        let outcome = ClusterSimulationOutcome {
+            total_steps: self.total_steps,
+            completed_snapshots: self.completed_snapshots.clone(),
+            violations,
+        };
+
+        Ok((outcome, snapshots))
     }
 }
 

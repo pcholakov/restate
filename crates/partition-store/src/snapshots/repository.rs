@@ -360,7 +360,7 @@ impl SnapshotRepository {
         skip_all,
         fields(local_path = %local_snapshot_path.display())
     )]
-    pub(crate) async fn put(
+    pub async fn put(
         &self,
         snapshot: &PartitionSnapshotMetadata,
         local_snapshot_path: PathBuf,

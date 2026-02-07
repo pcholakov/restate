@@ -37,7 +37,7 @@ use restate_wal_protocol::Envelope;
 use crate::PartitionProcessorBuilder;
 use crate::invoker_integration::EntryEnricher;
 use crate::partition::invoker_storage_reader::InvokerStorageReader;
-use crate::partition::{ProcessorError, TargetLeaderState};
+use crate::partition::{DistributedSnapshotEvent, ProcessorError, TargetLeaderState};
 use crate::partition_processor_manager::processor_state::StartedProcessor;
 
 pub struct SpawnPartitionProcessorTask<T> {
@@ -50,6 +50,7 @@ pub struct SpawnPartitionProcessorTask<T> {
     fast_forward_lsn: Option<Lsn>,
     invoker_capacity: InvokerCapacity,
     ingestion_client: IngestionClient<T, Envelope>,
+    distributed_snapshot_tx: mpsc::UnboundedSender<DistributedSnapshotEvent>,
 }
 
 impl<T> SpawnPartitionProcessorTask<T>
@@ -67,6 +68,7 @@ where
         fast_forward_lsn: Option<Lsn>,
         invoker_capacity: InvokerCapacity,
         ingestion_client: IngestionClient<T, Envelope>,
+        distributed_snapshot_tx: mpsc::UnboundedSender<DistributedSnapshotEvent>,
     ) -> Self {
         Self {
             task_name,
@@ -78,6 +80,7 @@ where
             fast_forward_lsn,
             invoker_capacity,
             ingestion_client,
+            distributed_snapshot_tx,
         }
     }
 
@@ -106,6 +109,7 @@ where
             fast_forward_lsn,
             invoker_capacity,
             ingestion_client,
+            distributed_snapshot_tx,
         } = self;
 
         let config = configuration.pinned();
@@ -138,6 +142,7 @@ where
             watch_tx,
             invoker.handle(),
             invoker_capacity,
+            distributed_snapshot_tx,
         );
 
         let invoker_name = Arc::from(format!("invoker-{}", partition.partition_id));

@@ -11,7 +11,7 @@
 pub mod keys {
     //! Keys of values stored in the metadata store
 
-    use crate::identifiers::PartitionId;
+    use crate::identifiers::{ClusterSnapshotId, PartitionId};
     use bytestring::ByteString;
 
     // todo: remove
@@ -24,5 +24,30 @@ pub mod keys {
     pub static PARTITION_PROCESSOR_EPOCH_PREFIX: &str = "pp_epoch";
     pub fn partition_processor_epoch_key(partition_id: PartitionId) -> ByteString {
         ByteString::from(format!("{PARTITION_PROCESSOR_EPOCH_PREFIX}_{partition_id}"))
+    }
+
+    static CLUSTER_SNAPSHOT_MANIFEST_PREFIX: &str = "cluster_snapshot";
+    static CLUSTER_SNAPSHOT_PARTITION_PREFIX: &str = "cluster_snapshot_part";
+
+    /// Key for the cluster snapshot manifest in metadata store.
+    pub fn cluster_snapshot_manifest_key(id: ClusterSnapshotId) -> ByteString {
+        ByteString::from(format!(
+            "{}_{}",
+            CLUSTER_SNAPSHOT_MANIFEST_PREFIX,
+            id.as_u64()
+        ))
+    }
+
+    /// Per-partition completion key within a cluster snapshot.
+    pub fn cluster_snapshot_partition_key(
+        id: ClusterSnapshotId,
+        pid: PartitionId,
+    ) -> ByteString {
+        ByteString::from(format!(
+            "{}_{}_{}",
+            CLUSTER_SNAPSHOT_PARTITION_PREFIX,
+            id.as_u64(),
+            pid
+        ))
     }
 }

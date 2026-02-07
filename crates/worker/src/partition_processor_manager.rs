@@ -60,7 +60,7 @@ use restate_types::cluster::cluster_state::{PartitionProcessorStatus, RunMode};
 use restate_types::config::Configuration;
 use restate_types::epoch::EpochMetadata;
 use restate_types::health::HealthStatus;
-use restate_types::identifiers::SnapshotId;
+use restate_types::identifiers::{ClusterSnapshotId, SnapshotId};
 use restate_types::identifiers::{PartitionId, PartitionKey};
 use restate_types::live::Live;
 use restate_types::logs::{Lsn, SequenceNumber};
@@ -89,7 +89,7 @@ use crate::metric_definitions::{NORMAL_STOP, PARTITION_TIME_SINCE_LAST_STATUS_UP
 use crate::metric_definitions::{NUM_ACTIVE_PARTITIONS, PARTITION_APPLIED_LSN_LAG};
 use crate::metric_definitions::{NUM_PARTITIONS, SNAPSHOT_AGE};
 use crate::metric_definitions::{PARTITION_LABEL, PARTITION_STOP};
-use crate::partition::{LeadershipInfo, ProcessorError};
+use crate::partition::{DistributedSnapshotEvent, LeadershipInfo, ProcessorError};
 use crate::partition_processor_manager::processor_state::{
     LeaderEpochToken, ProcessorState, StartedProcessor,
 };
@@ -128,6 +128,9 @@ pub struct PartitionProcessorManager<T> {
     invoker_capacity: InvokerCapacity,
 
     ingestion_client: IngestionClient<T, Envelope>,
+
+    distributed_snapshot_tx: mpsc::UnboundedSender<DistributedSnapshotEvent>,
+    distributed_snapshot_rx: mpsc::UnboundedReceiver<DistributedSnapshotEvent>,
 }
 
 type SnapshotResult = Result<PartitionSnapshotStatus, SnapshotError>;
@@ -261,6 +264,7 @@ where
         );
 
         let (tx, rx) = mpsc::channel(updateable_config.pinned().worker.internal_queue_length());
+        let (ds_tx, ds_rx) = mpsc::unbounded_channel();
         Self {
             health_status,
             updateable_config,
@@ -287,6 +291,8 @@ where
             wait_for_partition_table_update: false,
             invoker_capacity,
             ingestion_client,
+            distributed_snapshot_tx: ds_tx,
+            distributed_snapshot_rx: ds_rx,
         }
     }
 
@@ -364,6 +370,9 @@ where
                             debug!("Create snapshot task panicked: {}", join_error);
                         }
                     }
+                }
+                Some(event) = self.distributed_snapshot_rx.recv() => {
+                    self.on_distributed_snapshot_event(event);
                 }
                 () = &mut replica_set_states_changed => {
                     // register for the next replica set states updates to not miss any
@@ -686,6 +695,28 @@ where
                 self.pending_snapshot_status_refreshes.remove(&partition_id);
                 // No-op: no snapshot found or error fetching status (logged upstream)
             }
+            EventKind::DistributedSnapshotUploaded {
+                cluster_snapshot_id,
+                result,
+            } => {
+                match result {
+                    Ok(()) => {
+                        debug!(
+                            %partition_id,
+                            %cluster_snapshot_id,
+                            "Distributed snapshot checkpoint uploaded and reported"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            %partition_id,
+                            %cluster_snapshot_id,
+                            %err,
+                            "Failed to complete distributed snapshot checkpoint upload"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -829,6 +860,159 @@ where
                 let _ = sender.send(self.get_state());
             }
         }
+    }
+
+    /// Handles a distributed snapshot checkpoint event from a partition processor.
+    /// Spawns a task to upload the snapshot to the repository and write the
+    /// per-partition completion key to the metadata store.
+    fn on_distributed_snapshot_event(&mut self, event: DistributedSnapshotEvent) {
+        let Some(snapshot_repository) = self.snapshot_repository.clone() else {
+            warn!(
+                partition_id = %event.partition_id,
+                cluster_snapshot_id = %event.cluster_snapshot_id,
+                "Cannot upload distributed snapshot checkpoint: no snapshot repository configured"
+            );
+            return;
+        };
+
+        let partition_id = event.partition_id;
+        let cluster_snapshot_id = event.cluster_snapshot_id;
+        let snapshot_id = event.snapshot_id;
+        let local_snapshot = event.local_snapshot;
+
+        let (node_name, cluster_name, cluster_fingerprint) = Metadata::with_current(|m| {
+            let nodes_config = m.nodes_config_ref();
+            let node_name = nodes_config
+                .find_node_by_id(m.my_node_id())
+                .expect("my node must be present")
+                .name
+                .clone();
+            (
+                node_name,
+                nodes_config.cluster_name().to_owned(),
+                nodes_config.cluster_fingerprint(),
+            )
+        });
+
+        let metadata_store_client = self.metadata_writer.raw_metadata_store_client().clone();
+
+        let partition_store_manager = self.partition_store_manager.clone();
+
+        self.asynchronous_operations
+            .build_task()
+            .name(&format!(
+                "upload-distributed-snapshot-{cluster_snapshot_id}-{partition_id}"
+            ))
+            .spawn(
+                async move {
+                    let result = Self::upload_distributed_snapshot_checkpoint(
+                        snapshot_repository,
+                        metadata_store_client,
+                        partition_store_manager,
+                        partition_id,
+                        cluster_snapshot_id,
+                        snapshot_id,
+                        local_snapshot,
+                        node_name,
+                        cluster_name,
+                        cluster_fingerprint,
+                    )
+                    .await;
+
+                    if let Err(ref err) = result {
+                        warn!(
+                            %partition_id,
+                            %cluster_snapshot_id,
+                            %err,
+                            "Failed to upload distributed snapshot checkpoint"
+                        );
+                    }
+
+                    AsynchronousEvent {
+                        partition_id,
+                        inner: EventKind::DistributedSnapshotUploaded {
+                            cluster_snapshot_id,
+                            result,
+                        },
+                    }
+                }
+                .in_current_tc(),
+            )
+            .expect("to spawn distributed snapshot upload task");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_distributed_snapshot_checkpoint(
+        snapshot_repository: SnapshotRepository,
+        metadata_store_client: MetadataStoreClient,
+        partition_store_manager: Arc<PartitionStoreManager>,
+        partition_id: PartitionId,
+        cluster_snapshot_id: ClusterSnapshotId,
+        snapshot_id: SnapshotId,
+        local_snapshot: restate_partition_store::snapshots::LocalPartitionSnapshot,
+        node_name: String,
+        cluster_name: String,
+        cluster_fingerprint: Option<restate_types::nodes_config::ClusterFingerprint>,
+    ) -> anyhow::Result<()> {
+        use restate_partition_store::snapshots::PartitionSnapshotMetadata;
+        use restate_partition_store::snapshots::SnapshotFormatVersion;
+        use restate_types::cluster_snapshot::PartitionSnapshotRecord;
+        use restate_types::metadata_store::keys::cluster_snapshot_partition_key;
+
+        let metadata = PartitionSnapshotMetadata {
+            version: SnapshotFormatVersion::V1,
+            cluster_name: cluster_name.clone(),
+            cluster_fingerprint,
+            node_name: node_name.clone(),
+            partition_id,
+            created_at: restate_clock::WallClock::recent_ms().into_timestamp(),
+            snapshot_id,
+            key_range: local_snapshot.key_range.clone(),
+            log_id: local_snapshot.log_id,
+            min_applied_lsn: local_snapshot.min_applied_lsn,
+            db_comparator_name: local_snapshot.db_comparator_name.clone(),
+            files: local_snapshot.files.clone(),
+        };
+
+        let status = snapshot_repository
+            .put(&metadata, local_snapshot.base_dir)
+            .await?;
+
+        // Notify partition store of the archived LSN
+        if let Some(db) = partition_store_manager
+            .get_partition_db(partition_id)
+            .await
+        {
+            db.note_archived_lsn(status.archived_lsn);
+        }
+
+        info!(
+            %partition_id,
+            %cluster_snapshot_id,
+            %snapshot_id,
+            archived_lsn = %status.archived_lsn,
+            "Distributed snapshot checkpoint uploaded"
+        );
+
+        // Write per-partition completion key to metadata store
+        let record = PartitionSnapshotRecord::new(
+            snapshot_id,
+            metadata.log_id,
+            metadata.min_applied_lsn,
+            metadata.key_range.clone(),
+            node_name,
+            restate_types::time::MillisSinceEpoch::now(),
+        );
+
+        metadata_store_client
+            .put(
+                cluster_snapshot_partition_key(cluster_snapshot_id, partition_id),
+                &record,
+                restate_types::metadata::Precondition::DoesNotExist,
+            )
+            .await?;
+
+        Ok(())
     }
 
     #[instrument(level = "info", skip_all, fields(partition_id = %control_processor.partition_id))]
@@ -1357,6 +1541,7 @@ where
             self.fast_forward_on_startup.remove(&partition_id),
             self.invoker_capacity.clone(),
             self.ingestion_client.clone(),
+            self.distributed_snapshot_tx.clone(),
         );
 
         self.asynchronous_operations
@@ -1509,6 +1694,10 @@ enum EventKind {
         snapshot_status: PartitionSnapshotStatus,
     },
     SnapshotStatusUpdateSkipped,
+    DistributedSnapshotUploaded {
+        cluster_snapshot_id: restate_types::identifiers::ClusterSnapshotId,
+        result: anyhow::Result<()>,
+    },
 }
 
 #[cfg(test)]

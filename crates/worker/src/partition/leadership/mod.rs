@@ -172,6 +172,7 @@ pub(crate) struct LeadershipState<T, I> {
     invoker_capacity: InvokerCapacity,
     bifrost: Bifrost,
     trim_queue: TrimQueue,
+    distributed_snapshot_tx: mpsc::UnboundedSender<super::DistributedSnapshotEvent>,
 }
 
 impl<T, I> LeadershipState<T, I>
@@ -188,6 +189,7 @@ where
         bifrost: Bifrost,
         last_seen_leader_epoch: Option<LeaderEpoch>,
         trim_queue: TrimQueue,
+        distributed_snapshot_tx: mpsc::UnboundedSender<super::DistributedSnapshotEvent>,
     ) -> Self {
         Self {
             state: State::Follower,
@@ -198,6 +200,7 @@ where
             bifrost,
             last_seen_leader_epoch,
             trim_queue,
+            distributed_snapshot_tx,
         }
     }
 
@@ -774,7 +777,7 @@ where
             .storage
             .snapshots_staging_dir();
         let local_snapshot_id = SnapshotId::new();
-        let _local_snapshot = partition_store
+        let local_snapshot = partition_store
             .create_local_snapshot(&snapshot_base_path, Some(target_lsn), local_snapshot_id)
             .await?;
 
@@ -782,6 +785,16 @@ where
             %snapshot_id, %local_snapshot_id, %applied_lsn,
             "Snapshot: RocksDB checkpoint created"
         );
+
+        // Hand off the checkpoint to the PPM for upload immediately — before
+        // markers — so that even if leadership is lost before SnapshotComplete,
+        // the upload still happens.
+        let _ = self.distributed_snapshot_tx.send(super::DistributedSnapshotEvent {
+            cluster_snapshot_id: snapshot_id,
+            partition_id,
+            snapshot_id: local_snapshot_id,
+            local_snapshot,
+        });
 
         // Send SnapshotMarker to all other partitions.
         let partition_table = Metadata::with_current(|m| m.partition_table_ref());

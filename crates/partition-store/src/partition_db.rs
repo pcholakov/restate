@@ -100,7 +100,7 @@ impl PartitionDb {
             .await
     }
 
-    pub(crate) fn note_archived_lsn(&self, archived_lsn: Lsn) -> bool {
+    pub fn note_archived_lsn(&self, archived_lsn: Lsn) -> bool {
         self.archived_lsn.send_if_modified(|current| {
             if current.as_mut().is_none_or(|c| &archived_lsn > c) {
                 *current = Some(archived_lsn);

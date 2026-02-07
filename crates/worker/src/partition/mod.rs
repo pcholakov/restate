@@ -52,7 +52,7 @@ use restate_time_util::DurationExt;
 use restate_types::cluster::cluster_state::{PartitionProcessorStatus, ReplayStatus, RunMode};
 use restate_types::config::Configuration;
 use restate_types::epoch::EpochMetadata;
-use restate_types::identifiers::LeaderEpoch;
+use restate_types::identifiers::{LeaderEpoch, PartitionId};
 use restate_types::logs::{KeyFilter, Lsn, Record, SequenceNumber};
 use restate_types::net::ingest::{
     DedupSequenceNrQueryRequest, DedupSequenceNrQueryResponse, ReceivedIngestRequest,
@@ -67,6 +67,7 @@ use restate_types::partitions::state::PartitionReplicaSetStates;
 use restate_types::retries::{RetryPolicy, with_jitter};
 use restate_types::schema::Schema;
 use restate_types::storage::StorageDecodeError;
+use restate_types::identifiers::{ClusterSnapshotId, SnapshotId};
 use restate_types::time::{MillisSinceEpoch, NanosSinceEpoch};
 use restate_types::{GenerationalNodeId, SemanticRestateVersion, Version};
 use restate_vqueues::VQueuesMetaMut;
@@ -115,6 +116,14 @@ pub enum TargetLeaderState {
     Follower,
 }
 
+/// A locally-created distributed snapshot checkpoint, ready for upload by the PPM.
+pub struct DistributedSnapshotEvent {
+    pub cluster_snapshot_id: ClusterSnapshotId,
+    pub partition_id: PartitionId,
+    pub snapshot_id: SnapshotId,
+    pub local_snapshot: restate_partition_store::snapshots::LocalPartitionSnapshot,
+}
+
 pub(super) struct PartitionProcessorBuilder<InvokerInputSender> {
     status: PartitionProcessorStatus,
     invoker_tx: InvokerInputSender,
@@ -122,6 +131,7 @@ pub(super) struct PartitionProcessorBuilder<InvokerInputSender> {
     network_svc_rx: mpsc::Receiver<ServiceMessage<PartitionLeaderService>>,
     status_watch_tx: watch::Sender<PartitionProcessorStatus>,
     invoker_capacity: InvokerCapacity,
+    distributed_snapshot_tx: mpsc::UnboundedSender<DistributedSnapshotEvent>,
 }
 
 impl<InvokerInputSender> PartitionProcessorBuilder<InvokerInputSender>
@@ -136,6 +146,7 @@ where
         status_watch_tx: watch::Sender<PartitionProcessorStatus>,
         invoker_tx: InvokerInputSender,
         invoker_capacity: InvokerCapacity,
+        distributed_snapshot_tx: mpsc::UnboundedSender<DistributedSnapshotEvent>,
     ) -> Self {
         Self {
             status,
@@ -144,6 +155,7 @@ where
             network_svc_rx,
             status_watch_tx,
             invoker_capacity,
+            distributed_snapshot_tx,
         }
     }
 
@@ -164,6 +176,7 @@ where
             status_watch_tx,
             status,
             invoker_capacity,
+            distributed_snapshot_tx,
             ..
         } = self;
 
@@ -208,6 +221,7 @@ where
             bifrost.clone(),
             last_seen_leader_epoch,
             trim_queue.clone(),
+            distributed_snapshot_tx,
         );
 
         let last_applied_log_lsn_watch = watch::Sender::new(Lsn::INVALID);

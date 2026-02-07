@@ -19,7 +19,7 @@ mod version;
 
 pub mod art;
 pub mod cluster;
-
+pub mod cluster_snapshot;
 pub mod cluster_state;
 pub mod health;
 

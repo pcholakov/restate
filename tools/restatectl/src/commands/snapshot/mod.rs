@@ -8,12 +8,15 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+mod create_cluster_snapshot;
 mod create_snapshot;
 
 use cling::prelude::*;
 
 #[derive(Run, Subcommand, Clone)]
 pub enum Snapshot {
-    /// Create.
+    /// Create a per-partition snapshot
     CreateSnapshot(create_snapshot::CreateSnapshotOpts),
+    /// Create a coordinated cluster-wide snapshot (Chandy-Lamport)
+    CreateClusterSnapshot(create_cluster_snapshot::CreateClusterSnapshotOpts),
 }

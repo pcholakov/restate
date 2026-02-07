@@ -32,11 +32,12 @@ use restate_core::network::{
 };
 use restate_core::{Metadata, MetadataWriter, ShutdownError, TaskCenter, TaskKind};
 use restate_core::{cancellation_token, my_node_id};
-use restate_metadata_store::ReadModifyWriteError;
+use restate_metadata_store::{MetadataStoreClient, ReadModifyWriteError};
 use restate_storage_query_datafusion::BuildError;
 use restate_storage_query_datafusion::context::{ClusterTables, QueryContext};
 use restate_types::clock::WallClock;
 use restate_types::cluster::cluster_state::LegacyClusterState;
+use restate_types::cluster_snapshot::ClusterSnapshotManifest;
 use restate_types::config::{AdminOptions, Configuration};
 use restate_types::health::HealthStatus;
 use restate_types::identifiers::{ClusterSnapshotId, PartitionId};
@@ -46,6 +47,9 @@ use restate_types::logs::metadata::{
     ReplicatedLogletConfig, SealMetadata, SegmentIndex,
 };
 use restate_types::logs::{self, LogId, LogletId, Lsn};
+use restate_types::metadata_store::keys::{
+    cluster_snapshot_manifest_key, cluster_snapshot_partition_key,
+};
 use restate_types::net::node::NodeState;
 use restate_types::net::partition_processor_manager::{CreateSnapshotRequest, Snapshot};
 use restate_types::nodes_config::{NodesConfiguration, StorageState};
@@ -57,7 +61,7 @@ use restate_types::partitions::state::{MembershipState, PartitionReplicaSetState
 use restate_types::protobuf::common::AdminStatus;
 use restate_types::replicated_loglet::ReplicatedLogletParams;
 use restate_types::replication::{NodeSet, NodeSetChecker, ReplicationProperty};
-use restate_types::{GenerationalNodeId, NodeId, Version};
+use restate_types::{GenerationalNodeId, NodeId, Version, Versioned};
 use restate_wal_protocol::{Command, Destination, Envelope, Header, Source};
 
 use crate::cluster_controller::cluster_state_refresher::ClusterStateRefresher;
@@ -576,11 +580,15 @@ impl<T: TransportConnect> Service<T> {
             ClusterControllerCommand::CreateDistributedSnapshot { response_tx } => {
                 info!("Create distributed snapshot command received");
                 let bifrost = self.bifrost.clone();
+                let metadata_store_client =
+                    self.metadata_writer.raw_metadata_store_client().clone();
                 let _ = TaskCenter::spawn(
                     TaskKind::Disposable,
                     "create-distributed-snapshot",
                     async move {
-                        let _ = response_tx.send(initiate_distributed_snapshot(bifrost).await);
+                        let _ = response_tx.send(
+                            initiate_distributed_snapshot(bifrost, metadata_store_client).await,
+                        );
                         Ok(())
                     },
                 );
@@ -624,9 +632,17 @@ impl<T: TransportConnect> Service<T> {
 }
 
 /// Writes `InitiateSnapshot` commands to every partition's Bifrost log, starting
-/// a Chandy-Lamport distributed snapshot across the cluster.
-async fn initiate_distributed_snapshot(bifrost: Bifrost) -> anyhow::Result<ClusterSnapshotId> {
-    let partition_table = Metadata::with_current(|m| m.partition_table_ref());
+/// a Chandy-Lamport distributed snapshot across the cluster. Also writes the
+/// initial (in-progress) `ClusterSnapshotManifest` to the metadata store.
+async fn initiate_distributed_snapshot(
+    bifrost: Bifrost,
+    metadata_store_client: MetadataStoreClient,
+) -> anyhow::Result<ClusterSnapshotId> {
+    let (partition_table, cluster_name, cluster_fingerprint) = Metadata::with_current(|m| {
+        let pt = m.partition_table_ref();
+        let nc = m.nodes_config_ref();
+        (pt, nc.cluster_name().to_owned(), nc.cluster_fingerprint())
+    });
     let num_partitions = partition_table.num_partitions() as u32;
 
     let snapshot_id = ClusterSnapshotId::new(WallClock::now_ms().as_u64());
@@ -636,6 +652,23 @@ async fn initiate_distributed_snapshot(bifrost: Bifrost) -> anyhow::Result<Clust
         num_partitions,
         "Initiating distributed snapshot across all partitions"
     );
+
+    // Write initial manifest to metadata store before sending commands to partitions.
+    let manifest = ClusterSnapshotManifest::new(
+        snapshot_id,
+        cluster_name,
+        cluster_fingerprint,
+        num_partitions,
+        (*partition_table).clone(),
+    );
+    metadata_store_client
+        .put(
+            cluster_snapshot_manifest_key(snapshot_id),
+            &manifest,
+            restate_types::metadata::Precondition::DoesNotExist,
+        )
+        .await
+        .context("Failed to write initial cluster snapshot manifest to metadata store")?;
 
     for (partition_id, partition) in partition_table.iter() {
         let log_id = partition.log_id();
@@ -665,6 +698,60 @@ async fn initiate_distributed_snapshot(bifrost: Bifrost) -> anyhow::Result<Clust
 
     info!(%snapshot_id, "Distributed snapshot initiated on all partitions");
     Ok(snapshot_id)
+}
+
+/// Aggregates per-partition completion records from the metadata store and returns
+/// the current state of the cluster snapshot manifest.
+pub(crate) async fn get_cluster_snapshot_status(
+    snapshot_id: ClusterSnapshotId,
+    metadata_store_client: &MetadataStoreClient,
+) -> anyhow::Result<ClusterSnapshotManifest> {
+    use restate_types::cluster_snapshot::PartitionSnapshotRecord;
+
+    let mut manifest: ClusterSnapshotManifest = metadata_store_client
+        .get(cluster_snapshot_manifest_key(snapshot_id))
+        .await
+        .context("Failed to read cluster snapshot manifest")?
+        .ok_or_else(|| anyhow!("Cluster snapshot manifest not found for {snapshot_id}"))?;
+
+    if manifest.is_complete() {
+        return Ok(manifest);
+    }
+
+    // Aggregate per-partition completion keys
+    let partition_ids: Vec<PartitionId> = manifest
+        .partition_table
+        .iter()
+        .map(|(pid, _)| *pid)
+        .collect();
+    for partition_id in partition_ids {
+        if manifest.partitions.contains_key(&partition_id) {
+            continue;
+        }
+        let key = cluster_snapshot_partition_key(snapshot_id, partition_id);
+        if let Some(record) = metadata_store_client
+            .get::<PartitionSnapshotRecord>(key)
+            .await
+            .context("Failed to read partition snapshot record")?
+        {
+            manifest.add_partition(partition_id, record);
+        }
+    }
+
+    if manifest.is_complete() {
+        manifest.completed_at = Some(WallClock::now_ms());
+        // Write final manifest back to metadata store
+        metadata_store_client
+            .put(
+                cluster_snapshot_manifest_key(snapshot_id),
+                &manifest,
+                restate_types::metadata::Precondition::MatchesVersion(manifest.version()),
+            )
+            .await
+            .context("Failed to update completed cluster snapshot manifest")?;
+    }
+
+    Ok(manifest)
 }
 
 async fn update_cluster_configuration(

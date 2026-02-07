@@ -25,10 +25,11 @@ use restate_core::protobuf::cluster_ctrl_svc::{
     CreateDistributedSnapshotResponse, CreatePartitionSnapshotRequest,
     CreatePartitionSnapshotResponse, DescribeLogRequest, DescribeLogResponse, FindTailRequest,
     FindTailResponse, GetClusterConfigurationRequest, GetClusterConfigurationResponse,
-    ListLogsRequest, ListLogsResponse, MigrateMetadataRequest, MigrateMetadataResponse,
-    QueryRequest, QueryResponse, SealAndExtendChainRequest, SealAndExtendChainResponse,
-    SealChainRequest, SealChainResponse, SealedSegment, SetClusterConfigurationRequest,
-    SetClusterConfigurationResponse, TailState, TrimLogRequest,
+    GetClusterSnapshotStatusRequest, GetClusterSnapshotStatusResponse, ListLogsRequest,
+    ListLogsResponse, MigrateMetadataRequest, MigrateMetadataResponse, QueryRequest, QueryResponse,
+    SealAndExtendChainRequest, SealAndExtendChainResponse, SealChainRequest, SealChainResponse,
+    SealedSegment, SetClusterConfigurationRequest, SetClusterConfigurationResponse, TailState,
+    TrimLogRequest,
     cluster_ctrl_svc_server::{ClusterCtrlSvc, ClusterCtrlSvcServer},
 };
 use restate_core::{Metadata, MetadataWriter};
@@ -245,6 +246,31 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
                 snapshot_id: snapshot_id.as_u64(),
             })),
         }
+    }
+
+    async fn get_cluster_snapshot_status(
+        &self,
+        request: Request<GetClusterSnapshotStatusRequest>,
+    ) -> Result<Response<GetClusterSnapshotStatusResponse>, Status> {
+        let snapshot_id =
+            restate_types::identifiers::ClusterSnapshotId::new(request.into_inner().snapshot_id);
+
+        let manifest = super::service::get_cluster_snapshot_status(
+            snapshot_id,
+            self.metadata_writer.raw_metadata_store_client(),
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+
+        let manifest_json = serde_json::to_vec(&manifest)
+            .map_err(|err| Status::internal(format!("Failed to serialize manifest: {err}")))?;
+
+        Ok(Response::new(GetClusterSnapshotStatusResponse {
+            is_complete: manifest.is_complete(),
+            completed_partitions: manifest.partitions.len() as u32,
+            total_partitions: manifest.num_partitions,
+            manifest_json: manifest_json.into(),
+        }))
     }
 
     async fn seal_chain(

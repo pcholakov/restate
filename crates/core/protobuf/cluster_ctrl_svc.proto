@@ -46,6 +46,9 @@ service ClusterCtrlSvc {
 
   rpc CreateDistributedSnapshot(CreateDistributedSnapshotRequest)
       returns (CreateDistributedSnapshotResponse);
+
+  rpc GetClusterSnapshotStatus(GetClusterSnapshotStatusRequest)
+      returns (GetClusterSnapshotStatusResponse);
 }
 
 message SetClusterConfigurationResponse {}
@@ -193,6 +196,18 @@ message CreateDistributedSnapshotRequest {}
 
 message CreateDistributedSnapshotResponse {
   uint64 snapshot_id = 1;
+}
+
+message GetClusterSnapshotStatusRequest {
+  uint64 snapshot_id = 1;
+}
+
+message GetClusterSnapshotStatusResponse {
+  bool is_complete = 1;
+  uint32 completed_partitions = 2;
+  uint32 total_partitions = 3;
+  // JSON-encoded ClusterSnapshotManifest
+  bytes manifest_json = 4;
 }
 
 message MigrateMetadataRequest {

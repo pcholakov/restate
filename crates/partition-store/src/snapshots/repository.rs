@@ -32,8 +32,9 @@ use url::Url;
 use restate_clock::WallClock;
 use restate_core::Metadata;
 use restate_object_store_util::create_object_store_client;
+use restate_types::cluster_snapshot::ClusterSnapshotManifest;
 use restate_types::config::SnapshotsOptions;
-use restate_types::identifiers::{PartitionId, SnapshotId};
+use restate_types::identifiers::{ClusterSnapshotId, PartitionId, SnapshotId};
 use restate_types::logs::{LogId, Lsn};
 use restate_types::nodes_config::ClusterFingerprint;
 use restate_types::time::MillisSinceEpoch;
@@ -985,6 +986,81 @@ impl SnapshotRepository {
         filename: &str,
     ) -> ObjectPath {
         self.base_prefix(snapshot_metadata).child(filename)
+    }
+
+    // --- Cluster snapshot manifest storage ---
+    // Layout: <prefix>/cluster_snapshots/<snapshot_id>/manifest.json
+
+    fn cluster_manifest_path(&self, id: ClusterSnapshotId) -> ObjectPath {
+        self.prefix
+            .child("cluster_snapshots")
+            .child(id.as_u64().to_string())
+            .child("manifest.json")
+    }
+
+    /// Store a cluster snapshot manifest in the snapshot repository.
+    pub async fn put_cluster_manifest(
+        &self,
+        manifest: &ClusterSnapshotManifest,
+    ) -> anyhow::Result<()> {
+        let path = self.cluster_manifest_path(manifest.snapshot_id);
+        let payload = PutPayload::from(
+            serde_json::to_string_pretty(manifest).context("serializing cluster manifest")?,
+        );
+        self.object_store
+            .put(&path, payload)
+            .await
+            .with_context(|| format!("writing cluster manifest to {path}"))?;
+        debug!(%path, "Stored cluster snapshot manifest");
+        Ok(())
+    }
+
+    /// Retrieve a cluster snapshot manifest from the repository, if it exists.
+    pub async fn get_cluster_manifest(
+        &self,
+        id: ClusterSnapshotId,
+    ) -> anyhow::Result<Option<ClusterSnapshotManifest>> {
+        let path = self.cluster_manifest_path(id);
+        match self.object_store.get(&path).await {
+            Ok(result) => {
+                let manifest = serde_json::from_slice(&result.bytes().await?)
+                    .with_context(|| format!("parsing cluster manifest at {path}"))?;
+                Ok(Some(manifest))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(err) => Err(err).with_context(|| format!("fetching cluster manifest from {path}")),
+        }
+    }
+
+    /// List all cluster snapshot IDs in the repository.
+    pub async fn list_cluster_manifests(&self) -> anyhow::Result<Vec<ClusterSnapshotId>> {
+        use futures::TryStreamExt;
+
+        let prefix = self.prefix.child("cluster_snapshots");
+        let listing: Vec<_> = self
+            .object_store
+            .list(Some(&prefix))
+            .try_collect()
+            .await
+            .with_context(|| format!("listing cluster manifests under {prefix}"))?;
+
+        let mut ids: Vec<ClusterSnapshotId> = listing
+            .iter()
+            .filter_map(|obj| {
+                // Path: <prefix>/cluster_snapshots/<id>/manifest.json
+                let parts: Vec<_> = obj.location.as_ref().split('/').collect();
+                // Find the segment after "cluster_snapshots"
+                parts
+                    .iter()
+                    .position(|&s| s == "cluster_snapshots")
+                    .and_then(|i| parts.get(i + 1))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(ClusterSnapshotId::new)
+            })
+            .collect();
+        ids.sort_by_key(|id| id.as_u64());
+        ids.dedup();
+        Ok(ids)
     }
 
     fn conditional_put_options(&self, version: Option<&UpdateVersion>) -> PutOptions {

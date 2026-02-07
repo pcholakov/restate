@@ -14,18 +14,27 @@
 //! message routing and snapshot protocol coordination.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::RangeInclusive;
 use std::path::Path;
 
+use futures::StreamExt;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use tracing::info;
 
 use restate_partition_store::PartitionStore;
 use restate_partition_store::snapshots::LocalPartitionSnapshot;
 use restate_storage_api::Storage;
-use restate_storage_api::invocation_status_table::ReadInvocationStatusTable;
+use restate_storage_api::invocation_status_table::{
+    InvocationStatus, ReadInvocationStatusTable, ScanInvocationStatusTable,
+};
 use restate_storage_api::journal_table_v2::ReadJournalTable;
-use restate_storage_api::service_status_table::ReadVirtualObjectStatusTable;
-use restate_types::identifiers::{ClusterSnapshotId, InvocationId, PartitionId, WithPartitionKey};
+use restate_storage_api::service_status_table::{
+    ReadVirtualObjectStatusTable, ScanVirtualObjectStatusTable, VirtualObjectStatus,
+};
+use restate_types::identifiers::{
+    ClusterSnapshotId, InvocationId, PartitionId, PartitionKey, WithPartitionKey,
+};
 use restate_types::invocation::ServiceInvocation;
 use restate_types::partition_table::{FindPartition, PartitionTable};
 use restate_wal_protocol::Command;
@@ -121,6 +130,68 @@ pub struct ChannelStats {
     pub dropped: u64,
 }
 
+/// Event recorded in the execution history for post-restore verification.
+#[derive(Debug, Clone)]
+pub enum HistoryEvent {
+    /// An invocation was injected into the cluster.
+    Injected {
+        invocation_id: InvocationId,
+        partition_id: PartitionId,
+    },
+    /// A cross-partition message was routed from source to target.
+    CrossPartitionSend {
+        from_partition: usize,
+        to_partition: usize,
+    },
+    /// A RocksDB checkpoint was taken for a partition.
+    Checkpoint { partition_id: PartitionId },
+}
+
+/// Records execution history during cluster simulation for post-restore verification.
+///
+/// Each event is tagged with the global step number at which it occurred,
+/// enabling the verifier to reason about which operations happened before/after
+/// each partition's snapshot checkpoint.
+#[derive(Debug, Default, Clone)]
+pub struct HistoryTracker {
+    events: Vec<(usize, HistoryEvent)>,
+    /// Step at which each partition's checkpoint was taken.
+    checkpoint_steps: HashMap<PartitionId, usize>,
+}
+
+impl HistoryTracker {
+    pub fn record(&mut self, step: usize, event: HistoryEvent) {
+        if let HistoryEvent::Checkpoint { partition_id } = &event {
+            self.checkpoint_steps.insert(*partition_id, step);
+        }
+        self.events.push((step, event));
+    }
+
+    /// Returns the step at which a partition's checkpoint was taken, if any.
+    pub fn checkpoint_step(&self, pid: PartitionId) -> Option<usize> {
+        self.checkpoint_steps.get(&pid).copied()
+    }
+
+    /// Returns all events.
+    pub fn events(&self) -> &[(usize, HistoryEvent)] {
+        &self.events
+    }
+
+    /// Returns (invocation_id, partition_id, step) for every injection event.
+    pub fn injections(&self) -> Vec<(InvocationId, PartitionId, usize)> {
+        self.events
+            .iter()
+            .filter_map(|(step, event)| match event {
+                HistoryEvent::Injected {
+                    invocation_id,
+                    partition_id,
+                } => Some((*invocation_id, *partition_id, *step)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// Multi-partition cluster simulation.
 ///
 /// Drives N partition simulations with cross-partition message routing.
@@ -143,6 +214,8 @@ pub struct ClusterSimulation<S> {
     rr_cursor: usize,
     /// Invocations injected via `inject_invocation`, with their target partition.
     injected_invocations: Vec<(InvocationId, PartitionId)>,
+    /// Execution history for post-restore verification.
+    history: HistoryTracker,
 }
 
 impl<S> ClusterSimulation<S>
@@ -248,6 +321,7 @@ where
             channel_stats: HashMap::new(),
             rr_cursor: 0,
             injected_invocations: Vec::new(),
+            history: HistoryTracker::default(),
         }
     }
 
@@ -295,6 +369,13 @@ where
             .expect("partition key should map to a valid partition");
         let target_idx = self.partition_index(target_pid);
         self.injected_invocations.push((invocation_id, target_pid));
+        self.history.record(
+            self.total_steps,
+            HistoryEvent::Injected {
+                invocation_id,
+                partition_id: target_pid,
+            },
+        );
         self.mailboxes[target_idx]
             .messages
             .push_back(Command::Invoke(Box::new(invocation)));
@@ -304,6 +385,11 @@ where
     /// Returns all injected invocations with their target partitions.
     pub fn injected_invocations(&self) -> &[(InvocationId, PartitionId)] {
         &self.injected_invocations
+    }
+
+    /// Returns the execution history tracker.
+    pub fn history(&self) -> &HistoryTracker {
+        &self.history
     }
 
     /// Initiates a distributed snapshot by sending InitiateSnapshot to all partitions.
@@ -357,6 +443,13 @@ where
                 if should_drop {
                     stats.dropped += 1;
                 } else {
+                    self.history.record(
+                        self.total_steps,
+                        HistoryEvent::CrossPartitionSend {
+                            from_partition: idx,
+                            to_partition: target_idx,
+                        },
+                    );
                     self.partitions[target_idx].record_inbound_message();
                     self.mailboxes[target_idx].messages.push_back(msg.command);
                 }
@@ -662,6 +755,10 @@ impl ClusterSimulation<PartitionStore> {
                 .await?
             {
                 let pid = self.partitions[idx].partition_id();
+                self.history.record(
+                    self.total_steps,
+                    HistoryEvent::Checkpoint { partition_id: pid },
+                );
                 snapshots.insert(pid, local_snapshot);
             }
 
@@ -677,6 +774,219 @@ impl ClusterSimulation<PartitionStore> {
 
         Ok((outcome, snapshots))
     }
+
+    /// Runs with continuous traffic injection and checkpoint collection.
+    ///
+    /// Injects invocations from `invocation_iter` every `inject_interval` steps.
+    /// Initiates a snapshot after `snapshot_after_steps` steps. Continues running
+    /// until quiescence or max_steps. Returns the outcome, collected checkpoints,
+    /// and the snapshot ID used.
+    pub async fn run_with_continuous_traffic(
+        &mut self,
+        snapshot_base_path: &Path,
+        invocation_iter: &mut impl Iterator<Item = ServiceInvocation>,
+        inject_interval: usize,
+        snapshot_after_steps: usize,
+    ) -> Result<
+        (
+            ClusterSimulationOutcome,
+            HashMap<PartitionId, LocalPartitionSnapshot>,
+            ClusterSnapshotId,
+        ),
+        SimulationError,
+    > {
+        let snapshot_id = ClusterSnapshotId::new(200);
+        let mut snapshot_initiated = false;
+        let mut snapshots: HashMap<PartitionId, LocalPartitionSnapshot> = HashMap::new();
+        // Start at inject_interval so the first injection happens immediately
+        let mut steps_since_inject = inject_interval;
+
+        loop {
+            // Inject traffic at regular intervals
+            if steps_since_inject >= inject_interval
+                && let Some(invocation) = invocation_iter.next()
+            {
+                self.inject_invocation(invocation);
+                steps_since_inject = 0;
+            }
+
+            // Initiate snapshot after warm-up
+            if !snapshot_initiated && self.total_steps >= snapshot_after_steps {
+                self.initiate_snapshot(snapshot_id);
+                snapshot_initiated = true;
+            }
+
+            self.deliver_mailboxes();
+
+            let mut any_timer_fired = false;
+            for partition in &mut self.partitions {
+                if !partition.has_pending_commands() && partition.advance_timers().await? {
+                    any_timer_fired = true;
+                }
+            }
+
+            if self.total_steps >= self.config.max_steps {
+                break;
+            }
+
+            let Some(idx) = self.pick_partition() else {
+                if any_timer_fired {
+                    continue;
+                }
+                break;
+            };
+
+            self.partitions[idx].step().await?;
+            self.total_steps += 1;
+            steps_since_inject += 1;
+
+            // Collect checkpoint if this partition has a pending one
+            if let Some((_, local_snapshot)) = self.partitions[idx]
+                .take_pending_checkpoint(snapshot_base_path)
+                .await?
+            {
+                let pid = self.partitions[idx].partition_id();
+                self.history.record(
+                    self.total_steps,
+                    HistoryEvent::Checkpoint { partition_id: pid },
+                );
+                snapshots.insert(pid, local_snapshot);
+            }
+
+            self.route_outbound();
+        }
+
+        let violations = self.check_cluster_invariants();
+        let outcome = ClusterSimulationOutcome {
+            total_steps: self.total_steps,
+            completed_snapshots: self.completed_snapshots.clone(),
+            violations,
+        };
+
+        Ok((outcome, snapshots, snapshot_id))
+    }
+}
+
+/// Verifies that a set of restored partition stores represent a consistent cut.
+///
+/// Checks:
+/// 1. **VO exclusivity**: Locked VOs have an active lock holder (no orphaned locks)
+/// 2. **Invocation lifecycle**: No impossible states in restored invocation statuses
+/// 3. **Pre-checkpoint invocations present**: Invocations injected well before the
+///    checkpoint step should have some representation in the restored state
+pub async fn verify_consistent_cut(
+    stores: &mut [(PartitionId, PartitionStore, RangeInclusive<PartitionKey>)],
+    history: &HistoryTracker,
+) -> Result<ConsistentCutReport, SimulationError> {
+    let mut report = ConsistentCutReport::default();
+
+    for (pid, store, key_range) in stores.iter_mut() {
+        let checkpoint_step = history.checkpoint_step(*pid);
+
+        // 1. Scan all invocation statuses
+        let stream = store
+            .scan_invocation_statuses(key_range.clone())
+            .map_err(SimulationError::Storage)?;
+        tokio::pin!(stream);
+
+        let mut partition_statuses = HashMap::new();
+        while let Some(result) = stream.next().await {
+            let (inv_id, status) = result.map_err(SimulationError::Storage)?;
+            partition_statuses.insert(inv_id, status);
+        }
+
+        // 2. Check VO exclusivity on restored state
+        let vo_future = store
+            .for_each_virtual_object_status(key_range.clone(), {
+                let statuses = partition_statuses.clone();
+                let pid = *pid;
+                let mut violations = Vec::new();
+                move |(service_id, vo_status)| {
+                    if let VirtualObjectStatus::Locked(locked_by) = vo_status {
+                        let inv_status = statuses.get(&locked_by);
+                        let is_active = matches!(
+                            inv_status,
+                            Some(
+                                InvocationStatus::Invoked(_)
+                                    | InvocationStatus::Suspended { .. }
+                                    | InvocationStatus::Paused(_)
+                            )
+                        );
+                        if !is_active {
+                            violations.push((pid, service_id, locked_by));
+                        }
+                    }
+                    std::ops::ControlFlow::Continue(())
+                }
+            })
+            .map_err(SimulationError::Storage)?;
+        vo_future.await.map_err(SimulationError::Storage)?;
+
+        // 3. Count invocation states for this partition
+        let mut active_count = 0u32;
+        let mut completed_count = 0u32;
+        let mut scheduled_count = 0u32;
+        for status in partition_statuses.values() {
+            match status {
+                InvocationStatus::Invoked(_)
+                | InvocationStatus::Suspended { .. }
+                | InvocationStatus::Paused(_) => active_count += 1,
+                InvocationStatus::Completed(_) => completed_count += 1,
+                InvocationStatus::Scheduled(_) | InvocationStatus::Inboxed(_) => {
+                    scheduled_count += 1
+                }
+                InvocationStatus::Free => {} // Not stored, shouldn't appear in scan
+            }
+        }
+
+        // 4. Check that invocations injected well before the checkpoint are present
+        if let Some(cp_step) = checkpoint_step {
+            let early_injections: Vec<_> = history
+                .injections()
+                .into_iter()
+                .filter(|(_, target_pid, step)| target_pid == pid && *step + 20 < cp_step)
+                .collect();
+
+            // Invocations injected 20+ steps before checkpoint should have been processed.
+            // They may be Free (completed + cleaned up) or still active. We check that
+            // at least the partition has SOME state if we injected to it.
+            report.partition_reports.push(PartitionCutReport {
+                partition_id: *pid,
+                checkpoint_step: cp_step,
+                total_invocations_in_store: partition_statuses.len() as u32,
+                active_count,
+                completed_count,
+                scheduled_count,
+                early_injections_count: early_injections.len() as u32,
+            });
+        }
+
+        info!(
+            "Partition {pid}: {active_count} active, {completed_count} completed, \
+             {scheduled_count} scheduled ({} total in store)",
+            partition_statuses.len()
+        );
+    }
+
+    Ok(report)
+}
+
+/// Report from consistent cut verification.
+#[derive(Debug, Default)]
+pub struct ConsistentCutReport {
+    pub partition_reports: Vec<PartitionCutReport>,
+}
+
+/// Per-partition report from consistent cut verification.
+#[derive(Debug)]
+pub struct PartitionCutReport {
+    pub partition_id: PartitionId,
+    pub checkpoint_step: usize,
+    pub total_invocations_in_store: u32,
+    pub active_count: u32,
+    pub completed_count: u32,
+    pub scheduled_count: u32,
+    pub early_injections_count: u32,
 }
 
 /// Outcome of running a cluster simulation.

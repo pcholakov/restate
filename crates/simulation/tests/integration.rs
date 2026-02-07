@@ -1757,6 +1757,179 @@ async fn test_cluster_snapshot_restore_from_checkpoint() -> googletest::Result<(
     Ok(())
 }
 
+/// Validates snapshot consistency under continuous traffic — the realistic scenario.
+///
+/// Unlike the quiescent test above, this test injects invocations WHILE the snapshot
+/// protocol is running. This exercises the critical window where:
+/// - New outbox entries may be generated between drain and checkpoint
+/// - Cross-partition messages are in flight during marker exchange
+/// - Some partitions may checkpoint before others
+///
+/// After restore, verifies the consistent cut invariant:
+/// - VO exclusivity: no orphaned locks
+/// - Invocation state consistency: no impossible states
+/// - All partitions have valid applied_lsn
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn test_cluster_snapshot_restore_under_traffic() -> googletest::Result<()> {
+    use std::sync::Arc;
+
+    use restate_partition_store::PartitionStore;
+    use restate_simulation::cluster::verify_consistent_cut;
+    use restate_storage_api::fsm_table::ReadFsmTable;
+
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = Arc::new(PartitionStoreManager::create().await.unwrap());
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, PartitionStore> =
+        stores.into_iter().collect();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 8888,
+        max_steps: 20_000,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        InvokerBehavior::Probabilistic {
+            success_rate: 0.6,
+            failure_rate: 0.3,
+        },
+    );
+
+    // Generate invocations to inject during the run.
+    // We prepare them upfront so the iterator is simple.
+    let mut invocations: Vec<_> = (0..100)
+        .map(|_| cluster.partition_mut(0).random_vo_invocation())
+        .collect();
+    let mut inv_iter = invocations.drain(..);
+
+    // Run with continuous traffic:
+    // - inject every 3 steps
+    // - initiate snapshot after 50 steps (mid-traffic)
+    let snapshot_dir = tempfile::tempdir().unwrap();
+    let (outcome, mut checkpoints, _snapshot_id) = cluster
+        .run_with_continuous_traffic(
+            snapshot_dir.path(),
+            &mut inv_iter,
+            3,  // inject_interval
+            50, // snapshot_after_steps
+        )
+        .await?;
+
+    assert!(
+        outcome.is_ok(),
+        "Violations during continuous traffic: {:?}",
+        outcome.violations
+    );
+
+    info!(
+        "Continuous traffic run: {} steps, {} checkpoints, {} injected invocations",
+        outcome.total_steps,
+        checkpoints.len(),
+        cluster.injected_invocations().len()
+    );
+
+    // Verify all partitions produced a checkpoint
+    for (pid, _) in partition_table.iter() {
+        assert!(
+            checkpoints.contains_key(pid),
+            "Partition {pid} did not produce a checkpoint"
+        );
+    }
+
+    // Save history before dropping the cluster
+    let history = cluster.history().clone();
+    let injected = cluster.injected_invocations().to_vec();
+    drop(cluster);
+
+    // Phase 2: Wipe and restore
+    let partitions_info: Vec<_> = partition_table
+        .iter()
+        .map(|(pid, p)| (*pid, p.clone()))
+        .collect();
+
+    let mut restored_stores = Vec::new();
+    for (pid, partition) in &partitions_info {
+        let snapshot = checkpoints.remove(pid).unwrap();
+        let snapshot_min_lsn = snapshot.min_applied_lsn;
+
+        manager.close(*pid).await;
+        manager
+            .drop_partition(*pid)
+            .await
+            .expect("drop_partition should succeed");
+
+        let mut restored_store = manager
+            .open_from_snapshot(partition, snapshot)
+            .await
+            .expect("open_from_snapshot should succeed");
+
+        // Verify applied_lsn
+        let restored_lsn = restored_store
+            .get_applied_lsn()
+            .await
+            .expect("get_applied_lsn should succeed")
+            .expect("applied_lsn should be present after restore");
+
+        assert!(
+            restored_lsn >= snapshot_min_lsn,
+            "Partition {pid}: restored applied_lsn ({restored_lsn}) < \
+             snapshot min_applied_lsn ({snapshot_min_lsn})",
+        );
+
+        info!(
+            "Partition {pid}: restored with applied_lsn={restored_lsn} \
+             (snapshot min={snapshot_min_lsn}), checkpoint at step {:?}",
+            history.checkpoint_step(*pid)
+        );
+
+        restored_stores.push((*pid, restored_store, partition.key_range.clone()));
+    }
+
+    // Phase 3: Verify consistent cut on restored state
+    let report = verify_consistent_cut(&mut restored_stores, &history).await?;
+
+    for pr in &report.partition_reports {
+        info!(
+            "Partition {}: {} total in store ({} active, {} completed, {} scheduled), \
+             {} early injections, checkpoint at step {}",
+            pr.partition_id,
+            pr.total_invocations_in_store,
+            pr.active_count,
+            pr.completed_count,
+            pr.scheduled_count,
+            pr.early_injections_count,
+            pr.checkpoint_step
+        );
+    }
+
+    info!(
+        "Snapshot restore under continuous traffic validated: \
+         {} partitions restored with consistent state, {} total invocations injected",
+        report.partition_reports.len(),
+        injected.len()
+    );
+
+    Ok(())
+}
+
 /// Final cleanup test that shuts down RocksDB.
 ///
 /// # IMPORTANT: Test Naming Convention

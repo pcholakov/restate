@@ -822,6 +822,21 @@ impl Chain {
         Self { chain }
     }
 
+    /// Create a chain that is born sealed at `sealed_at`.
+    ///
+    /// The resulting chain has a single sealed segment at `sealed_at`. The Bifrost logs
+    /// controller will replace this marker with a new segment using the configured
+    /// provider. Used during cluster snapshot restore where the partition store already
+    /// contains data up to `sealed_at - 1`.
+    pub fn new_sealed(sealed_at: Lsn, metadata: &SealMetadata) -> Result<Self, serde_json::Error> {
+        let mut chain = BTreeMap::new();
+        chain.insert(
+            sealed_at,
+            LogletConfig::new_sealed(SegmentIndex::default(), metadata)?,
+        );
+        Ok(Self { chain })
+    }
+
     /// Returns the sealed tail if the chain is sealed.
     pub fn sealed_tail(&self) -> Option<Lsn> {
         if let Some((&lsn, config)) = self.chain.last_key_value()

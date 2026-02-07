@@ -54,6 +54,12 @@ pub struct ProvisionOpts {
     /// It's recommended to leave it unset (defaults to 0)
     #[clap(long)]
     log_default_nodeset_size: Option<u16>,
+
+    /// Restore cluster from a cluster snapshot. Takes a ClusterSnapshotId.
+    /// The partition table will be derived from the snapshot manifest.
+    /// The snapshot repository must be accessible from the provisioning node.
+    #[clap(long)]
+    from_cluster_snapshot: Option<u64>,
 }
 
 async fn provision_cluster(
@@ -99,6 +105,7 @@ async fn provision_cluster(
             .map(|provider| provider.to_string()),
         log_replication,
         target_nodeset_size: provision_opts.log_default_nodeset_size.map(Into::into),
+        from_cluster_snapshot_id: provision_opts.from_cluster_snapshot,
     };
 
     let response = match client.provision_cluster(request).await {
@@ -163,6 +170,7 @@ async fn provision_cluster(
         log_provider,
         log_replication,
         target_nodeset_size,
+        from_cluster_snapshot_id: provision_opts.from_cluster_snapshot,
     };
 
     match client.provision_cluster(request).await {

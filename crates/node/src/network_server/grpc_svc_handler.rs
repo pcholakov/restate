@@ -167,6 +167,8 @@ impl NodeCtlSvc for NodeCtlSvcHandler {
         let config = Configuration::pinned();
 
         let dry_run = request.dry_run;
+        let from_cluster_snapshot_id = request.from_cluster_snapshot_id;
+
         let cluster_configuration = Self::resolve_cluster_configuration(&config, request)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
@@ -176,10 +178,55 @@ impl NodeCtlSvc for NodeCtlSvcHandler {
             )));
         }
 
+        // If restoring from a cluster snapshot, load the manifest so the new
+        // cluster preserves the same partition layout and log LSN offsets.
+        let snapshot_manifest = if let Some(snapshot_id) = from_cluster_snapshot_id {
+            use restate_partition_store::snapshots::SnapshotRepository;
+            use restate_types::identifiers::ClusterSnapshotId;
+
+            let repository = SnapshotRepository::new_from_config(
+                &config.worker.snapshots,
+                config.worker.storage.snapshots_staging_dir(),
+            )
+            .await
+            .map_err(|err| {
+                Status::internal(format!("Failed to create snapshot repository: {err}"))
+            })?
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "Snapshot repository is not configured; \
+                     set `worker.snapshots.destination` to restore from a cluster snapshot",
+                )
+            })?;
+
+            let id = ClusterSnapshotId::new(snapshot_id);
+            let manifest = repository
+                .get_cluster_manifest(id)
+                .await
+                .map_err(|err| Status::internal(format!("Failed to load cluster manifest: {err}")))?
+                .ok_or_else(|| {
+                    Status::not_found(format!("Cluster snapshot manifest not found for {id}"))
+                })?;
+
+            if !manifest.is_complete() {
+                return Err(Status::failed_precondition(format!(
+                    "Cluster snapshot {} is not complete ({}/{} partitions)",
+                    snapshot_id,
+                    manifest.partitions.len(),
+                    manifest.num_partitions,
+                )));
+            }
+
+            Some(manifest)
+        } else {
+            None
+        };
+
         let newly_provisioned = provision_cluster_metadata(
             &self.metadata_writer,
             &config.common,
             &cluster_configuration,
+            snapshot_manifest.as_ref(),
         )
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
@@ -189,6 +236,14 @@ impl NodeCtlSvc for NodeCtlSvcHandler {
                 "The cluster has already been provisioned",
             ));
         }
+
+        // TODO(Phase 5 follow-up): After provisioning metadata, download and import
+        // each partition's snapshot from the repository into local RocksDB storage.
+        // This requires PartitionStoreManager access, which is not available during
+        // provisioning. Options:
+        // 1. Perform snapshot import as a post-provisioning step during node startup
+        // 2. Add a separate `restore-cluster-snapshot` admin command
+        // 3. Refactor to pass PartitionStoreManager to the provisioner
 
         Ok(Response::new(ProvisionClusterResponse::provisioned(
             ProtoClusterConfiguration::from(cluster_configuration),

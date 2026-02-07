@@ -846,6 +846,37 @@ impl StartedNode {
         partition_replication: ReplicationProperty,
         provider_configuration: Option<ProviderConfiguration>,
     ) -> anyhow::Result<bool> {
+        self.provision_cluster_inner(
+            num_partitions,
+            partition_replication,
+            provider_configuration,
+            None,
+        )
+        .await
+    }
+
+    pub async fn provision_cluster_from_snapshot(
+        &self,
+        partition_replication: ReplicationProperty,
+        provider_configuration: Option<ProviderConfiguration>,
+        snapshot_id: u64,
+    ) -> anyhow::Result<bool> {
+        self.provision_cluster_inner(
+            None,
+            partition_replication,
+            provider_configuration,
+            Some(snapshot_id),
+        )
+        .await
+    }
+
+    async fn provision_cluster_inner(
+        &self,
+        num_partitions: Option<NonZeroU16>,
+        partition_replication: ReplicationProperty,
+        provider_configuration: Option<ProviderConfiguration>,
+        from_cluster_snapshot_id: Option<u64>,
+    ) -> anyhow::Result<bool> {
         let channel = create_tonic_channel(
             self.advertised_address().clone(),
             &Configuration::default().networking,
@@ -868,6 +899,7 @@ impl StartedNode {
                     .target_nodeset_size()
                     .map(|nodeset_size| nodeset_size.as_u32())
             }),
+            from_cluster_snapshot_id,
         };
 
         let retry_policy = RetryPolicy::exponential(

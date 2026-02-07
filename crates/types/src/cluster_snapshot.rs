@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 
 use restate_clock::time::MillisSinceEpoch;
 
@@ -27,6 +28,7 @@ use crate::{Version, Versioned, flexbuffers_storage_encode_decode};
 /// updated with per-partition records as they complete. The `partition_table`
 /// captures the source cluster's layout at initiation time — this is critical
 /// for recovery.
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterSnapshotManifest {
     version: Version,
@@ -37,6 +39,7 @@ pub struct ClusterSnapshotManifest {
     pub partition_table: PartitionTable,
     pub initiated_at: MillisSinceEpoch,
     pub completed_at: Option<MillisSinceEpoch>,
+    #[serde_as(as = "serde_with::Seq<(_, _)>")]
     pub partitions: BTreeMap<PartitionId, PartitionSnapshotRecord>,
 }
 

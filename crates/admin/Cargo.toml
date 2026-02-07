@@ -30,6 +30,7 @@ restate-errors = { workspace = true }
 restate-ingestion-client = { workspace = true }
 restate-metadata-store = { workspace = true }
 restate-metadata-providers = { workspace = true }
+restate-partition-store = { workspace = true }
 restate-service-client = { workspace = true }
 restate-service-protocol = { workspace = true, features = ["discovery"] }
 restate-storage-query-datafusion = { workspace = true }

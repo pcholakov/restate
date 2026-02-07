@@ -34,8 +34,11 @@ use restate_core::protobuf::cluster_ctrl_svc::{
 };
 use restate_core::{Metadata, MetadataWriter};
 use restate_metadata_store::WriteError;
+use restate_partition_store::snapshots::SnapshotRepository;
 use restate_storage_query_datafusion::context::QueryContext;
-use restate_types::config::{MetadataClientKind, MetadataClientOptions, NetworkingOptions};
+use restate_types::config::{
+    Configuration, MetadataClientKind, MetadataClientOptions, NetworkingOptions,
+};
 use restate_types::identifiers::PartitionId;
 use restate_types::logs::metadata::{Logs, SegmentIndex};
 use restate_types::logs::{LogId, Lsn, SequenceNumber};
@@ -260,7 +263,31 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
             self.metadata_writer.raw_metadata_store_client(),
         )
         .await
-        .map_err(|err| Status::internal(err.to_string()))?;
+        .map_err(|err| Status::internal(format!("{err:#}")))?
+        .ok_or_else(|| {
+            Status::not_found(format!(
+                "No cluster snapshot manifest found for {snapshot_id}"
+            ))
+        })?;
+
+        // When the manifest just transitioned to complete, persist it to the
+        // snapshot repository so that it's available for cluster recovery
+        // (the metadata store won't exist on a fresh cluster).
+        if manifest.is_complete() {
+            let config = Configuration::pinned();
+            if let Ok(Some(repository)) = SnapshotRepository::new_from_config(
+                &config.worker.snapshots,
+                config.worker.storage.snapshots_staging_dir(),
+            )
+            .await
+                && let Err(err) = repository.put_cluster_manifest(&manifest).await
+            {
+                tracing::warn!(
+                    %snapshot_id,
+                    "Failed to write cluster manifest to snapshot repository: {err}"
+                );
+            }
+        }
 
         let manifest_json = serde_json::to_vec(&manifest)
             .map_err(|err| Status::internal(format!("Failed to serialize manifest: {err}")))?;

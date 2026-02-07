@@ -39,13 +39,17 @@ use restate_metadata_server::{
 use restate_metadata_store::{ReadWriteError, WriteError, retry_on_retryable_error};
 use restate_partition_store::PartitionStoreManager;
 use restate_tracing_instrumentation::prometheus_metrics::Prometheus;
+use restate_types::cluster_snapshot::ClusterSnapshotManifest;
 use restate_types::config::{CommonOptions, Configuration};
 use restate_types::errors::IntoMaybeRetryable;
 use restate_types::health::NodeStatus;
 use restate_types::live::Live;
 use restate_types::live::LiveLoadExt;
-use restate_types::logs::metadata::{Logs, LogsConfiguration, ProviderConfiguration, ProviderKind};
-use restate_types::logs::{self, RecordCache};
+use restate_types::logs::builder::LogsBuilder;
+use restate_types::logs::metadata::{
+    Chain, Logs, LogsConfiguration, ProviderConfiguration, ProviderKind, SealMetadata,
+};
+use restate_types::logs::{self, RecordCache, SequenceNumber};
 use restate_types::metadata::{GlobalMetadata, Precondition};
 use restate_types::net::listener::AddressBook;
 use restate_types::nodes_config::{ClusterFingerprint, NodeConfig, NodesConfiguration, Role};
@@ -425,6 +429,7 @@ impl Node {
                             &metadata_writer,
                             &common_opts,
                             &cluster_configuration,
+                            None,
                         )
                         .await;
 
@@ -635,13 +640,17 @@ impl ClusterConfiguration {
 /// This method returns an error if any of the initial metadata couldn't be written to the
 /// metadata store. In this case, the method does not try to clean the already written metadata
 /// up. Instead, the caller can retry to complete the provisioning.
+///
+/// If `snapshot_manifest` is provided (from a cluster snapshot), the partition table and
+/// per-partition log chains are derived from the snapshot instead of being freshly generated.
 async fn provision_cluster_metadata(
     metadata_writer: &MetadataWriter,
     common_opts: &CommonOptions,
     cluster_configuration: &ClusterConfiguration,
+    snapshot_manifest: Option<&ClusterSnapshotManifest>,
 ) -> anyhow::Result<bool> {
     let (initial_nodes_configuration, initial_partition_table, initial_logs) =
-        generate_initial_metadata(common_opts, cluster_configuration);
+        generate_initial_metadata(common_opts, cluster_configuration, snapshot_manifest);
 
     let result = retry_on_retryable_error(common_opts.network_error_retry_policy.clone(), || {
         metadata_writer
@@ -670,14 +679,37 @@ async fn provision_cluster_metadata(
     .await
     .context("failed provisioning the initial partition table")?;
 
+    // When restoring from a cluster snapshot, pre-seed per-partition epoch metadata
+    // with a starting epoch derived from the snapshot ID (a wall-clock timestamp).
+    // This ensures the first claim_leadership produces an epoch higher than anything
+    // the restored partition stores have seen from the source cluster.
+    if let Some(manifest) = snapshot_manifest {
+        let base_epoch =
+            restate_types::identifiers::LeaderEpoch::from(manifest.snapshot_id.as_u64());
+        let initial_epoch = restate_types::epoch::EpochMetadata::with_epoch(base_epoch);
+        let metadata_store_client = metadata_writer.raw_metadata_store_client();
+        for (partition_id, _) in manifest.partitions.iter() {
+            let key =
+                restate_types::metadata_store::keys::partition_processor_epoch_key(*partition_id);
+            retry_on_retryable_error(common_opts.network_error_retry_policy.clone(), || {
+                metadata_store_client.put(key.clone(), &initial_epoch, Precondition::DoesNotExist)
+            })
+            .await
+            .context("failed provisioning partition epoch metadata")?;
+        }
+    }
+
     Ok(result)
 }
 
-fn create_initial_nodes_configuration(common_opts: &CommonOptions) -> NodesConfiguration {
+fn create_initial_nodes_configuration(
+    common_opts: &CommonOptions,
+    fingerprint: ClusterFingerprint,
+) -> NodesConfiguration {
     let mut initial_nodes_configuration = NodesConfiguration::new(
         Version::MIN,
         common_opts.cluster_name().to_owned(),
-        ClusterFingerprint::generate(),
+        fingerprint,
     );
     let my_advertised_address =
         TaskCenter::with_current(|tc| common_opts.advertised_address(tc.address_book()));
@@ -702,20 +734,57 @@ fn create_initial_nodes_configuration(common_opts: &CommonOptions) -> NodesConfi
 fn generate_initial_metadata(
     common_opts: &CommonOptions,
     cluster_configuration: &ClusterConfiguration,
+    snapshot_manifest: Option<&ClusterSnapshotManifest>,
 ) -> (NodesConfiguration, PartitionTable, Logs) {
-    let mut initial_partition_table_builder = PartitionTableBuilder::default();
-    initial_partition_table_builder
-        .with_equally_sized_partitions(cluster_configuration.num_partitions)
-        .expect("Empty partition table should not have conflicts");
-    initial_partition_table_builder
-        .set_partition_replication(cluster_configuration.partition_replication.clone());
-    let initial_partition_table = initial_partition_table_builder.build();
+    let initial_partition_table = if let Some(manifest) = snapshot_manifest {
+        // Use the snapshot's partition table (preserving key ranges and log IDs).
+        manifest.partition_table.clone()
+    } else {
+        let mut builder = PartitionTableBuilder::default();
+        builder
+            .with_equally_sized_partitions(cluster_configuration.num_partitions)
+            .expect("Empty partition table should not have conflicts");
+        builder.set_partition_replication(cluster_configuration.partition_replication.clone());
+        builder.build()
+    };
 
-    let initial_logs = Logs::with_logs_configuration(LogsConfiguration::from(
-        cluster_configuration.bifrost_provider.clone(),
-    ));
+    let logs_config = LogsConfiguration::from(cluster_configuration.bifrost_provider.clone());
 
-    let initial_nodes_configuration = create_initial_nodes_configuration(common_opts);
+    let initial_logs = if let Some(manifest) = snapshot_manifest {
+        // Pre-create per-partition log chains as born-sealed at snapshot_lsn + 1.
+        // The Bifrost logs controller will replace each seal marker with a new
+        // segment using the configured provider (e.g. replicated loglet).
+        //
+        // Note: min_applied_lsn is exact for distributed (Chandy-Lamport) snapshots
+        // because the PP is quiesced during checkpoint creation.
+        let seal_metadata = SealMetadata::with_context(
+            false,
+            std::collections::HashMap::from_iter([(
+                "source".to_owned(),
+                "cluster-snapshot-restore".to_owned(),
+            )]),
+        );
+        let mut builder = LogsBuilder::default();
+        builder.set_configuration(logs_config);
+        for record in manifest.partitions.values() {
+            let chain = Chain::new_sealed(record.min_applied_lsn.next(), &seal_metadata)
+                .expect("Failed to create sealed chain");
+            builder
+                .add_log(record.log_id, chain)
+                .expect("Duplicate log_id in cluster snapshot manifest");
+        }
+        builder.build()
+    } else {
+        Logs::with_logs_configuration(logs_config)
+    };
+
+    // For snapshot restore, preserve the source cluster's fingerprint so that
+    // snapshot validation passes when importing partition data.
+    let fingerprint = snapshot_manifest
+        .and_then(|m| m.cluster_fingerprint)
+        .unwrap_or_else(ClusterFingerprint::generate);
+
+    let initial_nodes_configuration = create_initial_nodes_configuration(common_opts, fingerprint);
 
     (
         initial_nodes_configuration,

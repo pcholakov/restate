@@ -701,22 +701,29 @@ async fn initiate_distributed_snapshot(
 }
 
 /// Aggregates per-partition completion records from the metadata store and returns
-/// the current state of the cluster snapshot manifest.
+/// the current state of the cluster snapshot manifest, or `None` if no manifest
+/// exists for the given snapshot ID.
 pub(crate) async fn get_cluster_snapshot_status(
     snapshot_id: ClusterSnapshotId,
     metadata_store_client: &MetadataStoreClient,
-) -> anyhow::Result<ClusterSnapshotManifest> {
+) -> anyhow::Result<Option<ClusterSnapshotManifest>> {
     use restate_types::cluster_snapshot::PartitionSnapshotRecord;
 
-    let mut manifest: ClusterSnapshotManifest = metadata_store_client
-        .get(cluster_snapshot_manifest_key(snapshot_id))
+    let Some(mut manifest) = metadata_store_client
+        .get::<ClusterSnapshotManifest>(cluster_snapshot_manifest_key(snapshot_id))
         .await
         .context("Failed to read cluster snapshot manifest")?
-        .ok_or_else(|| anyhow!("Cluster snapshot manifest not found for {snapshot_id}"))?;
+    else {
+        return Ok(None);
+    };
 
     if manifest.is_complete() {
-        return Ok(manifest);
+        return Ok(Some(manifest));
     }
+
+    // Remember the version as stored in the metadata store — add_partition()
+    // bumps the in-memory version on each insert.
+    let stored_version = manifest.version();
 
     // Aggregate per-partition completion keys
     let partition_ids: Vec<PartitionId> = manifest
@@ -740,18 +747,27 @@ pub(crate) async fn get_cluster_snapshot_status(
 
     if manifest.is_complete() {
         manifest.completed_at = Some(WallClock::now_ms());
-        // Write final manifest back to metadata store
+        // Write final manifest back to metadata store using the original stored
+        // version for the CAS precondition (not the locally-mutated version).
         metadata_store_client
             .put(
                 cluster_snapshot_manifest_key(snapshot_id),
                 &manifest,
-                restate_types::metadata::Precondition::MatchesVersion(manifest.version()),
+                restate_types::metadata::Precondition::MatchesVersion(stored_version),
             )
             .await
-            .context("Failed to update completed cluster snapshot manifest")?;
+            .with_context(|| {
+                format!(
+                    "Failed to update completed cluster snapshot manifest \
+                     (stored_version={stored_version:?}, manifest_version={:?}, \
+                     partitions={})",
+                    manifest.version(),
+                    manifest.partitions.len(),
+                )
+            })?;
     }
 
-    Ok(manifest)
+    Ok(Some(manifest))
 }
 
 async fn update_cluster_configuration(

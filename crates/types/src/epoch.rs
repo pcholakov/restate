@@ -47,6 +47,19 @@ impl EpochMetadata {
         }
     }
 
+    /// Creates epoch metadata with a specified starting epoch. Used during
+    /// cluster snapshot restore to ensure the first `claim_leadership` produces
+    /// an epoch higher than what the restored partition stores have seen.
+    pub fn with_epoch(epoch: LeaderEpoch) -> Self {
+        Self {
+            version: Version::MIN,
+            leader_metadata: None,
+            current: PartitionConfiguration::default(),
+            next: None,
+            epoch,
+        }
+    }
+
     pub fn into_inner(
         self,
     ) -> (

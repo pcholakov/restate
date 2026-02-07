@@ -384,7 +384,8 @@ impl PartitionStoreManager {
         self.state.drop_partition(partition_id).await
     }
 
-    #[cfg(any(test, feature = "test-util"))]
+    /// Import a snapshot into a partition's RocksDB, replacing any existing data.
+    /// Used for partition recovery from a snapshot archive.
     pub async fn open_from_snapshot(
         &self,
         partition: &Partition,

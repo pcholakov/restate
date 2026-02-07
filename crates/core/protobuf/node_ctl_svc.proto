@@ -48,6 +48,10 @@ message ProvisionClusterRequest {
   // if unset then the configured cluster default target nodeset size will be
   // used
   optional uint32 target_nodeset_size = 6;
+  // Optional: provision from a cluster snapshot. The partition table and
+  // log configuration will be derived from the snapshot manifest. The snapshot
+  // repository must be accessible from the provisioning node.
+  optional uint64 from_cluster_snapshot_id = 7;
 }
 
 message ProvisionClusterResponse {

@@ -6879,6 +6879,7 @@ dependencies = [
  "restate-ingestion-client",
  "restate-metadata-providers",
  "restate-metadata-store",
+ "restate-partition-store",
  "restate-service-client",
  "restate-service-protocol",
  "restate-storage-query-datafusion",

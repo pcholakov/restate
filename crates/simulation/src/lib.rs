@@ -54,7 +54,8 @@ pub use cluster::{
 };
 pub use partition::{
     InvariantViolation, InvokerBehavior, InvokerSimulator, OutboundMessage, PartitionSimulation,
-    PartitionSimulationConfig, SimulationError, SimulationOutcome, StepResult, VO_TEST_HANDLER,
-    VO_TEST_KEYS, VO_TEST_SERVICE,
+    PartitionSimulationConfig, SET_SERVICE_HANDLER, SET_SERVICE_NAME, SetServiceInvoker,
+    SetServiceState, SimulationError, SimulationOutcome, StepResult, VO_TEST_HANDLER, VO_TEST_KEYS,
+    VO_TEST_SERVICE,
 };
 pub use trace::{ActionTrace, CommandTrace, SimulationTrace, TraceDiff, TraceEntry};

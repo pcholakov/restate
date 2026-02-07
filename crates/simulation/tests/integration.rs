@@ -2320,6 +2320,290 @@ async fn test_snapshot_linearizability_set_model() -> googletest::Result<()> {
     Ok(())
 }
 
+/// Tests linearizability of actual VO state through snapshot restore.
+///
+/// Unlike `test_snapshot_linearizability_set_model` which scans invocation statuses
+/// with indeterminate adds, this test:
+/// 1. Uses `SetServiceInvoker` to write real state keys via `SetState` journal entries
+/// 2. Runs pre-snapshot invocations to quiescence → these are `add_ok` (committed, MUST be present)
+/// 3. Injects concurrent traffic during snapshot → these are `add_info` (indeterminate)
+/// 4. After restore, scans actual VO state keys → `read_ok`
+/// 5. Verifies the combined history linearizes via `SetFullChecker`
+///
+/// This is strictly stronger than the invocation-status model: lost committed writes
+/// (elements that completed before snapshot but are missing after restore) cause failure.
+#[test(restate_core::test(start_paused = true, rng_seed = 42))]
+async fn test_snapshot_state_linearizability() -> googletest::Result<()> {
+    use std::ops::ControlFlow;
+    use std::sync::Arc;
+
+    use spectroscope::{History, Op, SetFullChecker, Validity};
+
+    use restate_partition_store::PartitionStore;
+    use restate_simulation::{SET_SERVICE_NAME, SetServiceState};
+    use restate_storage_api::state_table::ScanStateTable;
+
+    let num_partitions = 3u16;
+    let partition_table =
+        PartitionTable::with_equally_sized_partitions(Version::MIN, num_partitions);
+
+    let mut config = Configuration::default();
+    config.common.rocksdb_total_memory_size = NonZeroUsize::new(4 * 1024 * 1024 * 1024).unwrap();
+    let config = config.apply_cascading_values();
+    set_current_config(config);
+    RocksDbManager::init();
+
+    let manager = Arc::new(PartitionStoreManager::create().await.unwrap());
+    let mut stores = Vec::new();
+    for (pid, partition) in partition_table.iter() {
+        let store = manager.open(partition, None).await.unwrap();
+        stores.push((*pid, store));
+    }
+    let store_map: std::collections::HashMap<PartitionId, PartitionStore> =
+        stores.into_iter().collect();
+
+    // Shared state for SetServiceInvoker instances across partitions
+    let set_state = SetServiceState::new();
+
+    let cluster_config = ClusterSimulationConfig {
+        num_partitions,
+        seed: 9999,
+        max_steps: 30_000,
+        ..Default::default()
+    };
+
+    let mut cluster = ClusterSimulation::new_with_invoker_factory(
+        cluster_config,
+        partition_table.clone(),
+        |pid| store_map.get(&pid).unwrap().clone(),
+        |_pid| InvokerBehavior::Custom(Box::new(set_state.invoker())),
+    );
+
+    // Phase 1: Pre-snapshot — inject invocations and run to quiescence.
+    // 9 set keys across 3 partitions, 5 invocations each = 45 invocations.
+    let num_sets = 3 * num_partitions as usize;
+    let invocations_per_set = 5;
+    let mut pre_snapshot_ids = Vec::new();
+
+    for set_idx in 0..num_sets {
+        let set_key = format!("set-{set_idx}");
+        for _ in 0..invocations_per_set {
+            let invocation = cluster.partition_mut(0).set_invocation(&set_key);
+            let (inv_id, _pid) = cluster.inject_invocation(invocation);
+            pre_snapshot_ids.push(inv_id);
+        }
+    }
+
+    let outcome = cluster.run().await?;
+    assert!(
+        outcome.is_ok(),
+        "Pre-snapshot violations: {:?}",
+        outcome.violations
+    );
+    info!(
+        "Pre-snapshot phase complete: {} steps, {} invocations",
+        outcome.total_steps,
+        pre_snapshot_ids.len()
+    );
+
+    // Phase 2: Snapshot + concurrent traffic.
+    // Generate concurrent invocations (3 per set = 27 more).
+    let mut concurrent_invocations: Vec<_> = (0..num_sets)
+        .flat_map(|set_idx| {
+            let set_key = format!("set-{set_idx}");
+            (0..3).map(move |_| set_key.clone())
+        })
+        .map(|set_key| cluster.partition_mut(0).set_invocation(&set_key))
+        .collect();
+
+    let snapshot_dir = tempfile::tempdir().unwrap();
+    let (outcome, mut checkpoints, _snapshot_id) = cluster
+        .run_with_continuous_traffic(
+            snapshot_dir.path(),
+            &mut concurrent_invocations.drain(..),
+            3, // inject every 3 steps
+            0, // initiate snapshot immediately (pre-snapshot work is already done)
+        )
+        .await?;
+
+    assert!(
+        outcome.is_ok(),
+        "Snapshot phase violations: {:?}",
+        outcome.violations
+    );
+
+    // Verify all partitions produced a checkpoint
+    for (pid, _) in partition_table.iter() {
+        assert!(
+            checkpoints.contains_key(pid),
+            "Partition {pid} missing checkpoint (have: {:?})",
+            checkpoints.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // Snapshot the element map before dropping the cluster.
+    let all_elements = set_state.elements();
+
+    // All pre-snapshot invocations must have been processed by the invoker.
+    let pre_snapshot_elements: Vec<u64> = pre_snapshot_ids
+        .iter()
+        .map(|inv_id| {
+            *all_elements
+                .get(inv_id)
+                .unwrap_or_else(|| panic!("pre-snapshot invocation {inv_id} not in element map"))
+        })
+        .collect();
+
+    // Concurrent invocations: injected during snapshot, state may or may not
+    // have been written before the checkpoint. Classified as add_info.
+    // Note: we can't use injection step vs checkpoint step for promotion because
+    // injection step != state-written step — several simulation steps elapse
+    // between injection and the SetState effect being applied.
+    let pre_snapshot_set: std::collections::HashSet<u64> =
+        pre_snapshot_elements.iter().copied().collect();
+    let concurrent_elements: Vec<u64> = all_elements
+        .values()
+        .filter(|e| !pre_snapshot_set.contains(e))
+        .copied()
+        .collect();
+
+    info!(
+        "Snapshot phase complete: {} steps, {} checkpoints, \
+         {} pre-snapshot (add_ok), {} concurrent (add_info)",
+        outcome.total_steps,
+        checkpoints.len(),
+        pre_snapshot_elements.len(),
+        concurrent_elements.len(),
+    );
+
+    drop(cluster);
+
+    // Phase 3: Wipe and restore all partitions.
+    let partitions_info: Vec<_> = partition_table
+        .iter()
+        .map(|(pid, p)| (*pid, p.clone()))
+        .collect();
+
+    let mut restored_stores = Vec::new();
+    for (pid, partition) in &partitions_info {
+        let snapshot = checkpoints.remove(pid).unwrap();
+        manager.close(*pid).await;
+        manager
+            .drop_partition(*pid)
+            .await
+            .expect("drop_partition should succeed");
+        let restored_store = manager
+            .open_from_snapshot(partition, snapshot)
+            .await
+            .expect("open_from_snapshot should succeed");
+        restored_stores.push((*pid, restored_store, partition.key_range.clone()));
+    }
+
+    // Phase 4: Scan actual VO state and build spectroscope history.
+    let mut history: History<u64> = History::new();
+    let mut op_idx: usize = 0;
+
+    // Pre-snapshot elements: add_ok (committed, must be present after restore)
+    for (i, &element) in pre_snapshot_elements.iter().enumerate() {
+        let ts: spectroscope::Timestamp = std::time::Duration::from_micros(i as u64).into();
+        let ts_done: spectroscope::Timestamp =
+            std::time::Duration::from_micros(i as u64 + 1).into();
+        history.push(Op::add_invoke(op_idx, 0, element).at(ts));
+        op_idx += 1;
+        history.push(Op::add_ok(op_idx, 0, element).at(ts_done));
+        op_idx += 1;
+    }
+
+    // Concurrent elements: add_info (indeterminate, may or may not be present)
+    let concurrent_base = pre_snapshot_elements.len() as u64 * 2 + 100;
+    for (i, &element) in concurrent_elements.iter().enumerate() {
+        let ts: spectroscope::Timestamp =
+            std::time::Duration::from_micros(concurrent_base + i as u64 * 2).into();
+        let ts_done: spectroscope::Timestamp =
+            std::time::Duration::from_micros(concurrent_base + i as u64 * 2 + 1).into();
+        history.push(Op::add_invoke(op_idx, 0, element).at(ts));
+        op_idx += 1;
+        history.push(Op::add_info(op_idx, 0, element).at(ts_done));
+        op_idx += 1;
+    }
+
+    // Read: scan all user state from restored stores.
+    // Filter on service name AND `e_` key prefix to avoid false positives.
+    let read_ts: spectroscope::Timestamp = std::time::Duration::from_micros(
+        concurrent_base + concurrent_elements.len() as u64 * 2 + 1000,
+    )
+    .into();
+    history.push(Op::read_invoke(op_idx, 0).at(read_ts));
+    op_idx += 1;
+
+    let collected = Arc::new(parking_lot::Mutex::new(Vec::<u64>::new()));
+    for (_pid, store, key_range) in &restored_stores {
+        let sink = collected.clone();
+        store
+            .for_each_user_state(
+                key_range.clone(),
+                move |(service_id, state_key, state_value)| {
+                    if *service_id.service_name == *SET_SERVICE_NAME
+                        && state_key.starts_with(b"e_")
+                        && state_value.len() == 8
+                    {
+                        let element = u64::from_le_bytes(state_value.try_into().unwrap());
+                        sink.lock().push(element);
+                    }
+                    ControlFlow::Continue(())
+                },
+            )
+            .expect("for_each_user_state should succeed")
+            .await
+            .expect("state scan should complete");
+    }
+    let present_elements = Arc::try_unwrap(collected)
+        .expect("no other references")
+        .into_inner();
+
+    let read_done_ts: spectroscope::Timestamp = std::time::Duration::from_micros(
+        concurrent_base + concurrent_elements.len() as u64 * 2 + 1001,
+    )
+    .into();
+    history.push(Op::read_ok(op_idx, 0, present_elements.clone()).at(read_done_ts));
+
+    // Phase 5: Linearizability check
+    let result = SetFullChecker::linearizable().check(&history);
+
+    info!(
+        "State linearizability: {:?} (present: {}, pre-snapshot: {} (add_ok), \
+         concurrent: {} (add_info), stable: {}, lost: {}, stale: {}, never-read: {})",
+        result.valid,
+        present_elements.len(),
+        pre_snapshot_elements.len(),
+        concurrent_elements.len(),
+        result.stable_count,
+        result.lost_count,
+        result.stale_count,
+        result.never_read_count,
+    );
+
+    assert_eq!(
+        result.valid,
+        Validity::Valid,
+        "State linearizability violation: {} lost, {} stale. Lost: {:?}, Stale: {:?}",
+        result.lost_count,
+        result.stale_count,
+        result.lost,
+        result.stale,
+    );
+
+    // Sanity: we should have found at least all pre-snapshot committed elements
+    assert!(
+        present_elements.len() >= pre_snapshot_elements.len(),
+        "Expected at least {} elements (pre-snapshot committed), found {}",
+        pre_snapshot_elements.len(),
+        present_elements.len(),
+    );
+
+    Ok(())
+}
+
 /// Final cleanup test that shuts down RocksDB.
 ///
 /// # IMPORTANT: Test Naming Convention

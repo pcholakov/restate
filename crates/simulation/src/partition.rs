@@ -21,6 +21,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use bytestring::ByteString;
@@ -48,7 +50,9 @@ use restate_types::identifiers::{
 };
 use restate_types::invocation::{InvocationTarget, ServiceInvocation, Source};
 use restate_types::journal_v2::Entry;
-use restate_types::journal_v2::command::{Command as JournalCommand, OutputCommand, OutputResult};
+use restate_types::journal_v2::command::{
+    Command as JournalCommand, OutputCommand, OutputResult, SetStateCommand,
+};
 use restate_types::logs::{Lsn, SequenceNumber};
 use restate_types::partition_table::{FindPartition, PartitionTable};
 use restate_types::service_protocol::ServiceProtocolVersion;
@@ -298,6 +302,129 @@ impl InvokerSimulator for ProbabilisticInvoker {
         }
     }
 }
+
+/// Shared state for [`SetServiceInvoker`] instances across partitions.
+///
+/// The counter provides globally unique element IDs; the map records which
+/// invocation produced which element for post-restore verification.
+pub struct SetServiceState {
+    counter: Arc<AtomicU64>,
+    elements: Arc<parking_lot::Mutex<HashMap<InvocationId, u64>>>,
+}
+
+impl Default for SetServiceState {
+    fn default() -> Self {
+        Self {
+            counter: Arc::new(AtomicU64::new(0)),
+            elements: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl SetServiceState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns (InvocationId → element) for all invocations processed so far.
+    pub fn elements(&self) -> HashMap<InvocationId, u64> {
+        self.elements.lock().clone()
+    }
+
+    /// Creates a new invoker sharing this state.
+    pub fn invoker(&self) -> SetServiceInvoker {
+        SetServiceInvoker {
+            counter: self.counter.clone(),
+            elements: self.elements.clone(),
+        }
+    }
+}
+
+/// Invoker simulator that models a "Set" virtual object service.
+///
+/// Each invocation writes a unique element as a state key (`e_{element}` → element
+/// as le bytes). This avoids read-modify-write: the set of elements is the set of
+/// state keys present. After snapshot restore, reading all state keys for a ServiceId
+/// reconstructs the set.
+///
+/// Multiple instances share state via [`SetServiceState`] for globally unique elements.
+#[derive(Debug)]
+pub struct SetServiceInvoker {
+    counter: Arc<AtomicU64>,
+    elements: Arc<parking_lot::Mutex<HashMap<InvocationId, u64>>>,
+}
+
+impl InvokerSimulator for SetServiceInvoker {
+    fn on_invoke(
+        &mut self,
+        invocation_id: InvocationId,
+        _invocation_target: &InvocationTarget,
+        _journal: &InvokeInputJournal,
+        _rng: &mut StdRng,
+        _clock: &SimulationClock,
+    ) -> Vec<Command> {
+        let element = self.counter.fetch_add(1, Ordering::Relaxed);
+        self.elements.lock().insert(invocation_id, element);
+
+        let state_key = format!("e_{element}");
+        let state_value = element.to_le_bytes().to_vec();
+
+        vec![
+            // Pin deployment
+            Command::InvokerEffect(Box::new(Effect {
+                invocation_id,
+                kind: EffectKind::PinnedDeployment(PinnedDeployment {
+                    deployment_id: DeploymentId::default(),
+                    service_protocol_version: ServiceProtocolVersion::V5,
+                }),
+            })),
+            // SetState: write element as individual state key
+            Command::InvokerEffect(Box::new(Effect {
+                invocation_id,
+                kind: EffectKind::JournalEntryV2 {
+                    entry: StoredRawEntry::new(
+                        StoredRawEntryHeader::new(MillisSinceEpoch::UNIX_EPOCH),
+                        Entry::Command(JournalCommand::SetState(SetStateCommand {
+                            key: ByteString::from(state_key),
+                            value: Bytes::from(state_value),
+                            name: ByteString::new(),
+                        }))
+                        .encode::<ServiceProtocolV4Codec>(),
+                    ),
+                    command_index_to_ack: None,
+                },
+            })),
+            // Output
+            Command::InvokerEffect(Box::new(Effect {
+                invocation_id,
+                kind: EffectKind::JournalEntryV2 {
+                    entry: StoredRawEntry::new(
+                        StoredRawEntryHeader::new(MillisSinceEpoch::UNIX_EPOCH),
+                        Entry::Command(JournalCommand::Output(OutputCommand {
+                            result: OutputResult::Success(Bytes::from(
+                                element.to_le_bytes().to_vec(),
+                            )),
+                            name: ByteString::new(),
+                        }))
+                        .encode::<ServiceProtocolV4Codec>(),
+                    ),
+                    command_index_to_ack: None,
+                },
+            })),
+            // End
+            Command::InvokerEffect(Box::new(Effect {
+                invocation_id,
+                kind: EffectKind::End,
+            })),
+        ]
+    }
+}
+
+/// Default service name for Set service invocations.
+pub const SET_SERVICE_NAME: &str = "SetService";
+
+/// Default handler name for Set service invocations.
+pub const SET_SERVICE_HANDLER: &str = "add";
 
 /// Result of a single simulation step.
 #[derive(Debug)]
@@ -618,6 +745,20 @@ where
             VO_TEST_SERVICE,
             key,
             VO_TEST_HANDLER,
+            restate_types::invocation::VirtualObjectHandlerType::Exclusive,
+        );
+        self.create_invocation(target)
+    }
+
+    /// Creates an invocation targeting a specific set VO key.
+    ///
+    /// Used by the linearizability test: each set key (e.g., `set-0`, `set-1`)
+    /// is a virtual object whose state keys represent set elements.
+    pub fn set_invocation(&mut self, set_key: &str) -> ServiceInvocation {
+        let target = InvocationTarget::virtual_object(
+            SET_SERVICE_NAME,
+            set_key,
+            SET_SERVICE_HANDLER,
             restate_types::invocation::VirtualObjectHandlerType::Exclusive,
         );
         self.create_invocation(target)

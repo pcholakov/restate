@@ -27,11 +27,13 @@
       A7. Acks are sent even for duplicate messages (idempotent ack)
 *)
 
-EXTENDS Naturals, Sequences, FiniteSets
+EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS
     Partition,      \* Set of partition IDs, e.g. {0, 1, 2}
     MaxMessages     \* Bound on messages each partition can send (for model checking)
+
+PartitionSymmetry == Permutations(Partition)
 
 VARIABLES
     \* --- Application state ---
@@ -249,6 +251,23 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
+(* Log-processing action for partition p — drains whatever is at the head *)
+ProcessLog(p) ==
+    \/ ProcessMessage(p)
+    \/ ProcessAck(p)
+    \/ ProcessInitiate(p)
+    \/ SkipInitiate(p)
+    \/ ProcessMarker(p)
+
+(* Liveness spec: assumes PPs eventually process their logs and the
+   coordinator eventually initiates and recognizes completion.
+   No fairness on SendMessage — termination holds regardless of whether
+   new application messages are generated. *)
+LiveSpec == Spec
+    /\ WF_vars(InitiateSnapshot)
+    /\ \A p \in Partition : WF_vars(ProcessLog(p))
+    /\ WF_vars(CompleteSnapshot)
+
 -----------------------------------------------------------------------------
 (* Safety properties *)
 
@@ -299,5 +318,13 @@ ConsistentCut ==
                 LET src == entry[1]
                     s   == entry[2]
                 IN s < snapNextSeq[src]  \* Sender had sent this before its snapshot
+
+-----------------------------------------------------------------------------
+(* Liveness property *)
+
+(* SNAPSHOT TERMINATION
+   Under fairness assumptions (PPs process their logs, coordinator acts),
+   the distributed snapshot eventually completes. *)
+SnapshotTermination == <>(phase = "complete")
 
 =============================================================================

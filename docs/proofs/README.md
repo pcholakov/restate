@@ -21,8 +21,11 @@ java -cp /path/to/tla2tools.jar tlc2.TLC RestateSnapshot -config RestateSnapshot
 | File | Purpose |
 |------|---------|
 | `RestateSnapshot.tla` | The TLA+ specification |
-| `RestateSnapshot.cfg` | TLC config: 2 partitions, 2 messages |
-| `RestateSnapshot3.cfg` | TLC config: 3 partitions, 1 message |
+| `RestateSnapshot.cfg` | TLC config: 2 partitions, 2 messages (safety) |
+| `RestateSnapshot3.cfg` | TLC config: 3 partitions, 1 message (safety) |
+| `RestateSnapshotLive.cfg` | TLC config: 2 partitions, 2 messages (safety + liveness) |
+| `RestateSnapshot3Live.cfg` | TLC config: 3 partitions, 1 message (safety + liveness) |
+| `RestateSnapshot3x2.cfg` | TLC config: 3 partitions, 2 messages (safety, ~12 min) |
 
 ## What the model proves
 
@@ -35,6 +38,13 @@ Four safety invariants are verified across all reachable states:
    is captured *somewhere* in the global snapshot
 4. **ConsistentCut** — If a receiver's snapshot shows a processed message from
    src, then src must have sent that message before src's own snapshot
+
+One liveness (temporal) property is verified under weak fairness:
+
+5. **SnapshotTermination** — The snapshot eventually completes (`<>(phase = "complete")`),
+   assuming partition processors eventually process their logs and the coordinator
+   eventually acts. No fairness on application message sends — termination holds
+   regardless of new traffic.
 
 ## Model overview
 
@@ -165,13 +175,19 @@ The model explicitly encodes these assumptions (labeled A1–A7 in the spec):
 
 ### Model checking results
 
-| Configuration | States | Distinct | Depth | Time | Result |
-|--------------|--------|----------|-------|------|--------|
-| 2 partitions, 2 msgs | 17,945 | 8,676 | 19 | <1s | PASS |
-| 3 partitions, 1 msg | 1,775,246 | 622,092 | 21 | ~2s | PASS |
+All configs use symmetry reduction (`Permutations(Partition)`) to collapse
+equivalent states under partition renaming, reducing the state space by `N!`.
 
-All four invariants (TypeOK, NoMessageLost, AllSentMessagesCaptured,
-ConsistentCut) hold across all reachable states.
+| Configuration | Properties | States | Distinct | Depth | Time | Result |
+|--------------|------------|--------|----------|-------|------|--------|
+| 2 partitions, 2 msgs | safety | 9,135 | 4,407 | 19 | <1s | PASS |
+| 3 partitions, 1 msg | safety | 296,157 | 103,755 | 21 | ~1s | PASS |
+| 3 partitions, 2 msgs | safety | 482,539,039 | 151,926,474 | 30 | ~12m | PASS |
+| 2 partitions, 2 msgs | safety + liveness | 9,135 | 4,407 | 19 | <1s | PASS |
+| 3 partitions, 1 msg | safety + liveness | 296,157 | 103,755 | 21 | ~1s | PASS |
+
+All safety invariants and the liveness property hold across all reachable
+states.
 
 ### Relationship to existing docs
 

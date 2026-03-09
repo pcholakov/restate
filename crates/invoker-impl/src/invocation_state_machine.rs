@@ -49,6 +49,9 @@ pub(super) struct InvocationStateMachine<K: TimerKey = tokio_util::time::delay_q
     /// For more details of when we bump it, see [`InvokerError::should_bump_start_message_retry_count_since_last_stored_entry`].
     pub(super) start_message_retry_count_since_last_stored_command: u32,
     pub(super) requested_pause: bool,
+    /// Tracks whether this invocation reserved a slot from the invoker concurrency quota.
+    /// Only regular (non-VQueue) invocations reserve quota slots.
+    pub(super) quota_slot_reserved: bool,
 }
 
 /// This struct tracks which commands the invocation task generates,
@@ -213,6 +216,7 @@ impl<K: TimerKey> InvocationStateMachine<K> {
             },
             start_message_retry_count_since_last_stored_command: 0,
             requested_pause: false,
+            quota_slot_reserved: false,
         }
     }
 

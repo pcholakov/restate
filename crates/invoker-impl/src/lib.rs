@@ -666,19 +666,21 @@ where
                 .partition_storage_reader(partition)
                 .expect("partition is registered");
             self.quota.reserve_slot();
+            let mut ism = InvocationStateMachine::create(
+                None,
+                Permit::new_empty(),
+                invocation_target,
+                retry_iter,
+                on_max_attempts,
+            );
+            ism.quota_slot_reserved = true;
             self.start_invocation_task(
                 options,
                 partition,
                 storage_reader.clone(),
                 invocation_id,
                 journal,
-                InvocationStateMachine::create(
-                    None,
-                    Permit::new_empty(),
-                    invocation_target,
-                    retry_iter,
-                    on_max_attempts,
-                ),
+                ism,
             )
         } else {
             trace!(
@@ -1031,8 +1033,7 @@ where
             trace!(
                 restate.invocation.target = %ism.invocation_target,
                 "Invocation task closed correctly");
-            if ism._permit.is_empty() {
-                // the permit is empty when we are using a real permit token (vqueues).
+            if ism.quota_slot_reserved {
                 self.quota.unreserve_slot();
             }
             self.status_store.on_end(&partition, &invocation_id);
@@ -1067,7 +1068,9 @@ where
             .remove_invocation(partition, &invocation_id)
         {
             counter!(INVOKER_INVOCATION_TASKS, "status" => TASK_OP_SUSPENDED, "partition_id" => ID_LOOKUP.get(partition.0)).increment(1);
-            self.quota.unreserve_slot();
+            if ism.quota_slot_reserved {
+                self.quota.unreserve_slot();
+            }
             self.status_store.on_end(&partition, &invocation_id);
 
             if ism.requested_pause {
@@ -1128,7 +1131,9 @@ where
         {
             counter!(INVOKER_INVOCATION_TASKS, "status" => TASK_OP_SUSPENDED, "partition_id" => ID_LOOKUP.get(partition.0))
                 .increment(1);
-            self.quota.unreserve_slot();
+            if ism.quota_slot_reserved {
+                self.quota.unreserve_slot();
+            }
             self.status_store.on_end(&partition, &invocation_id);
 
             if ism.requested_pause {
@@ -1223,7 +1228,9 @@ where
                 "Aborting invocation"
             );
             ism.abort();
-            self.quota.unreserve_slot();
+            if ism.quota_slot_reserved {
+                self.quota.unreserve_slot();
+            }
             self.status_store.on_end(&partition, &invocation_id);
         } else {
             trace!(
@@ -1285,6 +1292,10 @@ where
 
             if ism.notify_pause() {
                 // If returns true, we need to pause now
+                if ism.quota_slot_reserved {
+                    self.quota.unreserve_slot();
+                }
+                self.status_store.on_end(&partition, &invocation_id);
                 let _ = sender
                     .send(Box::new(Effect {
                         invocation_id,
@@ -1333,7 +1344,9 @@ where
                     "Aborting invocation"
                 );
                 ism.abort();
-                self.quota.unreserve_slot();
+                if ism.quota_slot_reserved {
+                    self.quota.unreserve_slot();
+                }
                 self.status_store.on_end(&partition, &fid);
             }
         } else {
@@ -1479,7 +1492,9 @@ where
                     restate.invocation.target = %ism.invocation_target,
                     restate.deployment.id = %attempt_deployment_id,
                     "Error when executing the invocation, pausing the invocation.");
-                self.quota.unreserve_slot();
+                if ism.quota_slot_reserved {
+                    self.quota.unreserve_slot();
+                }
                 self.status_store.on_end(&partition, &invocation_id);
 
                 let journal_v2_related_command_type =
@@ -1541,7 +1556,9 @@ where
                     restate.invocation.target = %ism.invocation_target,
                     restate.deployment.id = %attempt_deployment_id,
                     "Error when executing the invocation, not going to retry.");
-                self.quota.unreserve_slot();
+                if ism.quota_slot_reserved {
+                    self.quota.unreserve_slot();
+                }
                 self.status_store.on_end(&partition, &invocation_id);
 
                 let _ = self
@@ -2676,10 +2693,15 @@ mod tests {
 
         let invocation_id = InvocationId::mock_random();
 
-        // Use OnMaxAttempts::Kill to ensure pause is from manual request
-        let (_, _status_tx, mut service_inner) =
-            ServiceInner::mock((), MockSchemas(None, Some(OnMaxAttempts::Kill)), None);
+        // Use a concurrency limit of 1 to verify slot release
+        let (_, _status_tx, mut service_inner) = ServiceInner::mock(
+            (),
+            MockSchemas(None, Some(OnMaxAttempts::Kill)),
+            Some(NonZeroUsize::new(1).unwrap()),
+        );
         let mut effects_rx = service_inner.register_mock_partition(EmptyStorageReader);
+
+        assert_eq!(service_inner.quota.available_slots(), 1);
 
         // Start invocation
         service_inner.handle_invoke(
@@ -2689,6 +2711,7 @@ mod tests {
             InvocationTarget::mock_virtual_object(),
             InvokeInputJournal::NoCachedJournal,
         );
+        assert_eq!(service_inner.quota.available_slots(), 0);
 
         // Simulate a transient error to put invocation in WaitingRetry state
         let error = InvokerError::SdkV2(SdkInvocationErrorV2::unknown());
@@ -2698,6 +2721,9 @@ mod tests {
         // Drain any proposed event
         let _ = effects_rx.try_recv();
 
+        // Slot should still be held during retry
+        assert_eq!(service_inner.quota.available_slots(), 0);
+
         // Verify invocation is in WaitingRetry state
         assert!(service_inner.is_invocation_waiting_retry(MOCK_PARTITION, &invocation_id));
         assert!(!service_inner.retry_timers.is_empty());
@@ -2706,6 +2732,13 @@ mod tests {
         service_inner
             .handle_pause_invocation(MOCK_PARTITION, invocation_id)
             .await;
+
+        // Slot must be released after pause
+        assert_eq!(
+            service_inner.quota.available_slots(),
+            1,
+            "concurrency slot must be released when pausing invocation in WaitingRetry state"
+        );
 
         // Should emit Paused effect immediately with no last_failure
         let effect = effects_rx

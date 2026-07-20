@@ -1,0 +1,17 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    env:
+      - DOCKER_BUILDKIT=1
+    args:
+      - build
+      - -f
+      - docker/Dockerfile
+      - -t
+      - us-central1-docker.pkg.dev/signup-test-408607/n-inl4edhpbxasp9yuz1n0yvvkme/restate:oom-instrument2
+      - .
+images:
+  - us-central1-docker.pkg.dev/signup-test-408607/n-inl4edhpbxasp9yuz1n0yvvkme/restate:oom-instrument2
+timeout: 4800s
+options:
+  machineType: E2_HIGHCPU_32
+  diskSizeGb: 120

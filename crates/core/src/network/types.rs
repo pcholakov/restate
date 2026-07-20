@@ -25,7 +25,7 @@ use restate_types::{GenerationalNodeId, Version};
 use restate_util_time::DurationExt;
 
 use super::protobuf::network::{Header, rpc_reply};
-use super::{ConnectionClosed, MessageSendError};
+use super::{ConnectionClosed, MessageSendError, PinGuard};
 
 /// Address of a peer in the network. It can be a specific node or an anonymous peer.
 #[derive(Debug, Clone, Copy, Eq, derive_more::IsVariant, derive_more::Display)]
@@ -117,7 +117,10 @@ impl Default for PeerMetadataVersion {
 }
 
 pub enum RawRpcReply {
-    Success((ProtocolVersion, Bytes)),
+    /// The `PinGuard` tracks the `Bytes` payload for as long as it's held past
+    /// receipt, so we can tell whether the RPC reply path is the structure
+    /// pinning tonic's per-stream decode buffer.
+    Success((ProtocolVersion, Bytes, PinGuard)),
     Error(RpcReplyError),
 }
 
@@ -154,7 +157,7 @@ impl<O: RpcResponse + Unpin> Future for ReplyRx<O> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         match ready!(self.inner.poll_unpin(cx)) {
-            Ok(RawRpcReply::Success((protocol_version, payload))) => {
+            Ok(RawRpcReply::Success((protocol_version, payload, _guard))) => {
                 Poll::Ready(Ok(O::decode(payload, protocol_version)))
             }
             Ok(RawRpcReply::Error(err)) => Poll::Ready(Err(err)),

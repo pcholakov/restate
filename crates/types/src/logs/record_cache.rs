@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use metrics::gauge;
 use moka::{
     ops::compute::Op,
     policy::EvictionPolicy,
@@ -22,6 +23,35 @@ use super::{LogletId, LogletOffset, Record, SequenceNumber};
 
 /// Unique record key across different loglets.
 type RecordKey = (LogletId, LogletOffset);
+
+// Diagnostic instrumentation: track fabric-derived `PolyBytes::Bytes` record bodies held
+// by this cache, under the shared `restate_fabric_held_bytes`/`restate_fabric_held_count`
+// gauges (see `restate_core::network::PinGuard`). This crate can't depend on `restate-core`,
+// so the metric names are duplicated here as literals instead of shared constants.
+const FABRIC_HELD_SITE: &str = "record_cache";
+
+/// Length of the record's body iff it's a fabric zero-copy `Bytes` slice; `Typed`/`Both`
+/// bodies don't pin tonic's decode buffer and aren't tracked.
+fn fabric_bytes_len(record: &Record) -> Option<usize> {
+    match record.body() {
+        PolyBytes::Bytes(bytes) => Some(bytes.len()),
+        PolyBytes::Typed(_) | PolyBytes::Both(_, _) => None,
+    }
+}
+
+fn track_held(record: &Record) {
+    if let Some(len) = fabric_bytes_len(record) {
+        gauge!("restate_fabric_held_bytes", "site" => FABRIC_HELD_SITE).increment(len as f64);
+        gauge!("restate_fabric_held_count", "site" => FABRIC_HELD_SITE).increment(1.0);
+    }
+}
+
+fn track_released(record: &Record) {
+    if let Some(len) = fabric_bytes_len(record) {
+        gauge!("restate_fabric_held_bytes", "site" => FABRIC_HELD_SITE).decrement(len as f64);
+        gauge!("restate_fabric_held_count", "site" => FABRIC_HELD_SITE).decrement(1.0);
+    }
+}
 
 /// A a simple LRU-based record cache.
 ///
@@ -48,6 +78,7 @@ impl RecordCache {
                     })
                     .max_capacity(memory_budget_bytes.try_into().unwrap_or(u64::MAX))
                     .eviction_policy(EvictionPolicy::lru())
+                    .eviction_listener(|_key, record, _cause| track_released(&record))
                     .build_with_hasher(ahash::RandomState::default()),
             )
         } else {
@@ -66,6 +97,7 @@ impl RecordCache {
             .entry((loglet_id, offset))
             .and_compute_with(|existing| {
                 let Some(existing) = existing else {
+                    track_held(record);
                     return Op::Put(record.clone());
                 };
                 match (existing.value().body(), record.body()) {

@@ -221,12 +221,14 @@ impl MessageRouter {
         let reservation = service_sink.reserve(encoded_len, sort_code).await?;
 
         let (reply_port, reply_rx) = RpcReplyPort::new();
+        let pin_guard = super::PinGuard::new("service_queue", encoded_len);
         let raw_rpc = RawRpc {
             reply_port,
             payload: rpc_call.payload,
             sort_code,
             msg_type: rpc_call.msg_type,
             reservation,
+            pin_guard,
         };
         let incoming = Incoming::new(
             connection.protocol_version,
@@ -656,7 +658,7 @@ impl<S: Service> ServiceMessage<S> {
         let protocol_version = CURRENT_PROTOCOL_VERSION;
 
         use crate::network::protobuf::network::rpc_reply;
-        use crate::network::{RawRpcReply, ReplyRx, RpcReplyError, RpcReplyPort};
+        use crate::network::{PinGuard, RawRpcReply, ReplyRx, RpcReplyError, RpcReplyPort};
 
         let (reply_sender, reply_token) = ReplyRx::new();
         let payload = msg
@@ -665,12 +667,14 @@ impl<S: Service> ServiceMessage<S> {
 
         let (reply_port, reply_rx) = RpcReplyPort::new();
 
+        let pin_guard = PinGuard::new("service_queue", payload.len());
         let raw_rpc = RawRpc {
             reply_port,
             payload,
             sort_code,
             msg_type: M::TYPE.to_owned(),
             reservation: MemoryLease::unlinked(),
+            pin_guard,
         };
 
         let raw_incoming = Incoming::new(
@@ -684,7 +688,8 @@ impl<S: Service> ServiceMessage<S> {
             match reply_rx.await {
                 Ok(envelope) => match envelope.body {
                     rpc_reply::Body::Payload(payload) => {
-                        reply_sender.send(RawRpcReply::Success((protocol_version, payload)))
+                        let guard = PinGuard::new("rpc_reply", payload.len());
+                        reply_sender.send(RawRpcReply::Success((protocol_version, payload, guard)))
                     }
                     rpc_reply::Body::Status(status) => {
                         reply_sender.send(RawRpcReply::Error(RpcReplyError::from(status)))

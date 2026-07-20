@@ -16,15 +16,18 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{info, trace};
 
-use restate_core::network::{NetworkSender, Networking, RpcError, Swimlane, TransportConnect};
+use restate_core::network::{
+    NetworkSender, Networking, PinGuard, RpcError, Swimlane, TransportConnect,
+};
 use restate_core::{Metadata, ShutdownError, TaskCenter, TaskHandle, TaskKind, my_node_id};
 use restate_types::config::{Configuration, ReplicatedLogletOptions};
 use restate_types::logs::{
-    KeyFilter, LogletOffset, MatchKeyQuery, RecordCache, SequenceNumber, TailOffsetWatch,
+    KeyFilter, LogletOffset, MatchKeyQuery, Record, RecordCache, SequenceNumber, TailOffsetWatch,
 };
 use restate_types::net::log_server::{GetRecords, LogServerRequestHeader, MaybeRecord};
 use restate_types::replicated_loglet::{EffectiveNodeSet, LogNodeSetExt, ReplicatedLogletParams};
 use restate_types::replication::NodeSet;
+use restate_types::storage::PolyBytes;
 use restate_types::{NodeId, PlainNodeId};
 
 use crate::LogEntry;
@@ -39,6 +42,16 @@ use crate::providers::replicated_loglet::tasks::GetTrimPointTask;
 #[derive(Debug, thiserror::Error)]
 #[error("Impossible to read from nodeset {0:?}, all nodes are disabled")]
 struct ImpossibleNodeSetError(NodeSet);
+
+/// Tracks a record's fabric-derived `PolyBytes::Bytes` body under the `"readahead"` site
+/// for as long as it sits in this read stream's read-ahead channel awaiting delivery to the
+/// consumer. `Typed`/`Both` bodies aren't zero-copy fabric slices, so they're not tracked.
+fn readahead_pin_guard(record: &Record) -> Option<PinGuard> {
+    match record.body() {
+        PolyBytes::Bytes(bytes) => Some(PinGuard::new("readahead", bytes.len())),
+        PolyBytes::Typed(_) | PolyBytes::Both(_, _) => None,
+    }
+}
 
 struct Stats {
     cache_filtered: Counter,
@@ -458,7 +471,12 @@ impl ReadStreamTask {
                                 // read the same records that we shipped. If this assumption
                                 // changes in the future, we can cache at this point.
                                 self.stats.records_read.increment(1);
-                                permit.send(Ok(LogEntry::new_data(self.read_pointer, record)));
+                                let guard = readahead_pin_guard(&record);
+                                let mut entry = LogEntry::new_data(self.read_pointer, record);
+                                if let Some(guard) = guard {
+                                    entry = entry.with_pin_guard(guard);
+                                }
+                                permit.send(Ok(entry));
                                 self.read_pointer = self.read_pointer.next();
                             }
                         }
@@ -554,7 +572,12 @@ impl ReadStreamTask {
                     .invalidate_record(self.my_params.loglet_id, self.read_pointer);
                 self.stats.cache_hits.increment(1);
                 self.stats.records_read.increment(1);
-                permit.send(Ok(LogEntry::new_data(self.read_pointer, record)));
+                let guard = readahead_pin_guard(&record);
+                let mut entry = LogEntry::new_data(self.read_pointer, record);
+                if let Some(guard) = guard {
+                    entry = entry.with_pin_guard(guard);
+                }
+                permit.send(Ok(entry));
                 CacheReadResult::Sent
             }
         } else {

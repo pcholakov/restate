@@ -8880,6 +8880,7 @@ dependencies = [
  "jsonptr 0.7.1",
  "jsonschema",
  "listenfd",
+ "metrics",
  "moka",
  "notify",
  "notify-debouncer-full",

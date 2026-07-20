@@ -22,7 +22,7 @@ use restate_types::net::{ProtocolVersion, Service, UnaryMessage, WatchResponse};
 use restate_types::net::{RpcRequest, RpcResponse, WatchRequest};
 
 use super::protobuf::network::{rpc_reply, watch_update};
-use super::{ConnectionClosed, PeerMetadataVersion, Verdict};
+use super::{ConnectionClosed, PeerMetadataVersion, PinGuard, Verdict};
 
 /// A wrapper for incoming messages over a network connection.
 #[derive(Debug)]
@@ -74,6 +74,11 @@ pub struct Rpc<M> {
     payload: Bytes,
     sort_code: Option<u64>,
     reservation: MemoryLease,
+    /// Tracks `payload` under the `"service_queue"` retention site while the
+    /// request is queued/decoded (see `PinGuard`). Never read; held only for its
+    /// `Drop` side effect.
+    #[allow(dead_code)]
+    pin_guard: PinGuard,
     _phantom: PhantomData<M>,
 }
 
@@ -116,6 +121,9 @@ pub struct RawRpc {
     /// Memory reservation for this message, used for backpressure.
     #[debug(skip)]
     pub(super) reservation: MemoryLease,
+    /// Tracks `payload` under the `"service_queue"` retention site (see `PinGuard`).
+    #[debug(skip)]
+    pub(super) pin_guard: PinGuard,
 }
 
 /// Untyped RPC message bound to a certain service type
@@ -129,6 +137,8 @@ pub struct RawSvcRpc<S> {
     msg_type: String,
     #[debug(skip)]
     reservation: MemoryLease,
+    #[debug(skip)]
+    pin_guard: PinGuard,
     _phantom: PhantomData<S>,
 }
 // --- END RPC ---
@@ -286,6 +296,7 @@ impl<S: Service> Incoming<RawSvcRpc<S>> {
                 sort_code: raw.inner.sort_code,
                 msg_type: raw.inner.msg_type,
                 reservation: raw.inner.reservation,
+                pin_guard: raw.inner.pin_guard,
                 _phantom: PhantomData,
             },
             peer: raw.peer,
@@ -303,6 +314,7 @@ impl<S: Service> Incoming<RawSvcRpc<S>> {
                 sort_code: self.inner.sort_code,
                 msg_type: self.inner.msg_type,
                 reservation: self.inner.reservation,
+                pin_guard: self.inner.pin_guard,
             },
             peer: self.peer,
             metadata_version: self.metadata_version,
@@ -344,6 +356,7 @@ impl<S: Service> Incoming<RawSvcRpc<S>> {
                 payload: self.inner.payload,
                 sort_code: self.inner.sort_code,
                 reservation: self.inner.reservation,
+                pin_guard: self.inner.pin_guard,
                 _phantom: PhantomData,
             },
             protocol_version: self.protocol_version,

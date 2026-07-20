@@ -21,12 +21,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, trace, warn};
 
 use restate_core::TaskCenter;
-use restate_core::network::{NetworkSender, RpcError, Swimlane};
+use restate_core::network::{NetworkSender, PinGuard, RpcError, Swimlane};
 use restate_core::{
     Metadata, TaskCenterFutureExt,
     network::{Networking, TransportConnect},
 };
 use restate_types::replicated_loglet::Spread;
+use restate_types::storage::PolyBytes;
 use restate_types::{
     Merge, PlainNodeId,
     config::Configuration,
@@ -79,6 +80,10 @@ pub(crate) struct SequencerAppender<T> {
     configuration: Live<Configuration>,
     // nodes that should be avoided by the spread selector
     graylist: NodeSet,
+    /// Tracks fabric-derived `PolyBytes::Bytes` bytes across `records` under the
+    /// `"sequencer_inflight"` site (see `PinGuard`) for as long as this append is in flight;
+    /// dropped when the appender completes (commit or error) and `self` is dropped.
+    _pin_guard: Option<PinGuard>,
 }
 
 impl<T: TransportConnect> SequencerAppender<T> {
@@ -103,12 +108,18 @@ impl<T: TransportConnect> SequencerAppender<T> {
             DecoratedNodeSet::from(sequencer_shared_state.selector.nodeset().clone());
 
         let mut payload_size: u32 = 0;
+        let mut fabric_bytes: usize = 0;
         for record in records.iter() {
             // it's safe to cast since a record would be never be larger than 4GiB.
             let record_size = record.estimated_encode_size() as u32;
             sequencer_shared_state.stats.record_size(record_size);
             payload_size += record_size;
+            if let PolyBytes::Bytes(bytes) = record.body() {
+                fabric_bytes += bytes.len();
+            }
         }
+        let pin_guard =
+            (fabric_bytes > 0).then(|| PinGuard::new("sequencer_inflight", fabric_bytes));
 
         Self {
             sequencer_shared_state,
@@ -123,6 +134,7 @@ impl<T: TransportConnect> SequencerAppender<T> {
             commit_resolver: Some(commit_resolver),
             configuration: Configuration::live(),
             graylist: NodeSet::default(),
+            _pin_guard: pin_guard,
         }
     }
 

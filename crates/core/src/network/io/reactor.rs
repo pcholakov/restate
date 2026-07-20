@@ -38,7 +38,8 @@ use crate::network::protobuf::network::{Datagram, RpcReply, datagram, rpc_reply}
 use crate::network::protobuf::network::{Header, Message};
 use crate::network::tracking::ConnectionTracking;
 use crate::network::{
-    Connection, MessageRouter, PeerMetadataVersion, ReplyEnvelope, RouterError, RpcReplyError,
+    Connection, MessageRouter, PeerMetadataVersion, PinGuard, ReplyEnvelope, RouterError,
+    RpcReplyError,
 };
 use crate::{Metadata, ShutdownError, TaskCenter, TaskContext, TaskId, TaskKind};
 
@@ -378,9 +379,11 @@ impl ConnectionReactor {
                         }
                         Some(rpc_reply::Body::Payload(payload)) => {
                             trace!(rpc_id = %msg.id, "Received RPC response with payload!");
+                            let guard = PinGuard::new("rpc_reply", payload.len());
                             reply_sender.send(crate::network::RawRpcReply::Success((
                                 self.connection.protocol_version,
                                 payload,
+                                guard,
                             )))
                         }
                         None => {

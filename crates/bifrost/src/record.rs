@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use restate_core::network::PinGuard;
 use restate_platform::memory::EstimatedMemorySize;
 use restate_types::logs::{BodyWithKeys, HasRecordKeys, Keys, Lsn, Record};
 use restate_types::logs::{LogletOffset, SequenceNumber};
@@ -38,6 +39,11 @@ pub enum RecordKind {
 pub struct LogEntry<S = Lsn> {
     offset: S,
     record: MaybeRecord<S>,
+    /// Tracks a fabric-derived `PolyBytes::Bytes` record body under the `"readahead"`
+    /// retention site (see `PinGuard`) for as long as this entry sits in a read-ahead
+    /// buffer/channel awaiting delivery to the consumer. `Arc`-wrapped so `LogEntry`
+    /// stays `Clone`; only set by the replicated-loglet read path.
+    pin_guard: Option<Arc<PinGuard>>,
 }
 
 impl LogEntry<LogletOffset> {
@@ -58,6 +64,7 @@ impl LogEntry<LogletOffset> {
         LogEntry {
             offset: base_lsn.offset_by(self.offset),
             record,
+            pin_guard: self.pin_guard,
         }
     }
 }
@@ -78,7 +85,15 @@ impl<S: Copy> LogEntry<S> {
         Self {
             offset,
             record: MaybeRecord::Data(record),
+            pin_guard: None,
         }
+    }
+
+    /// Attaches a `PinGuard` covering this entry's record body for as long as the entry
+    /// itself is held (e.g. buffered in a read-ahead channel). See `pin_guard` field docs.
+    pub(crate) fn with_pin_guard(mut self, guard: PinGuard) -> Self {
+        self.pin_guard = Some(Arc::new(guard));
+        self
     }
 
     pub fn dissolve(self) -> (S, MaybeRecord<S>) {
@@ -90,6 +105,7 @@ impl<S: Copy> LogEntry<S> {
         LogEntry {
             offset,
             record: MaybeRecord::TrimGap(Gap { to }),
+            pin_guard: None,
         }
     }
 
@@ -99,6 +115,7 @@ impl<S: Copy> LogEntry<S> {
         LogEntry {
             offset,
             record: MaybeRecord::DataLoss(Gap { to }),
+            pin_guard: None,
         }
     }
 
@@ -109,6 +126,7 @@ impl<S: Copy> LogEntry<S> {
         LogEntry {
             offset,
             record: MaybeRecord::Filtered(Gap { to }),
+            pin_guard: None,
         }
     }
 

@@ -24,13 +24,19 @@ use super::{LogletId, LogletOffset, Record, SequenceNumber};
 /// Unique record key across different loglets.
 type RecordKey = (LogletId, LogletOffset);
 
+#[derive(Clone)]
+struct RecordCacheEntry {
+    record: Record,
+    weight: u32,
+}
+
 /// A a simple LRU-based record cache.
 ///
 /// This can be safely shared between all ReplicatedLoglet(s) and the LocalSequencers or the
 /// RemoteSequencers
 #[derive(Clone)]
 pub struct RecordCache {
-    inner: Option<Cache<RecordKey, Record, ahash::RandomState>>,
+    inner: Option<Cache<RecordKey, RecordCacheEntry, ahash::RandomState>>,
 }
 
 impl RecordCache {
@@ -41,7 +47,7 @@ impl RecordCache {
             Some(
                 CacheBuilder::default()
                     .name("ReplicatedLogRecordCache")
-                    .weigher(|_, record: &Record| Self::weight(record))
+                    .weigher(|_, entry: &RecordCacheEntry| entry.weight)
                     .max_capacity(memory_budget_bytes.try_into().unwrap_or(u64::MAX))
                     .eviction_policy(EvictionPolicy::lru())
                     .build_with_hasher(ahash::RandomState::default()),
@@ -62,7 +68,7 @@ impl RecordCache {
             .entry((loglet_id, offset))
             .and_compute_with(|existing| {
                 let Some(existing) = existing else {
-                    if matches!(record.body(), PolyBytes::Bytes(_)) && !Self::fits(inner, record) {
+                    if !Self::fits(inner, record) {
                         return Op::Nop;
                     }
 
@@ -70,26 +76,27 @@ impl RecordCache {
                     return Op::Put(Self::cache_owned(record));
                 };
 
-                match (existing.value().body(), record.body()) {
+                match (existing.value().record.body(), record.body()) {
                     (PolyBytes::Bytes(_), PolyBytes::Bytes(_)) => Op::Nop,
-                    (PolyBytes::Bytes(_), PolyBytes::Typed(_)) => Op::Put(record.clone()),
-                    (PolyBytes::Bytes(_), PolyBytes::Both(typed, _)) => {
+                    (PolyBytes::Bytes(_), PolyBytes::Typed(_)) => {
+                        Op::Put(Self::cache_owned(record))
+                    }
+                    (PolyBytes::Bytes(_), PolyBytes::Both(_, _)) => {
                         // we only need to cache the typed value, let's repackage it.
-                        Op::Put(Record::from_parts(
-                            record.created_at(),
-                            record.keys().clone(),
-                            PolyBytes::Typed(Arc::clone(typed)),
-                        ))
+                        Op::Put(Self::cache_owned(record))
                     }
                     // Shouldn't happen (we only cache Typed or Bytes), but let's handle it anyway.
                     (PolyBytes::Both(typed, _), _) =>
                     // repackage the existing value into Typed only
                     {
-                        Op::Put(Record::from_parts(
-                            existing.value().created_at(),
-                            existing.value().keys().clone(),
-                            PolyBytes::Typed(Arc::clone(typed)),
-                        ))
+                        Op::Put(RecordCacheEntry {
+                            record: Record::from_parts(
+                                existing.value().record.created_at(),
+                                existing.value().record.keys().clone(),
+                                PolyBytes::Typed(Arc::clone(typed)),
+                            ),
+                            weight: existing.value().weight,
+                        })
                     }
                     (PolyBytes::Typed(_), _) => Op::Nop,
                 }
@@ -103,7 +110,10 @@ impl RecordCache {
             .unwrap_or(u32::MAX)
     }
 
-    fn fits(inner: &Cache<RecordKey, Record, ahash::RandomState>, record: &Record) -> bool {
+    fn fits(
+        inner: &Cache<RecordKey, RecordCacheEntry, ahash::RandomState>,
+        record: &Record,
+    ) -> bool {
         inner
             .policy()
             .max_capacity()
@@ -115,8 +125,9 @@ impl RecordCache {
     /// A [`Bytes`] value can be a small slice of a much larger allocation. Copy raw bodies when
     /// admitting a record so the cache capacity accounts for the memory it actually retains.
     /// Typed values are already reference counted, and any `Both` values will be reduced to only
-    /// the typed representation.
-    fn cache_owned(record: &Record) -> Record {
+    /// the typed representation. The weight is retained from the original record because a
+    /// `Typed` value cannot estimate its encoded size.
+    fn cache_owned(record: &Record) -> RecordCacheEntry {
         let body = match record.body() {
             PolyBytes::Bytes(bytes) => PolyBytes::Bytes(Bytes::copy_from_slice(bytes)),
             PolyBytes::Typed(typed) => PolyBytes::Typed(Arc::clone(typed)),
@@ -124,7 +135,10 @@ impl RecordCache {
             PolyBytes::Both(typed, _) => PolyBytes::Typed(Arc::clone(typed)),
         };
 
-        Record::from_parts(record.created_at(), record.keys().clone(), body)
+        RecordCacheEntry {
+            record: Record::from_parts(record.created_at(), record.keys().clone(), body),
+            weight: Self::weight(record),
+        }
     }
 
     /// Writes a record to cache externally
@@ -161,7 +175,7 @@ impl RecordCache {
     pub fn get(&self, loglet_id: LogletId, offset: LogletOffset) -> Option<Record> {
         let inner = self.inner.as_ref()?;
 
-        inner.get(&(loglet_id, offset))
+        inner.get(&(loglet_id, offset)).map(|entry| entry.record)
     }
 }
 
@@ -249,7 +263,7 @@ mod tests {
             &typed,
         ));
 
-        let both_cache = RecordCache::new(4 * 1024);
+        let both_cache = RecordCache::new(16 * 1024);
         both_cache.add(
             LOGLET_ID,
             OFFSET,
@@ -263,6 +277,40 @@ mod tests {
         let cached = both_cache.get(LOGLET_ID, OFFSET).unwrap();
         assert!(matches!(cached.body(), PolyBytes::Typed(_)));
         assert!(Arc::ptr_eq(&cached.decode_arc::<String>().unwrap(), &typed,));
+    }
+
+    #[test]
+    fn cache_miss_detaches_both_body_and_preserves_its_weight() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let backing = Bytes::from_owner(TrackingBacking {
+            bytes: vec![42; 128 * 1024],
+            dropped: Arc::clone(&dropped),
+        });
+        let body = backing.slice(64 * 1024..128 * 1024);
+        let typed = Arc::new("typed body".to_owned());
+        let record = Record::from_parts(
+            NanosSinceEpoch::now(),
+            Keys::None,
+            PolyBytes::Both(typed.clone(), body.clone()),
+        );
+        let expected_weight = u64::from(RecordCache::weight(&record));
+        let cache = RecordCache::new(128 * 1024);
+
+        cache.add(LOGLET_ID, OFFSET, &record);
+
+        drop(record);
+        drop(body);
+        drop(backing);
+
+        assert!(dropped.load(Ordering::Acquire));
+
+        let cached = cache.get(LOGLET_ID, OFFSET).unwrap();
+        assert!(matches!(cached.body(), PolyBytes::Typed(_)));
+        assert!(Arc::ptr_eq(&cached.decode_arc::<String>().unwrap(), &typed));
+
+        let inner = cache.inner.as_ref().unwrap();
+        inner.run_pending_tasks();
+        assert_eq!(inner.weighted_size(), expected_weight);
     }
 
     #[test]

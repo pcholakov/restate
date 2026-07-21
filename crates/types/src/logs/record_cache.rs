@@ -66,8 +66,10 @@ impl RecordCache {
                         return Op::Nop;
                     }
 
+                    // ensure the cache entry does not retain a much larger buffer
                     return Op::Put(Self::cache_owned(record));
                 };
+
                 match (existing.value().body(), record.body()) {
                     (PolyBytes::Bytes(_), PolyBytes::Bytes(_)) => Op::Nop,
                     (PolyBytes::Bytes(_), PolyBytes::Typed(_)) => Op::Put(record.clone()),
@@ -81,7 +83,7 @@ impl RecordCache {
                     }
                     // Shouldn't happen (we only cache Typed or Bytes), but let's handle it anyway.
                     (PolyBytes::Both(typed, _), _) =>
-                    // repackge the existing value into Typed only
+                    // repackage the existing value into Typed only
                     {
                         Op::Put(Record::from_parts(
                             existing.value().created_at(),
@@ -112,12 +114,13 @@ impl RecordCache {
     ///
     /// A [`Bytes`] value can be a small slice of a much larger allocation. Copy raw bodies when
     /// admitting a record so the cache capacity accounts for the memory it actually retains.
-    /// Typed values are already reference counted, and cached `Both` values only need the typed
-    /// representation.
+    /// Typed values are already reference counted, and any `Both` values will be reduced to only
+    /// the typed representation.
     fn cache_owned(record: &Record) -> Record {
         let body = match record.body() {
             PolyBytes::Bytes(bytes) => PolyBytes::Bytes(Bytes::copy_from_slice(bytes)),
             PolyBytes::Typed(typed) => PolyBytes::Typed(Arc::clone(typed)),
+            // Shouldn't happen (we only cache Typed or Bytes), but handle it anyway:
             PolyBytes::Both(typed, _) => PolyBytes::Typed(Arc::clone(typed)),
         };
 
@@ -211,21 +214,18 @@ mod tests {
 
         cache.add(LOGLET_ID, OFFSET, &record);
 
-        {
-            let cached = cache.get(LOGLET_ID, OFFSET).unwrap();
-            let PolyBytes::Bytes(cached_body) = cached.body() else {
-                panic!("raw record should remain raw in the cache");
-            };
-
-            assert_eq!(cached_body, &body);
-            assert_ne!(cached_body.as_ptr(), body.as_ptr());
-        }
-
         drop(record);
         drop(body);
         drop(backing);
 
         assert!(dropped.load(Ordering::Acquire));
+
+        let cached = cache.get(LOGLET_ID, OFFSET).unwrap();
+        let PolyBytes::Bytes(cached_body) = cached.body() else {
+            panic!("raw record should remain raw in the cache");
+        };
+
+        assert_eq!(cached_body.as_ref(), &[42; 1024]);
     }
 
     #[test]

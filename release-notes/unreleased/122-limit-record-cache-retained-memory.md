@@ -1,4 +1,4 @@
-# Release Notes for Issue #122: Limit RecordCache Retained Memory
+# Release Notes: Limit RecordCache Retained Memory
 
 ## Bug Fix
 
@@ -22,7 +22,3 @@ traffic.
 ### Migration Guidance
 
 No migration is required.
-
-### Related Issues
-
-- Issue #122: RecordCache memory growth

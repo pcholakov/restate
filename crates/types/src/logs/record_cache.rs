@@ -314,6 +314,50 @@ mod tests {
     }
 
     #[test]
+    fn raw_entry_replaced_with_both_preserves_its_weight() {
+        let cache = RecordCache::new(128 * 1024);
+        cache.add(
+            LOGLET_ID,
+            OFFSET,
+            &Record::from_parts(
+                NanosSinceEpoch::now(),
+                Keys::None,
+                PolyBytes::Bytes(Bytes::from_static(b"raw body")),
+            ),
+        );
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let backing = Bytes::from_owner(TrackingBacking {
+            bytes: vec![42; 128 * 1024],
+            dropped: Arc::clone(&dropped),
+        });
+        let body = backing.slice(64 * 1024..128 * 1024);
+        let typed = Arc::new("typed body".to_owned());
+        let record = Record::from_parts(
+            NanosSinceEpoch::now(),
+            Keys::None,
+            PolyBytes::Both(typed.clone(), body.clone()),
+        );
+        let expected_weight = u64::from(RecordCache::weight(&record));
+
+        cache.add(LOGLET_ID, OFFSET, &record);
+
+        drop(record);
+        drop(body);
+        drop(backing);
+
+        assert!(dropped.load(Ordering::Acquire));
+
+        let cached = cache.get(LOGLET_ID, OFFSET).unwrap();
+        assert!(matches!(cached.body(), PolyBytes::Typed(_)));
+        assert!(Arc::ptr_eq(&cached.decode_arc::<String>().unwrap(), &typed));
+
+        let inner = cache.inner.as_ref().unwrap();
+        inner.run_pending_tasks();
+        assert_eq!(inner.weighted_size(), expected_weight);
+    }
+
+    #[test]
     fn duplicate_raw_record_does_not_replace_cached_record() {
         let cache = RecordCache::new(4 * 1024);
         let first = Record::from_parts(

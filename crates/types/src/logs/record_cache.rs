@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use moka::{
     ops::compute::Op,
     policy::EvictionPolicy,
@@ -40,12 +41,7 @@ impl RecordCache {
             Some(
                 CacheBuilder::default()
                     .name("ReplicatedLogRecordCache")
-                    .weigher(|_, record: &Record| {
-                        record
-                            .estimated_encode_size()
-                            .try_into()
-                            .unwrap_or(u32::MAX)
-                    })
+                    .weigher(|_, record: &Record| Self::weight(record))
                     .max_capacity(memory_budget_bytes.try_into().unwrap_or(u64::MAX))
                     .eviction_policy(EvictionPolicy::lru())
                     .build_with_hasher(ahash::RandomState::default()),
@@ -66,7 +62,11 @@ impl RecordCache {
             .entry((loglet_id, offset))
             .and_compute_with(|existing| {
                 let Some(existing) = existing else {
-                    return Op::Put(record.clone());
+                    if matches!(record.body(), PolyBytes::Bytes(_)) && !Self::fits(inner, record) {
+                        return Op::Nop;
+                    }
+
+                    return Op::Put(Self::cache_owned(record));
                 };
                 match (existing.value().body(), record.body()) {
                     (PolyBytes::Bytes(_), PolyBytes::Bytes(_)) => Op::Nop,
@@ -92,6 +92,36 @@ impl RecordCache {
                     (PolyBytes::Typed(_), _) => Op::Nop,
                 }
             });
+    }
+
+    fn weight(record: &Record) -> u32 {
+        record
+            .estimated_encode_size()
+            .try_into()
+            .unwrap_or(u32::MAX)
+    }
+
+    fn fits(inner: &Cache<RecordKey, Record, ahash::RandomState>, record: &Record) -> bool {
+        inner
+            .policy()
+            .max_capacity()
+            .is_none_or(|max_capacity| u64::from(Self::weight(record)) <= max_capacity)
+    }
+
+    /// Creates the representation retained by the cache.
+    ///
+    /// A [`Bytes`] value can be a small slice of a much larger allocation. Copy raw bodies when
+    /// admitting a record so the cache capacity accounts for the memory it actually retains.
+    /// Typed values are already reference counted, and cached `Both` values only need the typed
+    /// representation.
+    fn cache_owned(record: &Record) -> Record {
+        let body = match record.body() {
+            PolyBytes::Bytes(bytes) => PolyBytes::Bytes(Bytes::copy_from_slice(bytes)),
+            PolyBytes::Typed(typed) => PolyBytes::Typed(Arc::clone(typed)),
+            PolyBytes::Both(typed, _) => PolyBytes::Typed(Arc::clone(typed)),
+        };
+
+        Record::from_parts(record.created_at(), record.keys().clone(), body)
     }
 
     /// Writes a record to cache externally
@@ -129,5 +159,149 @@ impl RecordCache {
         let inner = self.inner.as_ref()?;
 
         inner.get(&(loglet_id, offset))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use bytes::Bytes;
+
+    use super::{LogletId, LogletOffset, PolyBytes, Record, RecordCache};
+    use crate::{logs::Keys, time::NanosSinceEpoch};
+
+    const LOGLET_ID: LogletId = LogletId::new_unchecked(1);
+    const OFFSET: LogletOffset = LogletOffset::new(1);
+
+    struct TrackingBacking {
+        bytes: Vec<u8>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AsRef<[u8]> for TrackingBacking {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for TrackingBacking {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn cache_miss_copies_raw_body_without_retaining_its_backing_allocation() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let backing = Bytes::from_owner(TrackingBacking {
+            bytes: vec![42; 128 * 1024],
+            dropped: Arc::clone(&dropped),
+        });
+        let body = backing.slice(64 * 1024..65 * 1024);
+        let record = Record::from_parts(
+            NanosSinceEpoch::now(),
+            Keys::None,
+            PolyBytes::Bytes(body.clone()),
+        );
+        let cache = RecordCache::new(2 * 1024);
+
+        cache.add(LOGLET_ID, OFFSET, &record);
+
+        {
+            let cached = cache.get(LOGLET_ID, OFFSET).unwrap();
+            let PolyBytes::Bytes(cached_body) = cached.body() else {
+                panic!("raw record should remain raw in the cache");
+            };
+
+            assert_eq!(cached_body, &body);
+            assert_ne!(cached_body.as_ptr(), body.as_ptr());
+        }
+
+        drop(record);
+        drop(body);
+        drop(backing);
+
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cache_miss_retains_typed_values_without_raw_bytes() {
+        let typed = Arc::new("typed body".to_owned());
+        let typed_record = Record::from_parts(
+            NanosSinceEpoch::now(),
+            Keys::None,
+            PolyBytes::Typed(typed.clone()),
+        );
+        let typed_cache = RecordCache::new(4 * 1024);
+
+        typed_cache.add(LOGLET_ID, OFFSET, &typed_record);
+
+        assert!(Arc::ptr_eq(
+            &typed_cache
+                .get(LOGLET_ID, OFFSET)
+                .unwrap()
+                .decode_arc::<String>()
+                .unwrap(),
+            &typed,
+        ));
+
+        let both_cache = RecordCache::new(4 * 1024);
+        both_cache.add(
+            LOGLET_ID,
+            OFFSET,
+            &Record::from_parts(
+                NanosSinceEpoch::now(),
+                Keys::None,
+                PolyBytes::Both(typed.clone(), Bytes::from(vec![42; 8 * 1024])),
+            ),
+        );
+
+        let cached = both_cache.get(LOGLET_ID, OFFSET).unwrap();
+        assert!(matches!(cached.body(), PolyBytes::Typed(_)));
+        assert!(Arc::ptr_eq(&cached.decode_arc::<String>().unwrap(), &typed,));
+    }
+
+    #[test]
+    fn duplicate_raw_record_does_not_replace_cached_record() {
+        let cache = RecordCache::new(4 * 1024);
+        let first = Record::from_parts(
+            NanosSinceEpoch::now(),
+            Keys::None,
+            PolyBytes::Bytes(Bytes::from_static(b"first")),
+        );
+        let duplicate = Record::from_parts(
+            NanosSinceEpoch::now(),
+            Keys::None,
+            PolyBytes::Bytes(Bytes::from_static(b"duplicate")),
+        );
+
+        cache.add(LOGLET_ID, OFFSET, &first);
+        let first_cached = cache.get(LOGLET_ID, OFFSET).unwrap();
+        cache.add(LOGLET_ID, OFFSET, &duplicate);
+        let cached = cache.get(LOGLET_ID, OFFSET).unwrap();
+
+        assert!(matches!(cached.body(), PolyBytes::Bytes(bytes) if bytes.as_ref() == b"first"));
+        assert!(matches!(
+            (first_cached.body(), cached.body()),
+            (PolyBytes::Bytes(first), PolyBytes::Bytes(cached)) if first.as_ptr() == cached.as_ptr()
+        ));
+    }
+
+    #[test]
+    fn oversized_raw_record_is_not_cached() {
+        let cache = RecordCache::new(1024);
+        let record = Record::from_parts(
+            NanosSinceEpoch::now(),
+            Keys::None,
+            PolyBytes::Bytes(Bytes::from(vec![42; 1024])),
+        );
+
+        cache.add(LOGLET_ID, OFFSET, &record);
+
+        assert!(cache.get(LOGLET_ID, OFFSET).is_none());
     }
 }

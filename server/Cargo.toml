@@ -74,11 +74,13 @@ restate-metadata-server = { workspace = true, features = ["test-util"] }
 restate-metadata-store = { workspace = true, features = ["test-util"] }
 restate-metadata-providers = { workspace = true, features = ["replicated"] }
 restate-node = { workspace = true, features = ["memory-loglet", "test-util"] }
+restatectl = { workspace = true }
 restate-types = { workspace = true, features = ["test-util"] }
 mock-service-endpoint = { workspace = true }
 
 anyhow = { workspace = true }
 bytestring = { workspace = true}
+cling = { workspace = true }
 googletest = { workspace = true }
 tempfile = { workspace = true }
 test-log = { workspace = true }

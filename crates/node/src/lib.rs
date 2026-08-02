@@ -13,6 +13,7 @@ mod init;
 mod introspection;
 mod metric_definitions;
 mod network_server;
+mod restore;
 mod roles;
 
 use std::sync::Arc;
@@ -154,6 +155,7 @@ pub struct Node {
     is_provisioned: bool,
     prometheus: Prometheus,
     address_book: AddressBook,
+    partition_store_manager: Arc<PartitionStoreManager>,
 }
 
 impl Node {
@@ -459,6 +461,7 @@ impl Node {
             is_provisioned,
             prometheus,
             address_book,
+            partition_store_manager,
         })
     }
 
@@ -468,6 +471,8 @@ impl Node {
 
         let metadata_writer = self.metadata_manager.writer();
         let metadata = Metadata::current();
+        let partition_store_manager = Arc::clone(&self.partition_store_manager);
+        let restore_target_is_unprovisioned = !self.is_provisioned && !config.common.auto_provision;
 
         // Start metadata manager
         spawn_metadata_manager(self.metadata_manager)?;
@@ -482,6 +487,8 @@ impl Node {
                     self.server_builder,
                     metadata_writer,
                     self.prometheus,
+                    partition_store_manager,
+                    restore_target_is_unprovisioned,
                 )
                 .await?;
                 Ok(())
@@ -796,10 +803,22 @@ fn create_initial_nodes_configuration(
     common_opts: &CommonOptions,
     features: EnumSet<ClusterFeature>,
 ) -> NodesConfiguration {
+    create_initial_nodes_configuration_with_fingerprint(
+        common_opts,
+        features,
+        ClusterFingerprint::generate(),
+    )
+}
+
+fn create_initial_nodes_configuration_with_fingerprint(
+    common_opts: &CommonOptions,
+    features: EnumSet<ClusterFeature>,
+    fingerprint: ClusterFingerprint,
+) -> NodesConfiguration {
     let mut initial_nodes_configuration = NodesConfiguration::new(
         Version::MIN,
         common_opts.cluster_name().to_owned(),
-        ClusterFingerprint::generate(),
+        fingerprint,
     );
     initial_nodes_configuration.set_features(features);
     let my_advertised_address =

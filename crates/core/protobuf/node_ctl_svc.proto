@@ -33,6 +33,9 @@ service NodeCtlSvc {
   // Trigger manual compaction of RocksDB databases on this node.
   rpc TriggerCompaction(TriggerCompactionRequest)
       returns (TriggerCompactionResponse);
+
+  // Restore a V0 cluster backup onto an unprovisioned node.
+  rpc RestoreCluster(RestoreClusterRequest) returns (RestoreClusterResponse);
 }
 
 enum ClusterFeature {
@@ -140,4 +143,20 @@ message DatabaseCompactionResult {
   bool success = 2;
   optional string error = 3;
   uint32 column_families_compacted = 4;
+}
+
+message RestoreClusterRequest {
+  // A serialized restate_types::cluster_backup::ClusterBackupDescriptor.
+  bytes descriptor_json = 1;
+  bool restore_schema = 2;
+  bool preserve_cluster_fingerprint = 3;
+  bool dry_run = 4;
+}
+
+message RestoreClusterResponse {
+  bool dry_run = 1;
+  uint32 partition_count = 2;
+  bool schema_restored = 3;
+  string target_cluster_name = 4;
+  optional string target_cluster_fingerprint = 5;
 }

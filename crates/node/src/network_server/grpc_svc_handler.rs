@@ -8,7 +8,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::cmp::max_by_key;
+use std::{cmp::max_by_key, sync::Arc};
 
 use anyhow::Context;
 use bytes::BytesMut;
@@ -30,33 +30,55 @@ use restate_core::protobuf::node_ctl_svc::node_ctl_svc_server::{NodeCtlSvc, Node
 use restate_core::protobuf::node_ctl_svc::{
     ClusterHealthResponse, DatabaseCompactionResult, EmbeddedMetadataClusterHealth,
     GetMetadataRequest, GetMetadataResponse, IdentResponse, ProvisionClusterRequest,
-    ProvisionClusterResponse, TriggerCompactionRequest, TriggerCompactionResponse,
-    cluster_features_from_proto,
+    ProvisionClusterResponse, RestoreClusterRequest, RestoreClusterResponse,
+    TriggerCompactionRequest, TriggerCompactionResponse, cluster_features_from_proto,
 };
 use restate_core::{Identification, MetadataWriter};
 use restate_core::{Metadata, MetadataKind};
 use restate_metadata_store::{MetadataStoreClient, ReadError, WriteError};
+use restate_partition_store::PartitionStoreManager;
 use restate_rocksdb::RocksDbManager;
 use restate_types::Version;
+use restate_types::cluster_backup::ClusterBackupDescriptor;
 use restate_types::config::{Configuration, NetworkingOptions};
 use restate_types::errors::{ConversionError, MaybeRetryableError};
 use restate_types::logs::metadata::{NodeSetSize, ProviderConfiguration};
 use restate_types::metadata::VersionedValue;
-use restate_types::nodes_config::{ClusterFeature, Role};
+use restate_types::metadata_store::keys::NODES_CONFIG_KEY;
+use restate_types::nodes_config::{ClusterFeature, NodesConfiguration, Role};
 use restate_types::protobuf::cluster::ClusterConfiguration as ProtoClusterConfiguration;
 use restate_types::protobuf::common::DatabaseKind;
 use restate_types::replication::ReplicationProperty;
 use restate_types::storage::StorageCodec;
 
+use crate::restore::{self, RestoreOptions};
 use crate::{ClusterConfiguration, provision_cluster_metadata};
+
+fn metadata_store_is_explicitly_unprovisioned(error: &ReadError) -> bool {
+    error
+        .to_string()
+        .contains("Metadata store has not been provisioned yet")
+}
 
 pub struct NodeCtlSvcHandler {
     metadata_writer: MetadataWriter,
+    partition_store_manager: Arc<PartitionStoreManager>,
+    restore_target_is_unprovisioned: bool,
+    provision_lock: tokio::sync::Mutex<()>,
 }
 
 impl NodeCtlSvcHandler {
-    pub fn new(metadata_writer: MetadataWriter) -> Self {
-        Self { metadata_writer }
+    pub fn new(
+        metadata_writer: MetadataWriter,
+        partition_store_manager: Arc<PartitionStoreManager>,
+        restore_target_is_unprovisioned: bool,
+    ) -> Self {
+        Self {
+            metadata_writer,
+            partition_store_manager,
+            restore_target_is_unprovisioned,
+            provision_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     pub fn into_server(self, config: &NetworkingOptions) -> NodeCtlSvcServer<Self> {
@@ -168,14 +190,16 @@ impl NodeCtlSvc for NodeCtlSvcHandler {
         request: Request<ProvisionClusterRequest>,
     ) -> Result<Response<ProvisionClusterResponse>, Status> {
         let request = request.into_inner();
-        let config = Configuration::pinned();
-
         let dry_run = request.dry_run;
         let disabled = cluster_features_from_proto(&request.disabled_features)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let features = ClusterFeature::default_features() - disabled;
-        let cluster_configuration = Self::resolve_cluster_configuration(&config, request)
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let (cluster_configuration, common_options) = {
+            let config = Configuration::pinned();
+            let cluster_configuration = Self::resolve_cluster_configuration(&config, request)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            (cluster_configuration, config.common.clone())
+        };
 
         if dry_run {
             return Ok(Response::new(ProvisionClusterResponse::dry_run(
@@ -184,9 +208,11 @@ impl NodeCtlSvc for NodeCtlSvcHandler {
             )));
         }
 
+        let _provision_guard = self.provision_lock.lock().await;
+
         let newly_provisioned = provision_cluster_metadata(
             &self.metadata_writer,
-            &config.common,
+            &common_options,
             &cluster_configuration,
             features,
         )
@@ -198,11 +224,113 @@ impl NodeCtlSvc for NodeCtlSvcHandler {
                 "The cluster has already been provisioned",
             ));
         }
-
         Ok(Response::new(ProvisionClusterResponse::provisioned(
             ProtoClusterConfiguration::from(cluster_configuration),
             features,
         )))
+    }
+
+    async fn restore_cluster(
+        &self,
+        request: Request<RestoreClusterRequest>,
+    ) -> Result<Response<RestoreClusterResponse>, Status> {
+        let _provision_guard = self.provision_lock.lock().await;
+        if !self.restore_target_is_unprovisioned {
+            return Err(Status::already_exists(
+                "cluster restore requires a fresh, unprovisioned target node",
+            ));
+        }
+
+        let request = request.into_inner();
+        let descriptor: ClusterBackupDescriptor = serde_json::from_slice(&request.descriptor_json)
+            .map_err(|error| {
+                Status::invalid_argument(format!("invalid backup descriptor JSON: {error}"))
+            })?;
+        let (common_options, target_cluster_name, provider, snapshots_options, restore_staging_dir) = {
+            let configuration = Configuration::pinned();
+            (
+                configuration.common.clone(),
+                configuration.common.cluster_name().to_owned(),
+                configuration.bifrost.default_provider,
+                configuration.worker.snapshots.clone(),
+                configuration
+                    .worker
+                    .storage
+                    .snapshots_staging_dir()
+                    .join("restore"),
+            )
+        };
+        restore::validate_target_configuration(&common_options, provider)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+
+        // The on-disk cluster marker is not authoritative if it was lost independently from an
+        // existing embedded metadata database. Check the metadata store before any restore reads
+        // can lead to destructive local snapshot imports. A fresh built-in store reports its
+        // explicit unprovisioned state as Unavailable until `provision` initializes it.
+        match self
+            .metadata_writer
+            .raw_metadata_store_client()
+            .get::<NodesConfiguration>(NODES_CONFIG_KEY.clone())
+            .await
+        {
+            Ok(Some(_)) => {
+                return Err(Status::already_exists(
+                    "cluster metadata is already provisioned; refusing to import snapshots",
+                ));
+            }
+            Ok(None) => {
+                return Err(Status::failed_precondition(
+                    "target metadata store is initialized without NodesConfiguration; refusing to import snapshots",
+                ));
+            }
+            Err(error) if metadata_store_is_explicitly_unprovisioned(&error) => {}
+            Err(error) => {
+                return Err(Status::unavailable(format!(
+                    "failed verifying that target metadata is unprovisioned: {error}"
+                )));
+            }
+        }
+        let plan = restore::preflight(
+            descriptor,
+            RestoreOptions {
+                restore_schema: request.restore_schema,
+                preserve_cluster_fingerprint: request.preserve_cluster_fingerprint,
+            },
+            &common_options,
+            provider,
+            &snapshots_options,
+            restore_staging_dir,
+        )
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+
+        let partition_count = u32::try_from(plan.partition_count())
+            .expect("a Restate partition table contains at most u16::MAX partitions");
+        let schema_restored = plan.schema_restored();
+        let target_cluster_fingerprint = Some(plan.target_fingerprint().to_string());
+        if !request.dry_run {
+            let newly_provisioned = restore::apply(
+                plan,
+                &self.metadata_writer,
+                &common_options,
+                &self.partition_store_manager,
+            )
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+            if !newly_provisioned {
+                return Err(Status::already_exists(
+                    "the target cluster was provisioned concurrently",
+                ));
+            }
+        }
+
+        Ok(Response::new(RestoreClusterResponse {
+            dry_run: request.dry_run,
+            partition_count,
+            schema_restored,
+            target_cluster_name,
+            target_cluster_fingerprint,
+        }))
     }
 
     async fn cluster_health(
@@ -461,6 +589,20 @@ fn write_err_to_status(err: WriteError) -> Status {
 #[cfg(test)]
 mod tests {
     use restate_types::protobuf::common::DatabaseKind;
+
+    use super::*;
+
+    #[test]
+    fn recognizes_only_explicit_unprovisioned_metadata_errors() {
+        let unprovisioned = ReadError::retryable(std::io::Error::other(
+            "Metadata store has not been provisioned yet",
+        ));
+        assert!(metadata_store_is_explicitly_unprovisioned(&unprovisioned));
+
+        let unavailable =
+            ReadError::retryable(std::io::Error::other("metadata service unavailable"));
+        assert!(!metadata_store_is_explicitly_unprovisioned(&unavailable));
+    }
 
     #[test]
     fn database_kind_db_names() {

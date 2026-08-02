@@ -80,6 +80,9 @@ pub trait WriteFsmTable {
 
     fn put_schema(&mut self, schema: &Schema) -> Result<()>;
 
+    /// Removes the partition-local cached service schema.
+    fn delete_schema(&mut self) -> Result<()>;
+
     fn put_partition_config_state(&mut self, state: &CachedEpochMetadata) -> Result<()>;
 
     /// Persist the rule book for this partition.

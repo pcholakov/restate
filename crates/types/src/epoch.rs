@@ -53,6 +53,27 @@ impl EpochMetadata {
         }
     }
 
+    /// Creates epoch metadata for a bootstrap that must supersede a value imported with a
+    /// partition snapshot. Both the metadata version and leader epoch are strictly greater than
+    /// their respective floors, so the first leadership announcement is not rejected as stale.
+    pub fn bootstrap_after(
+        mut current: PartitionConfiguration,
+        version_floor: Version,
+        epoch_floor: LeaderEpoch,
+    ) -> Self {
+        let version = version_floor.max(Version::MIN).next();
+        current.version = version;
+
+        Self {
+            version,
+            leader_metadata: None,
+            epoch: epoch_floor.max(LeaderEpoch::INITIAL).next(),
+            current,
+            next: None,
+            leadership_policy: LeadershipPolicy::default(),
+        }
+    }
+
     pub fn into_inner(
         self,
     ) -> (
@@ -212,12 +233,12 @@ mod compatibility {
 
 #[cfg(test)]
 mod tests {
-    use crate::GenerationalNodeId;
     use crate::epoch::{EpochMetadata, PartitionConfiguration};
     use crate::identifiers::{LeaderEpoch, PartitionId};
     use crate::replication::ReplicationProperty;
     use crate::storage::StorageCodec;
     use crate::version::Versioned;
+    use crate::{GenerationalNodeId, Version};
     use bytes::BytesMut;
     use std::collections::HashMap;
 
@@ -271,5 +292,25 @@ mod tests {
             deserialized_epoch_metadata.version()
         );
         assert_eq!(epoch_metadata.epoch(), deserialized_epoch_metadata.epoch());
+    }
+
+    #[test]
+    fn restore_bootstrap_supersedes_imported_epoch_floors() {
+        let version_floor = Version::from(10);
+        let epoch_floor = LeaderEpoch::from(20);
+        let epoch_metadata = EpochMetadata::bootstrap_after(
+            PartitionConfiguration::default(),
+            version_floor,
+            epoch_floor,
+        );
+
+        assert!(epoch_metadata.version() > version_floor);
+        assert!(epoch_metadata.current().version() > version_floor);
+        assert!(epoch_metadata.epoch() > epoch_floor);
+
+        let claimed =
+            epoch_metadata.claim_leadership(GenerationalNodeId::INITIAL_NODE_ID, PartitionId::MIN);
+        assert!(claimed.version() > version_floor);
+        assert!(claimed.epoch() > epoch_floor);
     }
 }

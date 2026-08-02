@@ -8351,6 +8351,7 @@ dependencies = [
  "restate-rocksdb",
  "restate-service-client",
  "restate-service-protocol-v4",
+ "restate-storage-api",
  "restate-storage-query-datafusion",
  "restate-tracing-instrumentation",
  "restate-types",
@@ -8371,6 +8372,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@
 
 mod backup;
 mod create_snapshot;
+mod restore;
 
 use cling::prelude::*;
 
@@ -20,4 +21,6 @@ pub enum Snapshot {
     Backup(backup::BackupOpts),
     /// Create.
     CreateSnapshot(create_snapshot::CreateSnapshotOpts),
+    /// Restore a V0 cluster backup descriptor onto an unprovisioned node.
+    Restore(restore::RestoreOpts),
 }

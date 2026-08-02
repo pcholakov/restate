@@ -409,6 +409,12 @@ impl WriteFsmTable for PartitionStoreTransaction<'_> {
         self.put_kv_storage_codec(key, schema)
     }
 
+    fn delete_schema(&mut self) -> Result<()> {
+        let key = create_key(self.partition_id(), fsm_variable::SERVICES_SCHEMA_METADATA);
+        self.raw_delete_cf(KeyKind::Fsm, key.to_bytes());
+        Ok(())
+    }
+
     fn put_partition_config_state(&mut self, state: &CachedEpochMetadata) -> Result<()> {
         let key = create_key(self.partition_id(), fsm_variable::PARTITION_CONFIG_STATE);
         self.put_kv_storage_codec(key, state)

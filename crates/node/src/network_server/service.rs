@@ -8,6 +8,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::routing::{MethodFilter, get, on};
 
@@ -15,6 +17,7 @@ use restate_core::TaskCenter;
 use restate_core::network::grpc::CoreNodeSvcHandler;
 use restate_core::network::{ConnectionManager, NetworkServerBuilder};
 use restate_core::{Identification, MetadataWriter};
+use restate_partition_store::PartitionStoreManager;
 use restate_tracing_instrumentation::prometheus_metrics::Prometheus;
 use restate_types::config::Configuration;
 
@@ -31,6 +34,8 @@ impl NetworkServer {
         mut server_builder: NetworkServerBuilder,
         metadata_writer: MetadataWriter,
         prometheus: Prometheus,
+        partition_store_manager: Arc<PartitionStoreManager>,
+        restore_target_is_unprovisioned: bool,
     ) -> Result<(), anyhow::Error> {
         // Configure Metric Exporter
         let mut state_builder = NodeCtrlHandlerStateBuilder::default();
@@ -81,8 +86,12 @@ impl NetworkServer {
         );
 
         server_builder.register_grpc_service(
-            NodeCtlSvcHandler::new(metadata_writer)
-                .into_server(&Configuration::pinned().networking),
+            NodeCtlSvcHandler::new(
+                metadata_writer,
+                partition_store_manager,
+                restore_target_is_unprovisioned,
+            )
+            .into_server(&Configuration::pinned().networking),
             restate_core::protobuf::node_ctl_svc::FILE_DESCRIPTOR_SET,
         );
 

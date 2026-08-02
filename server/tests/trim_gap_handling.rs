@@ -195,6 +195,7 @@ async fn fast_forward_over_trim_gap() -> googletest::Result<()> {
             partition_id: 0,
             min_target_lsn: Some(3),
             trim_log: true,
+            protect_from_retention: false,
         })
         .await?
         .into_inner();

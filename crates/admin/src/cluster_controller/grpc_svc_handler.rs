@@ -45,7 +45,6 @@ use restate_types::logs::{LogId, Lsn, SequenceNumber};
 use restate_types::metadata::{GlobalMetadata, Precondition};
 use restate_types::metadata_store::keys::{NODES_CONFIG_KEY, partition_processor_epoch_key};
 use restate_types::net::connect_opts::GrpcConnectionOptions;
-use restate_types::net::partition_processor_manager::Snapshot;
 use restate_types::nodes_config::{NodesConfiguration, Role};
 use restate_types::partitions::PartitionTable;
 use restate_types::partitions::state::PartitionReplicaSetStates;
@@ -208,6 +207,7 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
                 partition_id,
                 request.min_target_lsn.map(Into::into),
                 request.trim_log,
+                request.protect_from_retention,
             )
             .await
             .map_err(|_| Status::aborted("Node is shutting down"))?
@@ -216,14 +216,12 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
                 info!("Failed to create partition snapshot: {err}");
                 Err(Status::internal(err.to_string()))
             }
-            Ok(Snapshot {
-                snapshot_id,
-                log_id,
-                min_applied_lsn,
-            }) => Ok(Response::new(CreatePartitionSnapshotResponse {
-                snapshot_id: snapshot_id.to_string(),
-                log_id: log_id.into(),
-                min_applied_lsn: min_applied_lsn.as_u64(),
+            Ok(snapshot) => Ok(Response::new(CreatePartitionSnapshotResponse {
+                snapshot_id: snapshot.snapshot_id.to_string(),
+                log_id: snapshot.log_id.into(),
+                min_applied_lsn: snapshot.exact_min_applied_lsn().as_u64(),
+                trim_safe_lsn: snapshot.min_applied_lsn.as_u64(),
+                snapshot_repository: snapshot.snapshot_repository,
             })),
         }
     }

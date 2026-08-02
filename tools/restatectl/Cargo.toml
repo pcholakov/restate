@@ -77,6 +77,7 @@ toml = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport", "zstd", "gzip"] }
 tracing = { workspace = true }
+url = { workspace = true }
 
 [build-dependencies]
 vergen = { workspace = true, default-features = false, features = [

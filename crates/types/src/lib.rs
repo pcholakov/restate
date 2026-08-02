@@ -22,6 +22,7 @@ mod version;
 
 pub mod art;
 pub mod cluster;
+pub mod cluster_backup;
 
 pub mod cluster_state;
 pub mod health;

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use ahash::{HashMap, HashMapExt};
 use anyhow::{Context, anyhow, bail};
 use bytes::BytesMut;
+use futures::future::BoxFuture;
 use object_store::path::Path as ObjectPath;
 use object_store::{
     MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
@@ -67,6 +68,46 @@ pub struct SnapshotRepository {
     enable_cleanup: bool,
 }
 
+/// Identity of the cluster that produced snapshots being restored.
+///
+/// This is deliberately supplied by the caller rather than inferred from the
+/// running node. A restore target can have a newly generated fingerprint.
+#[derive(Clone, Debug)]
+pub struct SnapshotSource {
+    cluster_name: String,
+    cluster_fingerprint: Option<ClusterFingerprint>,
+}
+
+/// An immutable snapshot selected during restore preflight.
+///
+/// Its metadata lets callers validate topology before any SST is downloaded. The repository
+/// path remains private so only this module can turn a validated record into a download.
+#[derive(Clone, Debug)]
+pub struct SnapshotRecord {
+    pub partition_id: PartitionId,
+    pub snapshot_id: SnapshotId,
+    pub min_applied_lsn: Lsn,
+    pub metadata: PartitionSnapshotMetadata,
+    path: String,
+}
+
+impl SnapshotSource {
+    pub fn new(cluster_name: String, cluster_fingerprint: Option<ClusterFingerprint>) -> Self {
+        Self {
+            cluster_name,
+            cluster_fingerprint,
+        }
+    }
+
+    fn validate_latest(&self, latest: &LatestSnapshot) -> anyhow::Result<()> {
+        latest.validate(&self.cluster_name, self.cluster_fingerprint)
+    }
+
+    fn validate_metadata(&self, metadata: &PartitionSnapshotMetadata) -> anyhow::Result<()> {
+        metadata.validate(&self.cluster_name, self.cluster_fingerprint)
+    }
+}
+
 /// S3 and other stores require a certain minimum size for the parts of a multipart upload. It is an
 /// API error to attempt a multipart put below this size, apart from the final segment.
 const MULTIPART_UPLOAD_CHUNK_SIZE_BYTES: usize = 5 * 1024 * 1024;
@@ -74,12 +115,21 @@ const MULTIPART_UPLOAD_CHUNK_SIZE_BYTES: usize = 5 * 1024 * 1024;
 /// Maximum number of concurrent downloads when getting snapshots from the repository.
 const DOWNLOAD_CONCURRENCY_LIMIT: usize = 8;
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LatestSnapshotVersion {
     V1,
     /// V2 adds support for retained snapshots. Introduced in v1.6.
     #[default]
     V2,
+    /// V3 adds retention-protected snapshot references.
+    ///
+    /// Once a repository contains V3 metadata, older binaries fail to deserialize its pointer
+    /// and therefore cannot silently discard protection during a rolling downgrade.
+    V3,
 }
 
 #[serde_as]
@@ -88,7 +138,7 @@ pub struct LatestSnapshot {
     pub version: LatestSnapshotVersion,
 
     pub partition_id: PartitionId,
-    pub log_id: Option<LogId>, // mandatory in LatestSnapshotVersion::V2
+    pub log_id: Option<LogId>, // mandatory in LatestSnapshotVersion::V2 and V3
 
     /// Restate cluster name which produced the snapshot.
     pub cluster_name: String,
@@ -128,15 +178,19 @@ pub struct SnapshotReference {
     #[serde(with = "serde_with::As::<serde_with::DisplayFromStr>")]
     pub created_at: jiff::Timestamp,
     pub path: String,
+    /// Protected snapshots are excluded from automatic retention cleanup.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub protected: bool,
 }
 
 impl SnapshotReference {
-    fn from_metadata(snapshot: &PartitionSnapshotMetadata) -> Self {
+    fn from_metadata(snapshot: &PartitionSnapshotMetadata, protected: bool) -> Self {
         SnapshotReference {
             snapshot_id: snapshot.snapshot_id,
             min_applied_lsn: snapshot.min_applied_lsn,
             created_at: snapshot.created_at,
             path: UniqueSnapshotKey::from_metadata(snapshot).padded_key(),
+            protected,
         }
     }
 }
@@ -155,10 +209,17 @@ impl LatestSnapshot {
                     min_applied_lsn: self.min_applied_lsn,
                     created_at: self.created_at,
                     path: self.path.clone(),
+                    protected: false,
                 }]
             }
         } else {
-            self.retained_snapshots.clone()
+            let mut snapshots = self.retained_snapshots.clone();
+            if self.version != LatestSnapshotVersion::V3 {
+                for snapshot in &mut snapshots {
+                    snapshot.protected = false;
+                }
+            }
+            snapshots
         }
     }
 
@@ -197,7 +258,8 @@ impl LatestSnapshot {
 #[display("{}", latest_snapshot_id)]
 pub struct PartitionSnapshotStatus {
     // Field ordering is intentional to naturally order items by LSN
-    /// Safe to trim LSN for the partition
+    /// Safe log trim LSN based on ordinary rolling-retention snapshots. Protected backup
+    /// artifacts do not hold this back.
     pub archived_lsn: Lsn,
     pub latest_snapshot_lsn: Lsn,
     pub latest_snapshot_id: SnapshotId,
@@ -232,9 +294,10 @@ impl TryFrom<&LatestSnapshot> for PartitionSnapshotStatus {
                     .map(|p| p.log_id())
                     .unwrap_or_else(|| LogId::default_for_partition(latest.partition_id))
             }
-            (LatestSnapshotVersion::V2, None) => {
+            (LatestSnapshotVersion::V2 | LatestSnapshotVersion::V3, None) => {
                 return Err(anyhow!(
-                    "LatestSnapshot V2 for partition {} (snapshot {}) missing required log_id",
+                    "LatestSnapshot {:?} for partition {} (snapshot {}) missing required log_id",
+                    latest.version,
                     latest.partition_id,
                     latest.snapshot_id
                 ));
@@ -259,6 +322,26 @@ impl TryFrom<&LatestSnapshot> for PartitionSnapshotStatus {
                     .iter()
                     .max_by_key(|s| s.min_applied_lsn)
                     .map(|s| s.created_at.into())
+                    .unwrap_or_else(|| latest.created_at.into());
+
+                (archived_lsn, latest_snapshot_created_at)
+            }
+            LatestSnapshotVersion::V3 => {
+                // Protected backup artifacts are retained independently and do not hold back log
+                // trimming. Only ordinary rolling-retention snapshots define the trim-safe LSN.
+                let archived_lsn = latest
+                    .retained_snapshots
+                    .iter()
+                    .filter(|snapshot| !snapshot.protected)
+                    .min_by_key(|snapshot| snapshot.min_applied_lsn)
+                    .map(|snapshot| snapshot.min_applied_lsn)
+                    .unwrap_or(latest.min_applied_lsn);
+
+                let latest_snapshot_created_at = latest
+                    .retained_snapshots
+                    .iter()
+                    .max_by_key(|snapshot| snapshot.min_applied_lsn)
+                    .map(|snapshot| snapshot.created_at.into())
                     .unwrap_or_else(|| latest.created_at.into());
 
                 (archived_lsn, latest_snapshot_created_at)
@@ -300,6 +383,11 @@ impl UniqueSnapshotKey {
 }
 
 impl SnapshotRepository {
+    /// Returns the normalized repository destination used to address snapshot objects.
+    pub fn destination(&self) -> &Url {
+        &self.destination
+    }
+
     /// Creates an instance of the repository if a snapshots destination is configured.
     pub async fn new_from_config(
         snapshots_options: &SnapshotsOptions,
@@ -316,29 +404,58 @@ impl SnapshotRepository {
             .inspect(|params| info!("Snapshot destination parameters ignored: {params}"));
         destination.set_query(None);
 
-        let prefix = destination.path().to_string();
-        let object_store = create_object_store_client(
-            destination.clone(),
-            &snapshots_options.object_store,
-            &snapshots_options.object_store_retry_policy,
-        )
-        .await?;
+        Self::new_at_destination(snapshots_options, destination, staging_dir)
+            .await
+            .map(Some)
+    }
 
-        // Best-effort cleanup of leftover snapshot staging directories from a previous run
-        // (e.g. downloads interrupted by a hard crash mid-import, which the per-download RAII
-        // guard cannot clean up). Safe here because no downloads are in flight at startup.
-        // See https://github.com/restatedev/restate/issues/4838.
-        Self::sweep_staging_dir(&staging_dir).await;
+    /// Opens an explicit source repository using the configured object-store credentials and
+    /// retry policy without changing the node's active snapshot destination.
+    ///
+    /// Snapshot upload APIs are crate-private, so callers outside `partition-store` can only use
+    /// the returned repository for restore inspection and downloads.
+    pub async fn new_for_source(
+        snapshots_options: &SnapshotsOptions,
+        mut source_destination: Url,
+        staging_dir: PathBuf,
+    ) -> anyhow::Result<SnapshotRepository> {
+        source_destination
+            .query()
+            .inspect(|params| info!("Snapshot source parameters ignored: {params}"));
+        source_destination.set_query(None);
+        Self::new_at_destination(snapshots_options, source_destination, staging_dir).await
+    }
 
-        Ok(Some(SnapshotRepository {
-            object_store,
-            destination,
-            prefix: ObjectPath::from(prefix),
-            staging_dir,
-            num_retained: snapshots_options.num_retained,
-            #[cfg(any(test, feature = "test-util"))]
-            enable_cleanup: snapshots_options.enable_cleanup,
-        }))
+    fn new_at_destination(
+        snapshots_options: &SnapshotsOptions,
+        destination: Url,
+        staging_dir: PathBuf,
+    ) -> BoxFuture<'_, anyhow::Result<SnapshotRepository>> {
+        Box::pin(async move {
+            let prefix = destination.path().to_string();
+            let object_store = create_object_store_client(
+                destination.clone(),
+                &snapshots_options.object_store,
+                &snapshots_options.object_store_retry_policy,
+            )
+            .await?;
+
+            // Best-effort cleanup of leftover snapshot staging directories from a previous run
+            // (e.g. downloads interrupted by a hard crash mid-import, which the per-download RAII
+            // guard cannot clean up). Safe here because no downloads are in flight at startup.
+            // See https://github.com/restatedev/restate/issues/4838.
+            Self::sweep_staging_dir(&staging_dir).await;
+
+            Ok(SnapshotRepository {
+                object_store,
+                destination,
+                prefix: ObjectPath::from(prefix),
+                staging_dir,
+                num_retained: snapshots_options.num_retained,
+                #[cfg(any(test, feature = "test-util"))]
+                enable_cleanup: snapshots_options.enable_cleanup,
+            })
+        })
     }
 
     /// Removes any entries left over in the snapshot staging directory by a previous run.
@@ -380,6 +497,26 @@ impl SnapshotRepository {
         snapshot: &PartitionSnapshotMetadata,
         local_snapshot: SnapshotDir,
     ) -> anyhow::Result<PartitionSnapshotStatus> {
+        self.put_with_retention(snapshot, local_snapshot, false)
+            .await
+    }
+
+    /// Writes a snapshot which automatic rolling retention must not delete.
+    pub(crate) async fn put_protected(
+        &self,
+        snapshot: &PartitionSnapshotMetadata,
+        local_snapshot: SnapshotDir,
+    ) -> anyhow::Result<PartitionSnapshotStatus> {
+        self.put_with_retention(snapshot, local_snapshot, true)
+            .await
+    }
+
+    async fn put_with_retention(
+        &self,
+        snapshot: &PartitionSnapshotMetadata,
+        local_snapshot: SnapshotDir,
+        protect_from_retention: bool,
+    ) -> anyhow::Result<PartitionSnapshotStatus> {
         use crate::metric_definitions::{
             SNAPSHOT_UPLOAD_DURATION, SNAPSHOT_UPLOAD_FAILED, SNAPSHOT_UPLOAD_SUCCESS,
         };
@@ -388,7 +525,7 @@ impl SnapshotRepository {
 
         let start = tokio::time::Instant::now();
         let put_result = self
-            .put_snapshot_inner(snapshot, local_snapshot.path())
+            .put_snapshot_inner(snapshot, local_snapshot.path(), protect_from_retention)
             .await;
 
         // We own the local snapshot directory; remove it asynchronously (it may hold large SST
@@ -424,6 +561,7 @@ impl SnapshotRepository {
         &self,
         snapshot: &PartitionSnapshotMetadata,
         local_snapshot_path: &Path,
+        protect_from_retention: bool,
     ) -> Result<PartitionSnapshotStatus, PutSnapshotError> {
         let snapshot_prefix = self.base_prefix(snapshot);
         debug!(
@@ -444,8 +582,22 @@ impl SnapshotRepository {
             .map_err(|e| PutSnapshotError::from(e, progress.clone()))?;
 
         if let Some((latest_stored, _)) = &maybe_stored
-            && latest_stored.min_applied_lsn >= snapshot.min_applied_lsn
+            && (latest_stored.min_applied_lsn > snapshot.min_applied_lsn
+                || (!protect_from_retention
+                    && latest_stored.min_applied_lsn == snapshot.min_applied_lsn))
         {
+            if protect_from_retention {
+                return Err(PutSnapshotError::from(
+                    anyhow!(
+                        "cannot protect snapshot {} at LSN {} because repository latest is newer at LSN {}; retry after the partition catches up",
+                        snapshot.snapshot_id,
+                        snapshot.min_applied_lsn,
+                        latest_stored.min_applied_lsn,
+                    ),
+                    progress,
+                ));
+            }
+
             info!(
                 repository_latest_lsn = ?latest_stored.min_applied_lsn,
                 new_snapshot_lsn = ?snapshot.min_applied_lsn,
@@ -453,7 +605,7 @@ impl SnapshotRepository {
                 will not update latest pointer"
             );
 
-            let snapshot_ref = SnapshotReference::from_metadata(snapshot);
+            let snapshot_ref = SnapshotReference::from_metadata(snapshot, false);
             let partition_id = snapshot.partition_id;
             let repository = self.clone();
             let _ = restate_core::TaskCenter::spawn_unmanaged_child(
@@ -472,7 +624,11 @@ impl SnapshotRepository {
         }
 
         let (new_latest, evicted_snapshots) = self
-            .build_latest_v2(snapshot, maybe_stored.as_ref().map(|(l, _)| l))
+            .build_latest_pointer(
+                snapshot,
+                maybe_stored.as_ref().map(|(l, _)| l),
+                protect_from_retention,
+            )
             .map_err(|e| PutSnapshotError::from(e, progress.clone()))?;
 
         let latest_payload = PutPayload::from(
@@ -553,17 +709,18 @@ impl SnapshotRepository {
         Ok(())
     }
 
-    /// Builds V2 latest snapshot metadata.
+    /// Builds the latest snapshot pointer in the format required by its retained references.
     ///
     /// Returns `(LatestSnapshot, Vec<SnapshotReference>)` where the second element contains
     /// snapshots that no longer need to be retained following the metadata update.
     /// If cleanup fails, these snapshots will be orphaned until cleaned up by the sweeper.
-    fn build_latest_v2(
+    fn build_latest_pointer(
         &self,
         snapshot: &PartitionSnapshotMetadata,
         current: Option<&LatestSnapshot>,
+        protect_from_retention: bool,
     ) -> anyhow::Result<(LatestSnapshot, Vec<SnapshotReference>)> {
-        let new_snapshot_ref = SnapshotReference::from_metadata(snapshot);
+        let new_snapshot_ref = SnapshotReference::from_metadata(snapshot, protect_from_retention);
 
         let mut retained_snapshots = current
             .map(|l| l.effective_retained_snapshots())
@@ -572,11 +729,29 @@ impl SnapshotRepository {
         // List will be in correct descending order if we insert the newest snapshot first
         retained_snapshots.insert(0, new_snapshot_ref.clone());
 
-        let evicted_snapshots = retained_snapshots
-            .split_off((self.num_retained.get() as usize).min(retained_snapshots.len()));
+        let mut ordinary_retained = 0;
+        let mut evicted_snapshots = Vec::new();
+        retained_snapshots.retain(|snapshot| {
+            if snapshot.protected {
+                true
+            } else if ordinary_retained < self.num_retained.get() as usize {
+                ordinary_retained += 1;
+                true
+            } else {
+                evicted_snapshots.push(snapshot.clone());
+                false
+            }
+        });
 
+        let version = if protect_from_retention
+            || current.is_some_and(|latest| latest.version == LatestSnapshotVersion::V3)
+        {
+            LatestSnapshotVersion::V3
+        } else {
+            LatestSnapshotVersion::V2
+        };
         let latest = LatestSnapshot {
-            version: LatestSnapshotVersion::V2,
+            version,
             partition_id: snapshot.partition_id,
             log_id: Some(snapshot.log_id),
             cluster_name: snapshot.cluster_name.clone(),
@@ -702,7 +877,13 @@ impl SnapshotRepository {
         use crate::metric_definitions::{SNAPSHOT_DOWNLOAD_DURATION, SNAPSHOT_DOWNLOAD_FAILED};
 
         let start = tokio::time::Instant::now();
-        let result = self.get_latest_inner(partition_id).await;
+        let source = Metadata::with_current(|m| {
+            SnapshotSource::new(
+                m.nodes_config_ref().cluster_name().to_owned(),
+                m.nodes_config_ref().cluster_fingerprint(),
+            )
+        });
+        let result = self.get_latest_for_source(partition_id, &source).await;
 
         if result.is_err() {
             metrics::counter!(SNAPSHOT_DOWNLOAD_FAILED).increment(1);
@@ -712,10 +893,23 @@ impl SnapshotRepository {
         result
     }
 
-    async fn get_latest_inner(
+    async fn get_latest_for_source(
         &self,
         partition_id: PartitionId,
+        source: &SnapshotSource,
     ) -> anyhow::Result<Option<LocalPartitionSnapshot>> {
+        let Some(record) = self.resolve_latest_for_source(partition_id, source).await? else {
+            return Ok(None);
+        };
+        self.download_record(record).await.map(Some)
+    }
+
+    /// Resolve the mutable latest pointer once, returning a pinned immutable snapshot record.
+    pub async fn resolve_latest_for_source(
+        &self,
+        partition_id: PartitionId,
+        source: &SnapshotSource,
+    ) -> anyhow::Result<Option<SnapshotRecord>> {
         let latest_path = self.latest_snapshot_pointer_path(partition_id);
 
         let latest = match self.object_store.get(&latest_path).await {
@@ -730,22 +924,58 @@ impl SnapshotRepository {
         let latest: LatestSnapshot = serde_json::from_slice(&latest.bytes().await?)?;
         tracing::Span::current().record("snapshot_id", tracing::field::display(latest.snapshot_id));
         debug!("Latest snapshot metadata: {latest:?}");
-        Metadata::with_current(|m| {
-            let nodes_config = m.nodes_config_ref();
+        source
+            .validate_latest(&latest)
+            .with_context(|| format!("'{latest_path}' has validation errors"))?;
 
-            latest.validate(
-                nodes_config.cluster_name(),
-                nodes_config.cluster_fingerprint(),
-            )?;
-            anyhow::Ok(())
-        })
-        .with_context(|| format!("'{latest_path}' has validation errors"))?;
+        if latest.partition_id != partition_id {
+            bail!(
+                "Latest snapshot at '{latest_path}' has partition {}, expected {partition_id}",
+                latest.partition_id
+            );
+        }
 
+        self.inspect_snapshot(
+            partition_id,
+            latest.snapshot_id,
+            latest.min_applied_lsn,
+            latest.path.as_str(),
+            source,
+        )
+        .await
+        .map(Some)
+    }
+
+    /// Inspect an exact immutable snapshot without downloading its SSTs.
+    pub async fn inspect_exact(
+        &self,
+        partition_id: PartitionId,
+        snapshot_id: SnapshotId,
+        min_applied_lsn: Lsn,
+        source: &SnapshotSource,
+    ) -> anyhow::Result<SnapshotRecord> {
+        let path = UniqueSnapshotKey {
+            snapshot_id,
+            lsn: min_applied_lsn,
+        }
+        .padded_key();
+        self.inspect_snapshot(partition_id, snapshot_id, min_applied_lsn, &path, source)
+            .await
+    }
+
+    async fn inspect_snapshot(
+        &self,
+        partition_id: PartitionId,
+        expected_snapshot_id: SnapshotId,
+        expected_min_applied_lsn: Lsn,
+        snapshot_path: &str,
+        source: &SnapshotSource,
+    ) -> anyhow::Result<SnapshotRecord> {
         let snapshot_metadata_path = self
             .prefix
             .clone()
             .join(partition_id.to_string())
-            .join(latest.path.as_str())
+            .join(snapshot_path)
             .join("metadata.json");
         let snapshot_metadata = self.object_store.get(&snapshot_metadata_path).await;
 
@@ -759,7 +989,7 @@ impl SnapshotRepository {
             Err(err) => return Err(err.into()),
         };
 
-        let mut snapshot_metadata: PartitionSnapshotMetadata =
+        let snapshot_metadata: PartitionSnapshotMetadata =
             serde_json::from_slice(&snapshot_metadata.bytes().await?)?;
         if !matches!(snapshot_metadata.version, SnapshotFormatVersion::V1) {
             bail!(
@@ -768,21 +998,54 @@ impl SnapshotRepository {
             );
         }
 
-        Metadata::with_current(|m| {
-            let nodes_config = m.nodes_config_ref();
+        source
+            .validate_metadata(&snapshot_metadata)
+            .with_context(|| {
+                format!(
+                    "failed validating metadata of snapshot {}",
+                    snapshot_metadata.snapshot_id
+                )
+            })?;
 
-            snapshot_metadata.validate(
-                nodes_config.cluster_name(),
-                nodes_config.cluster_fingerprint(),
-            )?;
-            anyhow::Ok(())
+        if snapshot_metadata.partition_id != partition_id
+            || snapshot_metadata.snapshot_id != expected_snapshot_id
+            || snapshot_metadata.min_applied_lsn != expected_min_applied_lsn
+        {
+            bail!(
+                "snapshot metadata at '{snapshot_metadata_path}' does not match requested immutable identity: expected partition {partition_id}, snapshot {expected_snapshot_id}, minimum applied LSN {expected_min_applied_lsn}; got partition {}, snapshot {}, minimum applied LSN {}",
+                snapshot_metadata.partition_id,
+                snapshot_metadata.snapshot_id,
+                snapshot_metadata.min_applied_lsn,
+            );
+        }
+
+        Ok(SnapshotRecord {
+            partition_id,
+            snapshot_id: expected_snapshot_id,
+            min_applied_lsn: expected_min_applied_lsn,
+            metadata: snapshot_metadata,
+            path: snapshot_path.to_owned(),
         })
-        .with_context(|| {
-            format!(
-                "failed validating metadata of snapshot {}",
-                snapshot_metadata.snapshot_id
-            )
-        })?;
+    }
+
+    /// Download SSTs for a record previously pinned by [`Self::inspect_exact`] or
+    /// [`Self::resolve_latest_for_source`].
+    pub async fn download_record(
+        &self,
+        record: SnapshotRecord,
+    ) -> anyhow::Result<LocalPartitionSnapshot> {
+        let partition_id = record.partition_id;
+        let snapshot_path = record.path;
+        let mut snapshot_metadata = record.metadata;
+
+        // Validate every untrusted metadata entry before creating a staging directory or fetching
+        // any snapshot component. This also prevents a later entry from escaping the staging
+        // directory after earlier entries have already been downloaded.
+        let filenames = snapshot_metadata
+            .files
+            .iter()
+            .map(|file| snapshot_file_basename(&file.name).map(str::to_owned))
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         if !self.staging_dir.exists() {
             std::fs::create_dir_all(&self.staging_dir)?;
@@ -800,22 +1063,21 @@ impl SnapshotRepository {
         let concurrency_limiter = Arc::new(Semaphore::new(DOWNLOAD_CONCURRENCY_LIMIT));
         let mut downloads = JoinSet::new();
         let mut task_handles = HashMap::with_capacity(snapshot_metadata.files.len());
-        for file in &mut snapshot_metadata.files {
-            let filename = strip_leading_slash(&file.name);
+        for (file, filename) in snapshot_metadata.files.iter_mut().zip(filenames) {
             let expected_size = file.size;
             let key = self
                 .prefix
                 .clone()
                 .join(partition_id.to_string())
-                .join(latest.path.as_str())
-                .join(filename);
-            let local_path = snapshot_dir.path().join(filename);
+                .join(snapshot_path.as_str())
+                .join(filename.as_str());
+            let local_path = snapshot_dir.path().join(&filename);
             let concurrency_limiter = Arc::clone(&concurrency_limiter);
             let object_store = Arc::clone(&self.object_store);
             let snapshot_id = snapshot_metadata.snapshot_id;
-            let snapshot_filename = filename.to_owned();
+            let snapshot_filename = filename.clone();
 
-            let handle = downloads.build_task().name(filename).spawn(async move {
+            let handle = downloads.build_task().name(&filename).spawn(async move {
                 let _permit = concurrency_limiter.acquire().await?;
                 debug!(%key, "Downloading snapshot object");
                 let mut file_data = StreamReader::new(
@@ -846,7 +1108,7 @@ impl SnapshotRepository {
                 );
                 anyhow::Ok(())
             }.instrument(Span::current()))?;
-            task_handles.insert(handle.id(), filename.to_string());
+            task_handles.insert(handle.id(), filename);
             // patch the directory path to reflect the actual location on the restoring node
             file.directory.clone_from(&directory);
         }
@@ -882,20 +1144,20 @@ impl SnapshotRepository {
         // Transfer ownership of the staging directory from the `TempDir` (which auto-cleans on
         // an early return mid-download) to the snapshot's `SnapshotDir`, which removes it on drop
         // whether the subsequent import succeeds or fails (see #4838).
-        Ok(Some(LocalPartitionSnapshot {
+        Ok(LocalPartitionSnapshot {
             base_dir: SnapshotDir::new(snapshot_dir.keep()),
             log_id: snapshot_metadata.log_id,
             min_applied_lsn: snapshot_metadata.min_applied_lsn,
             db_comparator_name: snapshot_metadata.db_comparator_name,
             files: snapshot_metadata.files,
             key_range: snapshot_metadata.key_range,
-        }))
+        })
     }
 
     /// Retrieve the latest snapshot metadata from the snapshot repository
     ///
-    /// If there are multiple retained snapshots, the archived LSN will be that of the earliest
-    /// snapshot's LSN. This allows restoring any of the retained snapshots.
+    /// If there are multiple ordinary retained snapshots, the archived LSN will be the earliest
+    /// ordinary snapshot's LSN. Protected backups survive cleanup but do not hold back log trims.
     pub async fn get_latest_partition_snapshot_status(
         &self,
         partition_id: PartitionId,
@@ -1009,6 +1271,24 @@ impl SnapshotRepository {
 // Strip the leading "/" character from RocksDB LiveFile names
 fn strip_leading_slash(name: &str) -> &str {
     name.trim_start_matches('/')
+}
+
+/// Returns the local basename represented by a RocksDB live-file name.
+///
+/// RocksDB prefixes live-file names with one `/`. Apart from that format convention, snapshot
+/// components must be a single non-empty basename so repository metadata cannot address files
+/// outside the download staging directory.
+fn snapshot_file_basename(name: &str) -> anyhow::Result<&str> {
+    let basename = name.strip_prefix('/').unwrap_or(name);
+    if basename.is_empty()
+        || basename == "."
+        || basename == ".."
+        || basename.contains('/')
+        || basename.contains('\\')
+    {
+        bail!("invalid snapshot component filename {name:?}: expected a single basename");
+    }
+    Ok(basename)
 }
 
 #[derive(Clone, Debug)]
@@ -1140,8 +1420,77 @@ mod tests {
 
     use crate::snapshots::repository::{LatestSnapshotVersion, SnapshotUploadProgress};
 
-    use super::{LatestSnapshot, SnapshotReference, SnapshotRepository, UniqueSnapshotKey};
+    use super::{
+        LatestSnapshot, PartitionSnapshotStatus, SnapshotRecord, SnapshotReference,
+        SnapshotRepository, SnapshotSource, UniqueSnapshotKey, snapshot_file_basename,
+    };
     use super::{PartitionSnapshotMetadata, SnapshotDir, SnapshotFormatVersion};
+
+    #[test]
+    fn snapshot_component_filename_must_be_a_basename() {
+        assert_eq!(snapshot_file_basename("000123.sst").unwrap(), "000123.sst");
+        assert_eq!(snapshot_file_basename("/000123.sst").unwrap(), "000123.sst");
+
+        for invalid in [
+            "",
+            "/",
+            ".",
+            "..",
+            "../escaped.sst",
+            "nested/data.sst",
+            "/tmp/data.sst",
+            "//data.sst",
+            r"nested\data.sst",
+            r"C:\data.sst",
+        ] {
+            assert!(
+                snapshot_file_basename(invalid).is_err(),
+                "accepted invalid snapshot component filename {invalid:?}"
+            );
+        }
+    }
+
+    #[restate_core::test]
+    async fn invalid_snapshot_component_is_rejected_before_staging() -> anyhow::Result<()> {
+        let _env = TestCoreEnv::create_with_single_node(1, 1).await;
+        let test_dir = TempDir::new()?;
+        let repository_dir = test_dir.path().join("repository");
+        tokio::fs::create_dir(&repository_dir).await?;
+        let staging_dir = test_dir.path().join("staging");
+        let escaped_path = test_dir.path().join("escaped.sst");
+        let repository = SnapshotRepository::new_from_config(
+            &SnapshotsOptions {
+                destination: Some(Url::from_file_path(&repository_dir).unwrap().to_string()),
+                ..SnapshotsOptions::default()
+            },
+            staging_dir.clone(),
+        )
+        .await?
+        .unwrap();
+
+        let metadata = mock_snapshot_metadata(
+            "../../escaped.sst".to_owned(),
+            "untrusted-directory".to_owned(),
+            0,
+        );
+        let record = SnapshotRecord {
+            partition_id: metadata.partition_id,
+            snapshot_id: metadata.snapshot_id,
+            min_applied_lsn: metadata.min_applied_lsn,
+            metadata,
+            path: "snapshot".to_owned(),
+        };
+
+        let error = repository.download_record(record).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid snapshot component filename")
+        );
+        assert!(!tokio::fs::try_exists(&staging_dir).await?);
+        assert!(!tokio::fs::try_exists(&escaped_path).await?);
+        Ok(())
+    }
 
     #[restate_core::test]
     async fn overwrite_unparsable_latest() -> anyhow::Result<()> {
@@ -1204,6 +1553,115 @@ mod tests {
                 .to_string(),
         )
         .await
+    }
+
+    #[restate_core::test]
+    async fn inspect_and_download_exact_snapshot_for_explicit_source() -> anyhow::Result<()> {
+        let _env = TestCoreEnv::create_with_single_node(1, 1).await;
+
+        let destination = TempDir::new()?;
+        let repository = SnapshotRepository::new_from_config(
+            &SnapshotsOptions {
+                destination: Some(Url::from_file_path(destination.path()).unwrap().to_string()),
+                ..SnapshotsOptions::default()
+            },
+            TempDir::new()?.keep(),
+        )
+        .await?
+        .unwrap();
+
+        let source_dir = TempDir::new()?.keep();
+        let data = b"snapshot-data";
+        tokio::fs::write(source_dir.join("data.sst"), data).await?;
+        let snapshot = mock_snapshot_metadata(
+            "/data.sst".to_owned(),
+            source_dir.to_string_lossy().to_string(),
+            data.len(),
+        );
+        let source =
+            SnapshotSource::new(snapshot.cluster_name.clone(), snapshot.cluster_fingerprint);
+        repository
+            .put(&snapshot, SnapshotDir::new(source_dir))
+            .await?;
+
+        let record = repository
+            .resolve_latest_for_source(snapshot.partition_id, &source)
+            .await?
+            .expect("latest snapshot exists");
+        assert_eq!(record.snapshot_id, snapshot.snapshot_id);
+        assert_eq!(record.min_applied_lsn, snapshot.min_applied_lsn);
+        assert_eq!(record.metadata.key_range, snapshot.key_range);
+        assert_eq!(record.metadata.log_id, snapshot.log_id);
+        assert_eq!(record.metadata.files.len(), 1);
+
+        let downloaded = repository.download_record(record).await?;
+        assert_eq!(downloaded.min_applied_lsn, snapshot.min_applied_lsn);
+        assert_eq!(downloaded.log_id, snapshot.log_id);
+
+        let wrong_source = SnapshotSource::new("different-cluster".to_owned(), None);
+        assert!(
+            repository
+                .resolve_latest_for_source(snapshot.partition_id, &wrong_source)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .inspect_exact(
+                    snapshot.partition_id,
+                    SnapshotId::new(),
+                    snapshot.min_applied_lsn,
+                    &source,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .inspect_exact(
+                    snapshot.partition_id,
+                    snapshot.snapshot_id,
+                    snapshot.min_applied_lsn.next(),
+                    &source,
+                )
+                .await
+                .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[restate_core::test]
+    async fn source_repository_uses_explicit_destination_without_changing_active_options()
+    -> anyhow::Result<()> {
+        let _env = TestCoreEnv::create_with_single_node(1, 1).await;
+        let active = TempDir::new()?;
+        let source = TempDir::new()?;
+        let active_destination = Url::from_file_path(active.path()).unwrap().to_string();
+        let mut source_destination = Url::from_file_path(source.path()).unwrap();
+        source_destination.set_query(Some("ignored=true"));
+        let options = SnapshotsOptions {
+            destination: Some(active_destination.clone()),
+            ..SnapshotsOptions::default()
+        };
+
+        let repository = SnapshotRepository::new_for_source(
+            &options,
+            source_destination,
+            TempDir::new()?.keep(),
+        )
+        .await?;
+
+        assert_eq!(repository.destination().query(), None);
+        assert_eq!(
+            repository.destination().path(),
+            source.path().to_str().unwrap()
+        );
+        assert_eq!(
+            options.destination.as_deref(),
+            Some(active_destination.as_str())
+        );
+        Ok(())
     }
 
     /// For this test to run, set RESTATE_S3_INTEGRATION_TEST_BUCKET_NAME to a writable S3 bucket name
@@ -1288,7 +1746,7 @@ mod tests {
             .get(&partition_prefix.clone().join("latest.json"))
             .await?;
         let latest: LatestSnapshot = serde_json::from_slice(&latest.bytes().await?)?;
-        let (expected_latest, _) = repository.build_latest_v2(&snapshot1, None)?;
+        let (expected_latest, _) = repository.build_latest_pointer(&snapshot1, None, false)?;
         assert_eq!(expected_latest, latest);
 
         let snapshot_source = TempDir::new()?;
@@ -1314,7 +1772,7 @@ mod tests {
             .get(&partition_prefix.join("latest.json"))
             .await?;
         let latest: LatestSnapshot = serde_json::from_slice(&latest.bytes().await?)?;
-        let (expected_latest2, _) = repository.build_latest_v2(&snapshot2, None)?;
+        let (expected_latest2, _) = repository.build_latest_pointer(&snapshot2, None, false)?;
         assert_eq!(expected_latest2, latest);
 
         let latest = repository.get_latest(PartitionId::MIN).await?.unwrap();
@@ -1448,6 +1906,100 @@ mod tests {
         assert_eq!(latest.retained_snapshots[0].min_applied_lsn, Lsn::new(4000));
         assert_eq!(latest.retained_snapshots[1].min_applied_lsn, Lsn::new(3000));
         assert_eq!(latest.retained_snapshots[2].min_applied_lsn, Lsn::new(2000));
+
+        let status = PartitionSnapshotStatus::try_from(&latest)?;
+        assert_eq!(status.latest_snapshot_id, latest.snapshot_id);
+        assert_eq!(status.latest_snapshot_lsn, Lsn::new(4000));
+        assert_eq!(status.archived_lsn, Lsn::new(2000));
+
+        Ok(())
+    }
+
+    #[restate_core::test]
+    async fn protected_snapshot_survives_cleanup_without_holding_back_trim_lsn()
+    -> anyhow::Result<()> {
+        let _env = TestCoreEnv::create_with_single_node(1, 1).await;
+
+        let snapshots_destination = TempDir::new()?;
+        let destination = Url::from_file_path(snapshots_destination.path())
+            .unwrap()
+            .to_string();
+        let repository = SnapshotRepository::new_from_config(
+            &SnapshotsOptions {
+                destination: Some(destination),
+                num_retained: std::num::NonZeroU8::new(1).unwrap(),
+                enable_cleanup: true,
+                ..SnapshotsOptions::default()
+            },
+            TempDir::new()?.keep(),
+        )
+        .await?
+        .unwrap();
+
+        let (protected, protected_dir) = mock_snapshot(b"protected", Lsn::new(100)).await?;
+        let protected_ref = SnapshotReference::from_metadata(&protected, true);
+        repository
+            .put_protected(&protected, SnapshotDir::new(protected_dir))
+            .await?;
+
+        let (evicted, evicted_dir) = mock_snapshot(b"evicted", Lsn::new(200)).await?;
+        let evicted_ref = SnapshotReference::from_metadata(&evicted, false);
+        repository
+            .put(&evicted, SnapshotDir::new(evicted_dir))
+            .await?;
+
+        let (latest_snapshot, latest_dir) = mock_snapshot(b"latest", Lsn::new(300)).await?;
+        repository
+            .put(&latest_snapshot, SnapshotDir::new(latest_dir))
+            .await?;
+
+        let latest = repository
+            .get_latest_snapshot_metadata_for_update(
+                &repository.latest_snapshot_pointer_path(PartitionId::MIN),
+            )
+            .await?
+            .map(|(latest, _)| latest)
+            .expect("latest metadata exists");
+        assert_eq!(latest.version, LatestSnapshotVersion::V3);
+        assert_eq!(latest.retained_snapshots.len(), 2);
+        assert!(
+            latest
+                .retained_snapshots
+                .iter()
+                .any(|snapshot| snapshot.snapshot_id == protected.snapshot_id && snapshot.protected)
+        );
+        let status = PartitionSnapshotStatus::try_from(&latest)?;
+        assert_eq!(status.latest_snapshot_lsn, Lsn::new(300));
+        assert_eq!(status.archived_lsn, Lsn::new(300));
+
+        let protected_metadata = repository
+            .partition_snapshots_prefix(PartitionId::MIN)
+            .join(protected_ref.path.as_str())
+            .join("metadata.json");
+        let evicted_metadata = repository
+            .partition_snapshots_prefix(PartitionId::MIN)
+            .join(evicted_ref.path.as_str())
+            .join("metadata.json");
+        for _ in 0..20 {
+            if matches!(
+                repository.object_store.get(&evicted_metadata).await,
+                Err(object_store::Error::NotFound { .. })
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            repository
+                .object_store
+                .get(&protected_metadata)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            repository.object_store.get(&evicted_metadata).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
 
         Ok(())
     }
@@ -1624,7 +2176,7 @@ mod tests {
         for i in 1..=5 {
             let (snapshot, source_dir) =
                 mock_snapshot(format!("data-{}", i).as_bytes(), Lsn::new(100 * i)).await?;
-            all_snapshot_paths.push(SnapshotReference::from_metadata(&snapshot).path);
+            all_snapshot_paths.push(SnapshotReference::from_metadata(&snapshot, false).path);
             repository
                 .put(&snapshot, SnapshotDir::new(source_dir))
                 .await?;
@@ -1696,8 +2248,8 @@ mod tests {
 
         // Create a V2 latest snapshot with multiple retained snapshots.
         // The retained_snapshots list is intentionally out of order to verify that the
-        // conversion code does NOT rely on the descending LSN sort invariant. This tests
-        // defensive behavior against corrupted or manually edited metadata.
+        // conversion code does NOT rely on the descending LSN sort invariant. V2 predates
+        // protection, so even a manually-added protected marker must not change its trim floor.
         let latest = LatestSnapshot {
             version: LatestSnapshotVersion::V2,
             partition_id: PartitionId::MIN,
@@ -1715,18 +2267,21 @@ mod tests {
                     min_applied_lsn: Lsn::new(3484), // Newest (index 0)
                     created_at: Timestamp::from_second(2).unwrap(),
                     path: "snap1".to_string(),
+                    protected: false,
                 },
                 SnapshotReference {
                     snapshot_id: SnapshotId::new(),
                     min_applied_lsn: Lsn::new(1342), // Oldest by LSN but at index 1
                     created_at: Timestamp::from_second(0).unwrap(),
                     path: "snap3".to_string(),
+                    protected: true,
                 },
                 SnapshotReference {
                     snapshot_id: SnapshotId::new(),
                     min_applied_lsn: Lsn::new(2839), // Middle LSN at index 2
                     created_at: Timestamp::from_second(1).unwrap(),
                     path: "snap2".to_string(),
+                    protected: false,
                 },
             ],
         };

@@ -37,6 +37,7 @@ pub struct SnapshotPartitionTask {
     pub cluster_fingerprint: Option<ClusterFingerprint>,
     pub node_name: String,
     pub snapshot_repository: SnapshotRepository,
+    pub protect_from_retention: bool,
 }
 
 impl SnapshotPartitionTask {
@@ -86,15 +87,20 @@ impl SnapshotPartitionTask {
 
         let metadata = self.metadata(&snapshot, WallClock::recent_ms());
 
-        let status = self
-            .snapshot_repository
-            // `put` takes ownership of the snapshot directory and removes it after upload.
-            .put(&metadata, snapshot.base_dir)
-            .await
-            .map_err(|e| SnapshotError {
-                partition_id: self.partition_id,
-                kind: SnapshotErrorKind::RepositoryIo(e),
-            })?;
+        // The repository takes ownership of the snapshot directory and removes it after upload.
+        let status = if self.protect_from_retention {
+            self.snapshot_repository
+                .put_protected(&metadata, snapshot.base_dir)
+                .await
+        } else {
+            self.snapshot_repository
+                .put(&metadata, snapshot.base_dir)
+                .await
+        }
+        .map_err(|e| SnapshotError {
+            partition_id: self.partition_id,
+            kind: SnapshotErrorKind::RepositoryIo(e),
+        })?;
 
         if let Some(db) = self
             .partition_store_manager

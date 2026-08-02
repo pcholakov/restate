@@ -925,6 +925,7 @@ where
         &mut self,
         partition_id: PartitionId,
         min_target_lsn: Option<Lsn>,
+        protect_from_retention: bool,
         sender: oneshot::Sender<SnapshotResult>,
     ) {
         let processor_state = match self.processor_states.get(&partition_id) {
@@ -959,6 +960,7 @@ where
             partition_id,
             min_target_lsn,
             snapshot_repository,
+            protect_from_retention,
             Some(sender),
         );
     }
@@ -1091,7 +1093,13 @@ where
             .take(limit);
 
         for partition_id in snapshot_partitions {
-            self.spawn_create_snapshot_task(partition_id, None, snapshot_repository.clone(), None);
+            self.spawn_create_snapshot_task(
+                partition_id,
+                None,
+                snapshot_repository.clone(),
+                false,
+                None,
+            );
         }
     }
 
@@ -1104,9 +1112,11 @@ where
         partition_id: PartitionId,
         min_target_lsn: Option<Lsn>,
         snapshot_repository: SnapshotRepository,
+        protect_from_retention: bool,
         sender: Option<oneshot::Sender<SnapshotResult>>,
     ) {
         if let Some(snapshot) = self.latest_snapshots.get(&partition_id)
+            && !protect_from_retention
             && min_target_lsn.is_some_and(|target_lsn| snapshot.archived_lsn >= target_lsn)
             && let Some(sender) = sender
         {
@@ -1157,6 +1167,7 @@ where
                     cluster_fingerprint,
                     node_name,
                     snapshot_repository,
+                    protect_from_retention,
                 };
 
                 let jitter = if sender.is_some() {
@@ -1289,7 +1300,16 @@ where
     fn handle_create_snapshot_request(&mut self, request: Incoming<Rpc<CreateSnapshotRequest>>) {
         let (sender, rx) = oneshot::channel();
         let (reciprocal, body) = request.split();
-        self.on_create_snapshot(body.partition_id, body.min_target_lsn, sender);
+        let snapshot_repository = self
+            .snapshot_repository
+            .as_ref()
+            .map(|repository| repository.destination().to_string());
+        self.on_create_snapshot(
+            body.partition_id,
+            body.min_target_lsn,
+            body.protect_from_retention,
+            sender,
+        );
         tokio::spawn(async move {
             let Ok(result) = rx.await else {
                 // dropping the reciprocal will notify the sender that the request will not
@@ -1302,6 +1322,9 @@ where
                         snapshot_id: snapshot.latest_snapshot_id,
                         log_id: snapshot.log_id,
                         min_applied_lsn: snapshot.archived_lsn,
+                        latest_snapshot_lsn: snapshot.latest_snapshot_lsn,
+                        snapshot_repository: snapshot_repository
+                            .expect("successful snapshot requires a configured repository"),
                     }),
                 }),
                 Err(err) => reciprocal.send(CreateSnapshotResponse {

@@ -110,6 +110,10 @@ message CreatePartitionSnapshotRequest {
   // successful snapshot and so will honor the min_target_lsn requirement, if
   // set to true
   bool trim_log = 3;
+  // Protect the created snapshot from the repository's rolling retention policy.
+  // Protected snapshots remain until explicitly removed by an operator or a future
+  // backup lifecycle API.
+  bool protect_from_retention = 4;
 }
 
 message CreatePartitionSnapshotResponse {
@@ -117,6 +121,12 @@ message CreatePartitionSnapshotResponse {
   uint32 log_id = 2;
   // Minimum LSN (inclusive) which is guaranteed to be covered by the snapshot
   uint64 min_applied_lsn = 3;
+  // Oldest LSN covered by every retained snapshot. This is the safe log trim point
+  // when older snapshots remain available in the repository.
+  uint64 trim_safe_lsn = 4;
+  // Authoritative normalized repository destination used by the worker. Credentials and
+  // query parameters are excluded.
+  string snapshot_repository = 5;
 }
 
 message ChainExtension {

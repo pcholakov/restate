@@ -89,6 +89,7 @@ async fn inner_create_snapshot(
         partition_id: partition_id.into(),
         min_target_lsn: opts.min_lsn,
         trim_log: opts.trim_log,
+        protect_from_retention: false,
     };
 
     let response = connection

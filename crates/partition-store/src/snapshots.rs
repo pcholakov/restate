@@ -18,7 +18,9 @@ use std::sync::Arc;
 use crate::{PartitionDb, PartitionStore, SnapshotError, SnapshotErrorKind};
 
 pub use self::metadata::*;
-pub use self::repository::{PartitionSnapshotStatus, SnapshotRepository};
+pub use self::repository::{
+    PartitionSnapshotStatus, SnapshotRecord, SnapshotRepository, SnapshotSource,
+};
 pub use self::snapshot_task::*;
 
 use tokio::sync::Semaphore;

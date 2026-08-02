@@ -8,12 +8,16 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+mod backup;
 mod create_snapshot;
 
 use cling::prelude::*;
 
 #[derive(Run, Subcommand, Clone)]
+#[allow(clippy::enum_variant_names)] // Preserve the existing `create-snapshot` CLI spelling.
 pub enum Snapshot {
+    /// Capture a V0 cluster backup descriptor.
+    Backup(backup::BackupOpts),
     /// Create.
     CreateSnapshot(create_snapshot::CreateSnapshotOpts),
 }

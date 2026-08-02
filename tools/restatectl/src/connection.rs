@@ -27,6 +27,7 @@ use restate_core::protobuf::node_ctl_svc::{
 use restate_metadata_store::ReadModifyWriteError;
 use restate_types::errors;
 use restate_types::partition_table::PartitionTable;
+use restate_types::schema::Schema;
 use restate_types::{
     Version, Versioned,
     logs::metadata::Logs,
@@ -147,6 +148,9 @@ pub struct ConnectionInfo {
     partition_table: Arc<Mutex<Option<PartitionTable>>>,
 
     #[clap(skip)]
+    schema: Arc<Mutex<Option<Schema>>>,
+
+    #[clap(skip)]
     open_connections: Arc<Mutex<HashMap<AdvertisedAddress<FabricPort>, Channel>>>,
 
     #[clap(skip)]
@@ -230,10 +234,13 @@ impl ConnectionInfo {
         Fut: Future<Output = Result<T, E>>,
     {
         let effective_addresses = self.get_effective_addresses();
-        let mut open_connections = self.open_connections.lock().await;
 
         if let Some(address) = effective_addresses.into_iter().next() {
-            if let Some(channel) = self.connect_internal(address, &mut open_connections).await {
+            let channel = {
+                let mut open_connections = self.open_connections.lock().await;
+                self.connect_internal(address, &mut open_connections)
+            };
+            if let Some(channel) = channel {
                 if let Some(required_role) = role {
                     let mut client =
                         new_node_ctl_client(channel.clone(), &CliContext::get().network);
@@ -359,6 +366,34 @@ impl ConnectionInfo {
             MetadataKind::PartitionTable,
             guard,
             |ident| Version::from(ident.partition_table_version),
+        )
+        .await
+    }
+
+    /// Gets Schema metadata using the same majority/version selection as other global metadata.
+    pub async fn get_schema(&self) -> Result<Schema, ConnectionInfoError> {
+        let guard = self.schema.lock().await;
+
+        if self.is_single_address_mode() {
+            return self
+                .get_metadata_single_address(
+                    MetadataKind::Schema,
+                    guard,
+                    |ident| Version::from(ident.schema_version),
+                    "schema metadata",
+                )
+                .await;
+        }
+
+        let nodes_config = self.get_nodes_configuration().await?;
+        let addresses = self.get_majority_consensus_addresses(&nodes_config).await;
+
+        self.get_latest_metadata(
+            addresses.into_iter(),
+            (nodes_config.len() / 2) + 1,
+            MetadataKind::Schema,
+            guard,
+            |ident| Version::from(ident.schema_version),
         )
         .await
     }
@@ -500,7 +535,13 @@ impl ConnectionInfo {
         }
 
         let nodes_config = self.get_nodes_configuration().await?;
-        let mut open_connections = self.open_connections.lock().await;
+        let connected_addresses = self
+            .open_connections
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
 
         let iterator = match role {
             Some(role) => Either::Left(nodes_config.iter_role(role)),
@@ -509,21 +550,24 @@ impl ConnectionInfo {
         .sorted_by(|a, b| {
             // nodes for which we already have open channels get higher precedence.
             match (
-                open_connections.contains_key(&a.1.address),
-                open_connections.contains_key(&b.1.address),
+                connected_addresses.contains(&a.1.address),
+                connected_addresses.contains(&b.1.address),
             ) {
                 (true, false) => Ordering::Less,
                 (false, true) => Ordering::Greater,
                 (_, _) => a.0.cmp(&b.0),
             }
-        });
+        })
+        .map(|(node_id, node)| (node_id, node.clone()))
+        .collect::<Vec<_>>();
 
         let mut errors = NodesErrors::default();
 
         for (_, node) in iterator {
-            let channel = self
-                .connect_internal(&node.address, &mut open_connections)
-                .await;
+            let channel = {
+                let mut open_connections = self.open_connections.lock().await;
+                self.connect_internal(&node.address, &mut open_connections)
+            };
 
             if let Some(channel) = channel {
                 debug!("Trying {}...", node.address);
@@ -568,18 +612,18 @@ impl ConnectionInfo {
         &self,
         address: &AdvertisedAddress<FabricPort>,
     ) -> Result<Channel, ConnectionInfoError> {
-        self.connect_internal(address, &mut self.open_connections.lock().await)
-            .await
+        let mut open_connections = self.open_connections.lock().await;
+        self.connect_internal(address, &mut open_connections)
             .map(Ok)
             .unwrap_or(Err(ConnectionInfoError::NodeUnreachable))
     }
 
     /// Creates and returns a (lazy) connection to the specified address, or `None` if this
     /// address was previously flagged as unreachable.
-    async fn connect_internal(
+    fn connect_internal(
         &self,
         address: &AdvertisedAddress<FabricPort>,
-        open_connections: &mut MutexGuard<'_, HashMap<AdvertisedAddress<FabricPort>, Channel>>,
+        open_connections: &mut HashMap<AdvertisedAddress<FabricPort>, Channel>,
     ) -> Option<Channel> {
         if self.dead_nodes.read().unwrap().contains(address) {
             debug!(
@@ -734,5 +778,55 @@ impl Display for NodesErrors {
 impl std::error::Error for NodesErrors {
     fn description(&self) -> &str {
         "aggregated nodes error"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::{Barrier, Mutex};
+
+    use super::ConnectionInfo;
+
+    #[tokio::test]
+    async fn concurrent_operations_do_not_hold_connection_cache_lock() {
+        let connection = ConnectionInfo {
+            address: vec![],
+            single_address: Some("http://127.0.0.1:5122/".parse().unwrap()),
+            nodes_configuration: Default::default(),
+            logs: Default::default(),
+            partition_table: Default::default(),
+            schema: Default::default(),
+            open_connections: Arc::new(Mutex::new(HashMap::default())),
+            dead_nodes: Default::default(),
+        };
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first = connection.try_each(None, |_| {
+            let barrier = Arc::clone(&barrier);
+            async move {
+                barrier.wait().await;
+                Ok::<_, tonic::Status>(())
+            }
+        });
+        let second = connection.try_each(None, |_| {
+            let barrier = Arc::clone(&barrier);
+            async move {
+                barrier.wait().await;
+                Ok::<_, tonic::Status>(())
+            }
+        });
+
+        let (first_result, second_result, _) =
+            tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(first, second, barrier.wait())
+            })
+            .await
+            .expect("both operations should enter their futures concurrently");
+        first_result.unwrap();
+        second_result.unwrap();
     }
 }

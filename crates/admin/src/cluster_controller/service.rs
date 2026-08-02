@@ -195,6 +195,7 @@ enum ClusterControllerCommand {
     CreateSnapshot {
         partition_id: PartitionId,
         min_target_lsn: Option<Lsn>,
+        protect_from_retention: bool,
         response_tx: oneshot::Sender<anyhow::Result<Snapshot>>,
     },
     UpdateClusterConfiguration {
@@ -262,6 +263,7 @@ impl ClusterControllerHandle {
         partition_id: PartitionId,
         min_target_lsn: Option<Lsn>,
         trim_log: bool,
+        protect_from_retention: bool,
     ) -> Result<anyhow::Result<Snapshot>, ShutdownError> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -277,6 +279,7 @@ impl ClusterControllerHandle {
             .send(ClusterControllerCommand::CreateSnapshot {
                 partition_id,
                 min_target_lsn,
+                protect_from_retention,
                 response_tx,
             })
             .await;
@@ -286,6 +289,8 @@ impl ClusterControllerHandle {
         if let (Ok(snapshot), true) = (&create_snapshot_response, trim_log) {
             // We have successfully archived the target LSN to the snapshot repository. For added
             // safety, we could optionally download and test the snapshot in the future.
+            // This field deliberately retains its legacy trim-safe meaning for old and new
+            // workers. Exact snapshot identity is carried separately.
             if let Err(trim_error) = self.trim_log(log_id, snapshot.min_applied_lsn).await? {
                 return Ok(Err(trim_error));
             }
@@ -441,6 +446,7 @@ impl<T: TransportConnect> Service<T> {
         &self,
         partition_id: PartitionId,
         min_target_lsn: Option<Lsn>,
+        protect_from_retention: bool,
         response_tx: oneshot::Sender<anyhow::Result<Snapshot>>,
     ) {
         let cluster_state = self.cluster_state_refresher.get_cluster_state();
@@ -478,6 +484,7 @@ impl<T: TransportConnect> Service<T> {
                                     node.generational_node_id,
                                     partition_id,
                                     min_target_lsn,
+                                    protect_from_retention,
                                 )
                                 .await,
                         );
@@ -522,12 +529,14 @@ impl<T: TransportConnect> Service<T> {
             ClusterControllerCommand::CreateSnapshot {
                 partition_id,
                 min_target_lsn,
+                protect_from_retention,
                 response_tx,
             } => {
                 info!(?partition_id, "Create snapshot command received");
                 self.spawn_create_partition_snapshot_task(
                     partition_id,
                     min_target_lsn,
+                    protect_from_retention,
                     response_tx,
                 );
             }
@@ -768,6 +777,7 @@ where
         node_id: GenerationalNodeId,
         partition_id: PartitionId,
         min_target_lsn: Option<Lsn>,
+        protect_from_retention: bool,
     ) -> anyhow::Result<Snapshot> {
         self.network_sender
             .call_rpc(
@@ -776,6 +786,7 @@ where
                 CreateSnapshotRequest {
                     partition_id,
                     min_target_lsn,
+                    protect_from_retention,
                 },
                 Some(partition_id.into()),
                 None,

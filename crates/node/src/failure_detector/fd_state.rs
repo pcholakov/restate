@@ -695,3 +695,77 @@ impl FdState {
             .expect("my node must be in FD")
     }
 }
+
+#[cfg(test)]
+mod v1_7_3_startup_trace {
+    use restate_types::cluster_state::ClusterState;
+    use restate_types::net::address::AdvertisedAddress;
+    use restate_types::nodes_config::{NodeConfig, NodesConfiguration, Role};
+    use restate_types::{GenerationalNodeId, RestateVersion};
+
+    use super::*;
+
+    const A: GenerationalNodeId = GenerationalNodeId::new(1, 1);
+    const B: GenerationalNodeId = GenerationalNodeId::new(2, 1);
+    const C: GenerationalNodeId = GenerationalNodeId::new(3, 1);
+
+    #[tokio::test(start_paused = true)]
+    async fn prints_startup_pre_aging_trace() {
+        let opts = GossipOptions::default();
+        let cluster_state = ClusterState::default();
+        let mut state = FdState::new(
+            A,
+            &nodes_config(),
+            PartitionReplicaSetStates::default(),
+            cluster_state.updater(),
+        );
+        state.num_gossip_received = opts.gossip_fd_stability_threshold.get() as usize;
+        for node in state.node_states.values_mut() {
+            node.gossip_age = 0;
+            node.state = NodeState::Alive;
+        }
+
+        let mut interval = tokio::time::interval(*opts.gossip_tick_interval);
+        tokio::time::advance(*opts.gossip_tick_interval * 12).await;
+        interval.reset_immediately();
+        interval.tick().await;
+
+        let full_intervals = state
+            .last_gossip_tick
+            .elapsed()
+            .div_duration_f32(*opts.gossip_tick_interval)
+            .floor() as u32;
+        let interval_passed = state.gossip_tick(&opts);
+        state.detect_peer_failures(&opts);
+        let b = &state.node_states[&B.as_plain()];
+        let c = &state.node_states[&C.as_plain()];
+
+        println!(
+            "v1.7.3 startup-pre-aging trace: reset_tokio_interval=true full_intervals={full_intervals} interval_passed={interval_passed} B(age={}, state={}) C(age={}, state={})",
+            b.gossip_age, b.state, c.gossip_age, c.state,
+        );
+
+        assert_eq!(full_intervals, 12);
+        assert!(interval_passed);
+        assert_eq!(b.gossip_age, 12);
+        assert_eq!(b.state, NodeState::Alive);
+        assert_eq!(c.gossip_age, 12);
+        assert_eq!(c.state, NodeState::Alive);
+    }
+
+    fn nodes_config() -> NodesConfiguration {
+        let mut nodes_config = NodesConfiguration::new_for_testing();
+        for node_id in [A, B, C] {
+            nodes_config.upsert_node(
+                NodeConfig::builder()
+                    .name(format!("node-{node_id}"))
+                    .current_generation(node_id)
+                    .address(AdvertisedAddress::default())
+                    .roles(Role::Admin | Role::Worker)
+                    .binary_version(RestateVersion::current())
+                    .build(),
+            );
+        }
+        nodes_config
+    }
+}

@@ -222,6 +222,13 @@ impl FdState {
         self.num_gossip_received >= (opts.gossip_fd_stability_threshold.get() as usize)
     }
 
+    /// Resets elapsed-time tracking when gossip processing becomes active.
+    pub(super) fn reset_gossip_timing(&mut self) {
+        let now = Instant::now();
+        self.last_gossip_received_at = now;
+        self.last_gossip_tick = now;
+    }
+
     /// returns true if there has been at least a gossip interval since the last one.
     pub fn gossip_tick(&mut self, opts: &GossipOptions) -> bool {
         let now = Instant::now();

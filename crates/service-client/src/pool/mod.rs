@@ -49,6 +49,7 @@ use crate::pool::{
 pub use config::PoolBuilder;
 use config::PoolConfig;
 pub use conn::ConnectionError;
+pub(crate) use conn::ConnectionHandle;
 
 /// Errors that can occur during the lifecycle of an H2 connection.
 #[derive(thiserror::Error, Debug)]

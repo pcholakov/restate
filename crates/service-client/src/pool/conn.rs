@@ -9,7 +9,7 @@
 // by the Apache License, Version 2.0.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -89,11 +89,28 @@ struct ConnectionShared {
     h2: OnceLock<H2Handle>,
     created_at: MillisSinceEpoch,
     last_used_at: AtomicU64,
+    keep_alive_timed_out: AtomicBool,
     /// Waiters registered during the Connecting phase. Narrowly-scoped lock.
     /// This is an Option<T> to mark waiters list as invalid
     /// (not in CONNECTING state anymore) and it's not possible
     /// to add more waiters to the list
     waiters: Mutex<Option<Vec<oneshot::Sender<()>>>>,
+}
+
+/// Handle to the connection carrying an HTTP/2 response.
+///
+/// Dropping a response does not close its connection. Calling [`Self::close`]
+/// prevents the pool from assigning new streams to it and terminates its H2
+/// driver.
+#[derive(Clone, Debug)]
+pub(crate) struct ConnectionHandle {
+    shared: Arc<ConnectionShared>,
+}
+
+impl ConnectionHandle {
+    pub(crate) fn close(&self) {
+        self.shared.close();
+    }
 }
 
 impl ConnectionShared {
@@ -114,6 +131,7 @@ impl ConnectionShared {
             waiters: Mutex::new(Some(Vec::new())),
             created_at: now,
             last_used_at: AtomicU64::new(now.as_u64()),
+            keep_alive_timed_out: AtomicBool::new(false),
         }
     }
 
@@ -125,6 +143,14 @@ impl ConnectionShared {
         }
         // Drop all waiter senders so receivers get Err (Cancelled)
         self.waiters.lock().take();
+    }
+
+    fn classify_error(&self, err: impl Into<Error>) -> Error {
+        if self.keep_alive_timed_out.load(Ordering::Relaxed) {
+            Error::KeepAliveTimeout
+        } else {
+            err.into()
+        }
     }
 }
 
@@ -467,27 +493,35 @@ where
                     let shared_weak = Arc::downgrade(&shared);
                     drop(shared);
 
-                    tokio::select! {
-                        result = &mut connection => match result {
-                            Ok(_) => {
-                                debug!("h2 connection shutdown");
-                            },
-                            Err(err) => {
-                                debug!("h2 connection ({stream_dbg}) shutdown with error: {err}");
+                    let keep_alive_timed_out = tokio::select! {
+                        result = &mut connection => {
+                            match result {
+                                Ok(_) => {
+                                    debug!("h2 connection shutdown");
+                                },
+                                Err(err) => {
+                                    debug!("h2 connection ({stream_dbg}) shutdown with error: {err}");
+                                }
                             }
+                            false
                         },
                         Err(err) = &mut keep_alive => {
                             debug!("h2 connection ({stream_dbg}) keep-alive error: {err}");
-                        }
+                            matches!(err, Error::KeepAliveTimeout)
+                        },
                         _ = cancel.cancelled() => {
                             debug!("h2 connection cancelled");
-                        }
+                            false
+                        },
                     };
 
                     counter!(CONNECTION_POOL_CONNECTION_CLOSED).increment(1);
 
                     // set state to closed
                     if let Some(shared) = shared_weak.upgrade() {
+                        shared
+                            .keep_alive_timed_out
+                            .store(keep_alive_timed_out, Ordering::Relaxed);
                         shared.close();
                     }
                 })
@@ -704,7 +738,9 @@ where
                             this.state = ResponseFutureState::PreFlight { send_request };
                         }
                         Err(_) => {
-                            this.state = ResponseFutureState::error(Error::Closed);
+                            this.state = ResponseFutureState::error(
+                                this.shared.classify_error(Error::Closed),
+                            );
                             continue;
                         }
                     }
@@ -715,7 +751,8 @@ where
                     match send_request.poll_ready(cx) {
                         Poll::Ready(Ok(_)) => {}
                         Poll::Ready(Err(err)) => {
-                            this.state = ResponseFutureState::error(err);
+                            this.state =
+                                ResponseFutureState::error(this.shared.classify_error(err));
                             continue;
                         }
                         Poll::Pending => {
@@ -759,7 +796,7 @@ where
                 }
                 ResponseFutureState::InFlight { ref mut fut } => {
                     let resp = ready!(fut.poll_unpin(cx))
-                        .map_err(Error::from)
+                        .map_err(|err| this.shared.classify_error(err))
                         .inspect_err(|_| {
                             counter!(CONNECTION_POOL_STREAM_OPEN_FAILED).increment(1);
                         })?;
@@ -902,6 +939,12 @@ impl PermittedRecvStream {
             start_time: MillisSinceEpoch::now(),
             _permit: permit,
             _connection: connection,
+        }
+    }
+
+    pub(crate) fn connection_handle(&self) -> ConnectionHandle {
+        ConnectionHandle {
+            shared: Arc::clone(&self._connection),
         }
     }
 }

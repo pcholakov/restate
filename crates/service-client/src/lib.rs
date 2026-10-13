@@ -31,8 +31,8 @@ use restate_types::schema::deployment::{Deployment, DeploymentType, EndpointLamb
 
 pub use crate::gcp::GcpAuthError;
 pub use crate::http::HttpClient;
-pub use crate::http::ResponseBody as HttpResponseBody;
 pub use crate::http::HttpError;
+pub use crate::http::ResponseBody as HttpResponseBody;
 pub use crate::lambda::AssumeRoleCacheMode;
 use crate::lambda::LambdaClient;
 use crate::request_identity::SignRequest;

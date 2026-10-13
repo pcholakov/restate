@@ -176,9 +176,7 @@ fn log_lease(
 }
 
 fn failure_response(status: StatusCode) -> Response<ResponseBody> {
-    let mut response = Response::new(ResponseBody::Right(http_body_util::Full::new(
-        Bytes::new(),
-    )));
+    let mut response = Response::new(ResponseBody::Right(http_body_util::Full::new(Bytes::new())));
     *response.status_mut() = status;
     response
 }

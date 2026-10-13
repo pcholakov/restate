@@ -15,6 +15,7 @@ options_schema = ["restate-types/schemars"]
 restate-workspace-hack = { workspace = true }
 
 restate-core = { workspace = true }
+restate-dial-back = { workspace = true }
 restate-errors = { workspace = true }
 restate-futures-util = { workspace = true }
 restate-memory = { workspace = true }

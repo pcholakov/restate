@@ -7859,6 +7859,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "restate-dial-back"
+version = "1.8.0-rc.2"
+dependencies = [
+ "bytes",
+ "http 1.5.0",
+ "http-body-util",
+ "hyper",
+ "rand 0.10.2",
+ "restate-workspace-hack",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "restate-doctor"
 version = "1.8.0-rc.2"
 dependencies = [
@@ -8033,6 +8047,7 @@ dependencies = [
  "pin-project-lite",
  "prost",
  "restate-core",
+ "restate-dial-back",
  "restate-hyper-uds",
  "restate-ingestion-client",
  "restate-test-util",
@@ -8117,6 +8132,7 @@ dependencies = [
  "pin-project-lite",
  "prost",
  "restate-core",
+ "restate-dial-back",
  "restate-errors",
  "restate-futures-util",
  "restate-memory",

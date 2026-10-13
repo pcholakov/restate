@@ -16,10 +16,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use bytestring::ByteString;
+use futures::future::Either;
 use futures::{Stream, StreamExt};
 use gardal::futures::StreamExt as GardalStreamExt;
 use http::uri::PathAndQuery;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use http_body_util::Empty;
 use metrics::{Counter, counter};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::{Span, SpanContext, Status, TraceFlags};
@@ -27,6 +29,7 @@ use prost::Message as ProstMessage;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
+use restate_core::TaskCenter;
 use restate_errors::warn_it;
 use restate_memory::{LocalMemoryLease, LocalMemoryPool, PinnableMemoryStream};
 use restate_service_client::{Endpoint, Method, Parts, Request};
@@ -38,6 +41,7 @@ use restate_service_protocol_v4::message_codec::{
 use restate_service_protocol_v4::proto_lite;
 use restate_tracing_instrumentation::ServiceSpan;
 use restate_types::Scope;
+use restate_types::config::Configuration;
 use restate_types::errors::{GenericError, InvocationError};
 use restate_types::identifiers::{EntryIndex, InvocationId};
 use restate_types::invocation::{
@@ -70,6 +74,7 @@ use crate::error::{
     CommandPreconditionError, InvocationErrorRelatedCommandV2, InvokerError,
     RequestedErrorBehavior, SdkInvocationErrorV2,
 };
+use crate::invocation_task::dial_back;
 use crate::invocation_task::{
     InvocationTask, InvocationTaskOutputInner, InvokerBodySender, InvokerBodyType, ResponseChunk,
     ResponseStream, TerminalLoopState, X_RESTATE_SERVER, collect_eager_state,
@@ -161,7 +166,11 @@ where
         );
 
         // Figure out the protocol type. Force RequestResponse if inactivity_timeout is zero
-        let protocol_type = if self.invocation_task.inactivity_timeout.is_zero() {
+        let dial_back = dial_back::is_dial_back(&deployment.additional_headers);
+        let protocol_type = if dial_back {
+            // The protocol runs on the attach stream, which is always full duplex.
+            ProtocolType::BidiStream
+        } else if self.invocation_task.inactivity_timeout.is_zero() {
             ProtocolType::RequestResponse
         } else {
             deployment.ty.protocol_type()
@@ -191,6 +200,7 @@ where
         let deployment_id = deployment.id;
         let deployment_type_str = deployment.ty.as_static_str();
         // Prepare the request
+        let dial_back_registration = dial_back.then(restate_dial_back::register);
         let (http_stream_tx, request) = Self::prepare_request(
             path,
             deployment,
@@ -198,10 +208,36 @@ where
             &self.invocation_task.invocation_id,
             attempt_span.span_context(),
             self.invocation_task.invocation_target.key(),
+            dial_back_registration
+                .as_ref()
+                .map(|(registration, _)| registration.token()),
         );
 
+        // Dropped when this attempt is done with the attach stream, which tells the lease watcher
+        // that a finished lease is no longer a sign of a dead service.
+        let (_attach_ended_tx, attach_ended_rx) = tokio::sync::oneshot::channel::<()>();
+
         // Initialize the response stream state
-        let http_stream_rx = ResponseStream::new(self.invocation_task.client.call(request));
+        let response_fut = match dial_back_registration {
+            None => Either::Left(self.invocation_task.client.call(request)),
+            Some((registration, attach_rx)) => {
+                // The lease is a complete, empty request; the invocation body goes on the attach.
+                let (lease_head, invoker_body) = request.into_parts();
+                let lease = self
+                    .invocation_task
+                    .client
+                    .call(Request::new(lease_head, Empty::<Bytes>::new()));
+                Either::Right(dial_back::lease_or_attach(
+                    self.invocation_task.invocation_id,
+                    lease,
+                    registration,
+                    attach_rx,
+                    invoker_body,
+                    attach_ended_rx,
+                ))
+            }
+        };
+        let http_stream_rx = ResponseStream::new(response_fut);
 
         let mut decoder_stream = std::pin::pin!(
             DecoderStream::new(
@@ -423,6 +459,7 @@ where
         invocation_id: &InvocationId,
         parent_span_context: &SpanContext,
         service_key: Option<&ByteString>,
+        dial_back_token: Option<&str>,
     ) -> (InvokerBodySender, Request<InvokerBodyType>) {
         // Use an unbounded channel: backpressure is provided by the memory budget
         // (each frame's Bytes embeds a LocalMemoryLease via from_owner) rather than
@@ -486,6 +523,16 @@ where
         };
 
         headers.extend(deployment_metadata.additional_headers);
+
+        if let Some(token) = dial_back_token
+            && let (Ok(url), Ok(token)) = (
+                HeaderValue::from_str(&attach_url()),
+                HeaderValue::from_str(token),
+            )
+        {
+            headers.insert(restate_dial_back::ATTACH_URL_HEADER, url);
+            headers.insert(restate_dial_back::ATTACH_TOKEN_HEADER, token);
+        }
 
         let mut request_parts = Parts::new(Method::Post, address, path, headers);
         if let Some(service_key) = service_key {
@@ -1785,4 +1832,18 @@ where
             }
         }
     }
+}
+
+/// prototype: the attach URL is the advertised ingress address of this node.
+fn attach_url() -> String {
+    let advertised = TaskCenter::with_current(|tc| {
+        Configuration::pinned()
+            .ingress
+            .advertised_address(tc.address_book())
+    });
+    format!(
+        "{}{}",
+        advertised.to_string().trim_end_matches('/'),
+        restate_dial_back::ATTACH_PATH
+    )
 }

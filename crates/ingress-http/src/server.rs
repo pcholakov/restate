@@ -233,6 +233,27 @@ where
             .layer(layers::tracing_context_extractor::HttpTraceContextExtractorLayer)
             .service(service);
 
+        // The attach route of lease + dial-back invocations is long-lived and carries the
+        // invocation protocol, so it bypasses the request limits and layers above.
+        let service = tower::service_fn(move |req: Request<Incoming>| {
+            let service = service.clone();
+            async move {
+                if req.method() == http::Method::POST
+                    && req.uri().path() == restate_dial_back::ATTACH_PATH
+                {
+                    return Ok::<_, Infallible>(
+                        restate_dial_back::serve_attach(req)
+                            .await
+                            .map(tonic::body::Body::new),
+                    );
+                }
+                service
+                    .oneshot(req)
+                    .await
+                    .map(|response| response.map(tonic::body::Body::new))
+            }
+        });
+
         // todo(azmy): `CorsLayer` should sit above `RequestBodyLimitLayer` so CORS is applied
         // as early as possible. This is currently blocked because `CorsLayer` requires the
         // response body to implement `Default`, which `RequestBodyLimitLayer`'s body does not.
